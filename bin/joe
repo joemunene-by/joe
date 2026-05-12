@@ -123,6 +123,7 @@ EVALS_DB = STATE_DIR / "evals.sqlite"
 TRAINING_DATA_DIR = STATE_DIR / "training-data"
 TRAINING_DATA_DIR.mkdir(parents=True, exist_ok=True)
 DEVELOPER_JOURNAL = STATE_DIR / "journal" / "developer-journal.md"
+MCP_CLIENTS_CONFIG = STATE_DIR / "mcp-clients.json"
 
 # Per-turn context, set by run_turn (and the @@agent dispatch) so tools like
 # write/edit can stamp provenance with the original user message + persona.
@@ -1812,6 +1813,239 @@ def cmd_train(args: list[str], default_model: str) -> int:
 
 
 # --------------------------------------------------------------------------
+# MCP client (joe-as-client). Connects to external MCP servers configured
+# in ~/.joe-agent/mcp-clients.json so the orchestrator can invoke tools
+# from them via the <mcp server="..." tool="..."> tag. The MCP SDK is
+# async-only, so each connection runs its own event loop in a background
+# thread; we expose synchronous `call` / `list_tools` that block on the
+# loop via `asyncio.run_coroutine_threadsafe`.
+# --------------------------------------------------------------------------
+
+# Lazy import: only resolved when the user actually configures MCP clients,
+# so users without the mcp SDK never pay the import cost.
+_MCP_AVAILABLE: Optional[bool] = None
+
+
+def _mcp_check_available() -> bool:
+    global _MCP_AVAILABLE
+    if _MCP_AVAILABLE is not None:
+        return _MCP_AVAILABLE
+    try:
+        import asyncio  # noqa: F401
+        import mcp  # noqa: F401
+        from mcp import ClientSession  # noqa: F401
+        from mcp.client.stdio import stdio_client  # noqa: F401
+        _MCP_AVAILABLE = True
+    except ImportError:
+        _MCP_AVAILABLE = False
+    return _MCP_AVAILABLE
+
+
+class MCPClient:
+    """One connection to an external MCP server, wrapping the async SDK.
+
+    Spawns the server process (stdio) and keeps an asyncio loop alive in a
+    background thread. Sync methods schedule coroutines onto that loop via
+    run_coroutine_threadsafe so the rest of joe stays single-threaded.
+    """
+
+    def __init__(self, config: dict) -> None:
+        self.name = config["name"]
+        self.config = config
+        self.tools: list = []           # raw mcp Tool objects
+        self.tool_names: list[str] = []
+        self.connected = False
+        self._loop = None
+        self._thread: Optional[threading.Thread] = None
+        self._session = None
+        self._stack = None
+        self._connect_error: str = ""
+
+    def start(self) -> bool:
+        """Spin up the background loop + connect. Returns True on success."""
+        import asyncio
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever, daemon=True,
+        )
+        self._thread.start()
+        fut = asyncio.run_coroutine_threadsafe(self._connect(), self._loop)
+        try:
+            ok = fut.result(timeout=20)
+        except Exception as e:
+            self._connect_error = str(e)
+            ok = False
+        self.connected = ok
+        return ok
+
+    async def _connect(self) -> bool:
+        from contextlib import AsyncExitStack
+        from mcp import ClientSession
+        from mcp.client.stdio import StdioServerParameters, stdio_client
+        try:
+            transport = self.config.get("transport", "stdio")
+            self._stack = AsyncExitStack()
+            await self._stack.__aenter__()
+            if transport == "stdio":
+                params = StdioServerParameters(
+                    command=self.config["command"],
+                    args=self.config.get("args", []),
+                    env=self.config.get("env"),
+                )
+                (read, write) = await self._stack.enter_async_context(
+                    stdio_client(params),
+                )
+            else:
+                self._connect_error = f"unsupported transport: {transport}"
+                return False
+            self._session = await self._stack.enter_async_context(
+                ClientSession(read, write),
+            )
+            await self._session.initialize()
+            tools_result = await self._session.list_tools()
+            self.tools = list(tools_result.tools)
+            self.tool_names = [t.name for t in self.tools]
+            return True
+        except Exception as e:
+            self._connect_error = str(e)
+            return False
+
+    def call(self, tool: str, args: dict, timeout: float = 120) -> str:
+        """Block-and-return the tool's text content, or 'ERROR: ...'."""
+        if not self.connected or self._session is None:
+            return f"ERROR: {self.name} not connected ({self._connect_error})"
+        import asyncio
+        fut = asyncio.run_coroutine_threadsafe(
+            self._call(tool, args), self._loop,
+        )
+        try:
+            return fut.result(timeout=timeout)
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    async def _call(self, tool: str, args: dict) -> str:
+        try:
+            result = await self._session.call_tool(tool, args)
+        except Exception as e:
+            return f"ERROR: {e}"
+        # result.content is list[TextContent | ImageContent | EmbeddedResource]
+        parts: list[str] = []
+        for c in getattr(result, "content", []) or []:
+            text = getattr(c, "text", None)
+            if text:
+                parts.append(text)
+        if not parts:
+            return "(no content returned)"
+        return "\n".join(parts)
+
+
+# Module-level registry of connected clients, keyed by server name.
+_MCP_CLIENTS: dict[str, MCPClient] = {}
+
+
+def _mcp_load_config() -> list[dict]:
+    if not MCP_CLIENTS_CONFIG.is_file():
+        return []
+    try:
+        cfg = json.loads(MCP_CLIENTS_CONFIG.read_text())
+    except Exception:
+        return []
+    return cfg.get("servers", []) if isinstance(cfg, dict) else []
+
+
+def _mcp_connect_all() -> None:
+    """Connect to every configured MCP server. Best-effort; failures are
+    captured per-client and printed but don't block joe startup."""
+    if _MCP_CLIENTS:
+        return  # already connected
+    servers = _mcp_load_config()
+    if not servers:
+        return
+    if not _mcp_check_available():
+        console.print(
+            "[yellow]mcp-clients.json configured but the `mcp` SDK is not "
+            "installed.[/]  pip install --user mcp"
+        )
+        return
+    for s in servers:
+        if not isinstance(s, dict) or "name" not in s:
+            continue
+        if not s.get("enabled", True):
+            continue
+        client = MCPClient(s)
+        ok = client.start()
+        _MCP_CLIENTS[s["name"]] = client
+        if ok:
+            console.print(
+                f"[dim]mcp client[/] [bold green]connected[/] "
+                f"{s['name']} ({len(client.tools)} tools)"
+            )
+        else:
+            console.print(
+                f"[dim]mcp client[/] [bold red]failed[/] "
+                f"{s['name']}: {client._connect_error}"
+            )
+
+
+def _mcp_tools_block() -> str:
+    """Format the currently-connected MCP tools so the model can call them."""
+    if not _MCP_CLIENTS:
+        return ""
+    lines: list[str] = []
+    for name, client in _MCP_CLIENTS.items():
+        if not client.connected:
+            continue
+        for t in client.tools:
+            desc = (getattr(t, "description", "") or "").strip().replace("\n", " ")
+            if len(desc) > 120:
+                desc = desc[:120] + "..."
+            lines.append(f"  <mcp server=\"{name}\" tool=\"{t.name}\" /> -- {desc}")
+    if not lines:
+        return ""
+    return (
+        "<mcp_tools>\n"
+        "Available external MCP tools. Use them via:\n"
+        "  <mcp server=\"<name>\" tool=\"<tool>\">{\"arg\": \"value\"}</mcp>\n"
+        "args body is a JSON object. Result comes back in <tool_result>.\n"
+        + "\n".join(lines)
+        + "\n</mcp_tools>"
+    )
+
+
+def tool_mcp(attrs: dict, body: str) -> str:
+    server = attrs.get("server", "")
+    tool = attrs.get("tool", "")
+    if not server or not tool:
+        raise ToolError("<mcp> needs server=\"...\" and tool=\"...\"")
+    client = _MCP_CLIENTS.get(server)
+    if not client:
+        raise ToolError(
+            f"<mcp server={server!r}>: not connected. "
+            f"available: {sorted(_MCP_CLIENTS.keys()) or '(none)'}"
+        )
+    try:
+        args = json.loads(body) if body.strip() else {}
+    except json.JSONDecodeError as e:
+        raise ToolError(f"<mcp>: args body must be JSON ({e})")
+    if not isinstance(args, dict):
+        raise ToolError("<mcp>: args body must be a JSON object")
+    panel(
+        f"MCP call: {server}.{tool}",
+        Syntax(json.dumps(args, indent=2), "json", theme="ansi_dark"),
+        style="bright_blue",
+    )
+    out = client.call(tool, args)
+    if len(out) > 6000:
+        out = out[:6000] + "\n[... truncated ...]"
+    panel(
+        f"MCP result: {server}.{tool}",
+        Syntax(out, "text", theme="ansi_dark"),
+        style="bright_blue" if not out.startswith("ERROR:") else "red",
+    )
+    return out
+
+
+# --------------------------------------------------------------------------
 # Background task tracker (long-running shell jobs with ntfy phone push)
 # --------------------------------------------------------------------------
 #
@@ -2256,7 +2490,7 @@ class ToolCall:
 #   block:         <tool_name attr="val">body</tool_name>
 TAG_PAT = re.compile(
     r"<(?P<name>read|write|edit|bash|grep|glob|delegate|"
-    r"test|lint|build|web_search|web_fetch|plan|image)"
+    r"test|lint|build|web_search|web_fetch|plan|image|mcp)"
     # attrs: greedy any-char-but-> with a tail-trim of optional `/` so we still
     # detect self-closing tags. Previous version excluded `/` which broke
     # paths like `/tmp/foo`.
@@ -2275,7 +2509,7 @@ RUN_LEGACY_PAT = re.compile(r"^RUN:\s*(.+?)\s*$", re.MULTILINE)
 # happens to mention the tag name.
 OPENER_FALLBACK_PAT = re.compile(
     r"<(?P<name>read|write|edit|bash|grep|glob|delegate|"
-    r"test|lint|build|web_search|web_fetch|plan|image)"
+    r"test|lint|build|web_search|web_fetch|plan|image|mcp)"
     r"(?P<attrs>\s+[^>]+?)\s*/?>"
     r"(?!.*</(?P=name)>)",  # only if there's no matching close downstream
     re.DOTALL,
@@ -3851,6 +4085,11 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
     lb = lessons_block()
     if lb:
         parts.append(lb)
+    # If joe is connected to external MCP servers, list their tools so the
+    # orchestrator knows it can call them.
+    mcp_block = _mcp_tools_block()
+    if mcp_block:
+        parts.append(mcp_block)
     profile = _load_profile(cwd)
     profile_block = _profile_block(profile)
     if profile_block:
@@ -4019,6 +4258,8 @@ def run_turn(
                 result = tool_web_fetch(call.attrs, call.body)
             elif call.name == "image":
                 result = tool_image(call.attrs, call.body)
+            elif call.name == "mcp":
+                result = tool_mcp(call.attrs, call.body)
             elif call.name == "plan":
                 # Don't execute inline; hand back to the user so they can
                 # approve. The model will see this as "plan acknowledged".
@@ -4089,6 +4330,9 @@ def run_turn(
 def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[str]) -> int:
     cwd = Path.cwd()
     banner(model, cwd)
+    # Best-effort: spin up any configured external MCP clients. Failures
+    # are printed inline and don't block REPL start.
+    _mcp_connect_all()
     state = {
         "model": model,
         "coder": coder_model,
@@ -5421,6 +5665,50 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                     continue
                 console.print("[dim]/macro record <name> | stop | run <name> | list | drop <name>[/]")
                 continue
+            if cmd == "mcp":
+                sub, _, rest = args.partition(" ")
+                if not sub or sub == "list":
+                    _mcp_connect_all()
+                    if not _MCP_CLIENTS:
+                        console.print(
+                            "[dim](no MCP clients configured; run "
+                            "[bold]joe mcp init[/] to scaffold ~/.joe-agent/mcp-clients.json)[/]"
+                        )
+                        continue
+                    blocks: list[str] = []
+                    for name, client in _MCP_CLIENTS.items():
+                        status = "[green]connected[/]" if client.connected \
+                            else f"[red]failed[/] ({client._connect_error})"
+                        if client.connected:
+                            tools = "\n".join(
+                                f"    [bold]{t.name}[/]  [dim]{(getattr(t, 'description', '') or '').strip()[:80]}[/]"
+                                for t in client.tools
+                            )
+                        else:
+                            tools = ""
+                        blocks.append(
+                            f"[bold bright_blue]@{name}[/]  {status}\n{tools}"
+                        )
+                    panel(
+                        f"MCP clients ({len(_MCP_CLIENTS)})",
+                        Text.from_markup("\n\n".join(blocks)),
+                        style="bright_blue",
+                        subtitle=str(MCP_CLIENTS_CONFIG),
+                    )
+                    continue
+                if sub == "reload":
+                    # Tear down + reconnect. Used after editing the config.
+                    for c in list(_MCP_CLIENTS.values()):
+                        try:
+                            if c._loop and c._loop.is_running():
+                                c._loop.call_soon_threadsafe(c._loop.stop)
+                        except Exception:
+                            pass
+                    _MCP_CLIENTS.clear()
+                    _mcp_connect_all()
+                    continue
+                console.print("[dim]/mcp list  |  /mcp reload[/]")
+                continue
             if cmd == "tasks":
                 cmd_tasks(); continue
             if cmd == "task":
@@ -5820,6 +6108,65 @@ def cmd_replay(session: str, alt_model: Optional[str] = None) -> int:
                 Markdown(rerun) if len(rerun) < 6000 else Text(rerun[:6000]),
                 style="bright_blue",
             )
+    return 0
+
+
+def cmd_mcp_init() -> int:
+    """Scaffold ~/.joe-agent/mcp-clients.json with two commented-out example
+    servers (filesystem, github). All entries start as enabled=false so joe
+    doesn't try to connect to anything you haven't reviewed."""
+    if MCP_CLIENTS_CONFIG.exists():
+        console.print(
+            f"[yellow]{MCP_CLIENTS_CONFIG} already exists; not overwriting.[/]"
+        )
+        return 0
+    sample = {
+        "servers": [
+            {
+                "name": "filesystem",
+                "transport": "stdio",
+                "enabled": False,
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem",
+                         str(HOME / "Desktop")],
+                "_help": (
+                    "Official filesystem MCP server. Set enabled=true and "
+                    "adjust the path to expose only the dir you want."
+                ),
+            },
+            {
+                "name": "github",
+                "transport": "stdio",
+                "enabled": False,
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "<paste-PAT-here>"},
+                "_help": (
+                    "Official GitHub MCP server. Paste a fine-grained PAT "
+                    "above and set enabled=true."
+                ),
+            },
+        ],
+        "_help": (
+            "Every entry has `enabled: false` by default. Flip to true after "
+            "you've reviewed the command + args. Restart joe (or run /mcp "
+            "reload) to pick up changes. transports: 'stdio' supported in v1."
+        ),
+    }
+    MCP_CLIENTS_CONFIG.write_text(json.dumps(sample, indent=2) + "\n")
+    panel(
+        "joe mcp init",
+        Text.from_markup(
+            f"[bold]wrote:[/] {MCP_CLIENTS_CONFIG}\n"
+            f"[bold]install:[/]\n"
+            f"  python3 -m pip install --user mcp\n"
+            f"  brew install node  (or any way to get npx)\n\n"
+            f"[dim]edit the file, flip [bold]enabled[/] to true on the\n"
+            f"servers you want, then [bold]joe mcp reload[/] (in REPL) or\n"
+            f"restart joe.[/]"
+        ),
+        style="green",
+    )
     return 0
 
 
@@ -6353,6 +6700,23 @@ def main() -> int:
         return cmd_ios_setup()
     if argv and argv[0] == "stats":
         return cmd_stats()
+    if argv and argv[0] == "mcp":
+        if len(argv) < 2 or argv[1] not in {"init", "list"}:
+            console.print("[red]usage: joe mcp init | list[/]")
+            return 1
+        if argv[1] == "init":
+            return cmd_mcp_init()
+        if argv[1] == "list":
+            _mcp_connect_all()
+            if not _MCP_CLIENTS:
+                console.print(
+                    "[dim](no MCP clients configured; joe mcp init scaffolds the config)[/]"
+                )
+                return 0
+            for name, c in _MCP_CLIENTS.items():
+                status = "ok" if c.connected else "FAIL"
+                print(f"  {status:<4}  {name:<24}  {len(c.tools)} tool(s)")
+            return 0
     if argv and argv[0] == "replay":
         if len(argv) < 2:
             console.print("[red]usage: joe replay <session> [alt-model][/]"); return 1
@@ -6446,6 +6810,8 @@ def main() -> int:
     if args.prompt:
         cwd = Path.cwd()
         session = args.session or f"joe-oneshot-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        # One-shot also gets MCP clients so the orchestrator can use them.
+        _mcp_connect_all()
         run_turn(
             model=args.model, coder_model=args.coder, user_msg=args.prompt,
             cwd=cwd, session=session, allow_all_bash=args.unsafe_bash,

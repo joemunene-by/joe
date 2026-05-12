@@ -297,11 +297,50 @@ Click the menu-bar icon to toggle the dashboard window. Left-click
 toggles; right-click opens the menu (Open / Refresh / Quit). The app
 reuses your existing `joe-http` server and auth token.
 
+## bidirectional MCP
+
+joe is now both an MCP server **and** a client. As of v0.7.0:
+
+- **server side** (`joe-mcp`): exposes joe's tools (ask, search_repos,
+  pr_draft, standup) to any MCP client (Claude Code, Cursor, Continue).
+- **client side**: connects to external MCP servers configured at
+  `~/.joe-agent/mcp-clients.json` and lets the orchestrator call their
+  tools via a `<mcp>` tag.
+
+Setup:
+
+```sh
+joe mcp init                  # scaffolds ~/.joe-agent/mcp-clients.json
+                              # with filesystem + github sample servers
+                              # (both disabled-by-default)
+# edit the file, flip `enabled: true` on the servers you want
+python3 -m pip install --user mcp   # if you don't already have it
+joe                           # at startup, joe connects each enabled server
+```
+
+Inside the REPL:
+
+```
+/mcp list      # show connected servers + their tools
+/mcp reload    # tear down + reconnect after editing the config
+```
+
+The orchestrator sees available tools in an `<mcp_tools>` block in its
+system prompt and can call them with:
+
+```xml
+<mcp server="github" tool="list_repos">{"owner": "joemunene-by"}</mcp>
+```
+
+Results come back through the standard `<tool_result>` loop.
+
 ## what's not in here yet
 
-- Bidirectional MCP (joe driving other MCP servers' tools as a client,
-  not just exposing itself to Claude Code via joe-mcp). Substantial
-  async integration work; queued for the next round.
+The headline open items are shipped. Future polish:
+
+- HTTP transport for MCP clients (currently stdio-only).
+- A `joe stats --export csv` flag.
+- More piper-tts voices via a per-language `--setup-piper <locale>` flow.
 
 PRs welcome.
 
