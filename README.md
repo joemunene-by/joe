@@ -334,6 +334,31 @@ system prompt and can call them with:
 
 Results come back through the standard `<tool_result>` loop.
 
+### example: joe talking to ghostloop
+
+ghostloop (the robotics-agent sister project) already ships an MCP
+server at `examples/mcp_robot.py`. With one config entry in
+`~/.joe-agent/mcp-clients.json` joe becomes a client of that server:
+
+```json
+{
+  "servers": [{
+    "name": "ghostloop",
+    "transport": "stdio",
+    "enabled": true,
+    "command": "python3",
+    "args": ["/absolute/path/to/ghostloop/examples/mcp_robot.py"],
+    "env": {"GHOSTLOOP_PROFILE": "franka_arm", "GHOSTLOOP_BACKEND": "mock"}
+  }]
+}
+```
+
+joe-gemma now sees `move_to`, `pick`, `place`, `scan` etc. in
+`<mcp_tools>` and can drive a robot from any prompt. ghostloop's
+policy pipeline (geofence, force-cap, human-in-the-loop) still gates
+every intent so joe can use the robot but can't bypass safety. Full
+sample at `examples/mcp-clients.ghostloop.json`.
+
 ## what's not in here yet
 
 The headline open items are shipped. Future polish:

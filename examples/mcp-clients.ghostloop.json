@@ -1,0 +1,20 @@
+{
+  "_help": "Sample mcp-clients.json that wires joe to ghostloop's robot MCP server.\nCopy to ~/.joe-agent/mcp-clients.json, edit the path, then run `joe mcp reload`.\nghostloop's policy pipeline (geofence, force-cap, HITL gates) still gates every\nintent joe emits, so joe can drive the robot but cannot bypass safety.",
+  "servers": [
+    {
+      "name": "ghostloop",
+      "transport": "stdio",
+      "enabled": true,
+      "command": "python3",
+      "args": [
+        "/REPLACE/WITH/ABSOLUTE/PATH/TO/ghostloop/examples/mcp_robot.py"
+      ],
+      "env": {
+        "GHOSTLOOP_PROFILE": "franka_arm",
+        "GHOSTLOOP_BACKEND": "mock",
+        "GHOSTLOOP_TRANSPORT": "stdio"
+      },
+      "_help": "Other profiles: turtlebot, spot, tello, stretch, humanoid_demo, or path/to/your_robot.yaml. Other backends: mock, mujoco (needs ghostloop[mujoco]), ros2 (needs ROS 2 humble + ghostloop[ros2])."
+    }
+  ]
+}
