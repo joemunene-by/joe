@@ -299,17 +299,13 @@ reuses your existing `joe-http` server and auth token.
 
 ## what's not in here yet
 
-- Linux feature parity is mostly there (notify-send instead of osascript,
-  espeak/piper instead of say, xclip/wl-copy instead of pbcopy, fswatch
-  works on Linux too) — but the launchd-only bits (`joe-schedule`) still
-  assume macOS. A systemd-user equivalent is the obvious port.
-- Bidirectional MCP (joe driving Claude Code and vice-versa).
-- Multi-agent debate mode (`/debate <topic>` spawning multiple personas
-  with conflicting prompts).
-- Encrypted state-at-rest for `joe sync` (currently the gitignore keeps
-  large/sensitive blobs out; an `age`-based encrypt-before-commit pass
-  would let `joe-state` live on any host).
-- More TTS voices on Linux via piper-tts auto-config.
+- Bidirectional MCP (joe driving other MCP servers' tools as a client,
+  not just exposing itself to Claude Code via joe-mcp).
+- More TTS voices on Linux via piper-tts auto-download + config.
+- A web-based key-management dashboard for `joe sync --encrypt` (right
+  now you ship the `age` key file between machines yourself).
+- Telemetry-free local analytics: most-used slashes, peak hours,
+  longest sessions, per-repo time spent.
 
 PRs welcome on any of these.
 

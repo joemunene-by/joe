@@ -1171,14 +1171,140 @@ knowledge-index.sqlite
 
 # legacy / not-yet-used
 .DS_Store
+
+# encryption key material (always private, never sync)
+sync-age.key
 """
+
+# When --encrypt is on, the *plain* versions of these files stay local
+# (gitignored) and only the .age ciphertext lands in the synced repo.
+_ENCRYPTED_FILES = (
+    "joe-sessions.sqlite",
+    "lessons.sqlite",
+    "knowledge.sqlite",
+    "prompt-supplement.md",
+)
+
+
+def _age_available() -> bool:
+    return shutil.which("age") is not None and shutil.which("age-keygen") is not None
+
+
+def _age_keyfile() -> Path:
+    return STATE_DIR / "sync-age.key"
+
+
+def _age_pubkey() -> Optional[str]:
+    key = _age_keyfile()
+    if not key.is_file():
+        return None
+    try:
+        cp = subprocess.run(
+            ["age-keygen", "-y", str(key)],
+            capture_output=True, text=True, timeout=5,
+        )
+        if cp.returncode == 0:
+            return cp.stdout.strip()
+    except Exception:
+        return None
+    return None
+
+
+def _sync_encrypt(plain_files: tuple[str, ...]) -> int:
+    """Encrypt each named file in STATE_DIR to <name>.age in-place."""
+    pub = _age_pubkey()
+    if not pub:
+        console.print(
+            "[red]no age key found; run [bold]joe sync encrypt-init[/] first[/]"
+        )
+        return 1
+    n = 0
+    for name in plain_files:
+        src = STATE_DIR / name
+        if not src.is_file():
+            continue
+        dst = src.with_suffix(src.suffix + ".age")
+        cp = subprocess.run(
+            ["age", "-r", pub, "-o", str(dst), str(src)],
+            capture_output=True, text=True,
+        )
+        if cp.returncode == 0:
+            n += 1
+        else:
+            console.print(f"[red]encrypt failed for {name}: {cp.stderr.strip()}[/]")
+    console.print(f"[dim]encrypted {n} file(s) -> *.age[/]")
+    return 0
+
+
+def _sync_decrypt() -> int:
+    key = _age_keyfile()
+    if not key.is_file():
+        console.print(
+            "[red]no age key at {0}; copy it from your other machine first[/]"
+            .format(key)
+        )
+        return 1
+    n = 0
+    for age_path in STATE_DIR.glob("*.age"):
+        # Strip .age suffix.
+        plain = age_path.with_suffix("")
+        cp = subprocess.run(
+            ["age", "-d", "-i", str(key), "-o", str(plain), str(age_path)],
+            capture_output=True, text=True,
+        )
+        if cp.returncode == 0:
+            n += 1
+        else:
+            console.print(f"[red]decrypt failed for {age_path.name}: {cp.stderr.strip()}[/]")
+    console.print(f"[dim]decrypted {n} file(s)[/]")
+    return 0
 
 
 def cmd_sync(args: list[str]) -> int:
     if not args:
-        console.print("[dim]joe sync init <git-url> | push | pull | status[/]")
+        console.print(
+            "[dim]joe sync init <git-url> | push [--encrypt] | "
+            "pull [--encrypt] | status | encrypt-init[/]"
+        )
         return 1
     sub = args[0]
+    encrypt = "--encrypt" in args
+    args = [a for a in args if a != "--encrypt"]
+    sub = args[0]  # in case --encrypt was first
+    if sub == "encrypt-init":
+        if not _age_available():
+            console.print(
+                "[red]`age` and `age-keygen` not on PATH.[/] install with:\n"
+                "  brew install age  (macOS)\n"
+                "  apt install age   (Debian/Ubuntu)\n"
+                "then re-run [bold]joe sync encrypt-init[/]"
+            )
+            return 1
+        key = _age_keyfile()
+        if key.exists():
+            console.print(f"[yellow]key already exists at {key}[/]")
+        else:
+            cp = subprocess.run(
+                ["age-keygen", "-o", str(key)],
+                capture_output=True, text=True,
+            )
+            if cp.returncode != 0:
+                console.print(f"[red]age-keygen failed: {cp.stderr.strip()}[/]")
+                return 1
+            key.chmod(0o600)
+        pub = _age_pubkey() or "(unknown)"
+        panel(
+            "joe sync encrypt-init",
+            Text.from_markup(
+                f"[bold]key file:[/]    {key}  [dim](600, never sync this)[/]\n"
+                f"[bold]public key:[/]  {pub}\n\n"
+                "[dim]on your other machine, copy sync-age.key into\n"
+                f"~/.joe-agent/ before running [bold]joe sync pull --encrypt[/]\n"
+                "(the gitignore excludes it from the sync repo)[/]"
+            ),
+            style="green",
+        )
+        return 0
     git = shutil.which("git")
     if not git:
         console.print("[red]git not on PATH[/]"); return 1
@@ -1221,8 +1347,24 @@ def cmd_sync(args: list[str]) -> int:
         subprocess.run([git, "-C", str(STATE_DIR), "log", "--oneline", "-5"])
         return 0
     if sub == "push":
+        if encrypt:
+            # On encrypt mode, also add plain sensitive files to gitignore
+            # (idempotent) so only the .age ciphertext lands in the repo.
+            gi = STATE_DIR / ".gitignore"
+            existing = gi.read_text() if gi.is_file() else ""
+            extras = [f for f in _ENCRYPTED_FILES if f not in existing]
+            if extras:
+                with gi.open("a") as f:
+                    f.write("\n# joe sync --encrypt: keep plain files local\n")
+                    for f_name in extras:
+                        f.write(f"{f_name}\n")
+            rc = _sync_encrypt(_ENCRYPTED_FILES)
+            if rc != 0:
+                return rc
         subprocess.run([git, "-C", str(STATE_DIR), "add", "-A"], check=False)
         msg = f"joe sync: {dt.datetime.now().isoformat(timespec='seconds')}"
+        if encrypt:
+            msg += " (encrypted)"
         cp = subprocess.run(
             [git, "-C", str(STATE_DIR), "commit", "-m", msg],
             capture_output=True, text=True,
@@ -1248,7 +1390,11 @@ def cmd_sync(args: list[str]) -> int:
         panel("joe sync pull",
               Text(out or "(no output)"),
               style="green" if cp.returncode == 0 else "red")
-        return cp.returncode
+        if cp.returncode != 0:
+            return cp.returncode
+        if encrypt:
+            _sync_decrypt()
+        return 0
     console.print(f"[red]unknown sync sub: {sub}[/]")
     return 1
 
@@ -2702,6 +2848,46 @@ def parse_plan_block(text: str) -> Optional[Plan]:
     return Plan(title=title, steps=steps)
 
 
+def _plan_validate(plan: Plan, cwd: Path) -> tuple[list[str], list[str]]:
+    """Look at each plan step for file-path-shaped tokens and check the
+    repo for them. Returns (present, missing) lists. Used to warn the
+    user before kicking the plan loop on a hallucinated codebase.
+    """
+    # Pull the repo's file list (empty if not a git repo).
+    repo_files: set[str] = set()
+    try:
+        cp = subprocess.run(
+            ["git", "-C", str(cwd), "ls-files"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if cp.returncode == 0:
+            repo_files = set(cp.stdout.splitlines())
+    except Exception:
+        pass
+    # File-shaped token: looks like a path with a recognised code extension.
+    pat = re.compile(
+        r"(?:[\w./@-]+/)?[\w@-]+\."
+        r"(?:ts|tsx|js|jsx|py|rs|go|rb|java|kt|swift|c|cc|cpp|h|hpp|md|toml|yaml|yml|json|sh)"
+    )
+    seen: set[str] = set()
+    present: list[str] = []
+    missing: list[str] = []
+    for step in plan.steps:
+        for m in pat.findall(step):
+            tok = m.strip("` ,.:;\"'")
+            if tok in seen:
+                continue
+            seen.add(tok)
+            # Match by suffix so 'src/foo.py' hits 'project/src/foo.py'.
+            hit = (
+                tok in repo_files
+                or any(rf.endswith(tok) for rf in repo_files)
+                or (cwd / tok).exists()
+            )
+            (present if hit else missing).append(tok)
+    return present, missing
+
+
 def _plan_grounding(cwd: Path) -> str:
     """Probe cwd before plan execution so steps don't hallucinate files.
 
@@ -2771,6 +2957,36 @@ def execute_plan(
     """
     panel(plan.title, plan.render(), style="bright_cyan",
           subtitle=f"{len(plan.steps)} steps")
+
+    # Prerequisite check: if every file mentioned in the steps is absent
+    # from the repo, the planner likely hallucinated a codebase. Warn but
+    # let the user proceed (some plans create new files).
+    present, missing = _plan_validate(plan, cwd)
+    if missing and not present:
+        panel(
+            "plan prerequisite check failed",
+            Text.from_markup(
+                f"[bold red]The plan references {len(missing)} path(s) that "
+                f"don't exist in this repo[/]:\n"
+                + "\n".join(f"  - [yellow]{p}[/]" for p in missing[:12])
+                + (f"\n  ... +{len(missing) - 12} more" if len(missing) > 12 else "")
+                + "\n\n[dim]Likely the planner hallucinated a codebase. "
+                "Either /cwd to the real project, or refine the prompt with "
+                "actual file names from the repo.[/]"
+            ),
+            style="red",
+            subtitle=plan.title,
+        )
+        if not _confirm("Run the plan anyway?"):
+            console.print("[yellow]plan aborted (failed prereq check)[/]")
+            return
+    elif missing:
+        console.print(
+            f"[dim]plan references {len(present)} known + {len(missing)} "
+            f"unknown path(s); the unknown ones may be files the plan will "
+            f"create.[/]"
+        )
+
     if not _confirm(f"Execute this {len(plan.steps)}-step plan?"):
         console.print("[yellow]plan aborted[/]")
         return
@@ -4931,6 +5147,95 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                 if not args:
                     console.print("[red]/ask needs a question[/]"); continue
                 cmd_ask(args, state["model"])
+                continue
+            if cmd == "debate":
+                if not args:
+                    console.print(
+                        "[red]/debate <topic>[/]  or  "
+                        "[red]/debate @@a @@b @@c <topic>[/]"
+                    )
+                    continue
+                # Pick personas: explicit @@names first, else 3 sensible defaults
+                # whose system prompts already have distinct viewpoints.
+                tokens = args.split()
+                explicit: list[str] = []
+                rest_idx = 0
+                for t in tokens:
+                    if t.startswith("@@"):
+                        explicit.append(t[2:])
+                        rest_idx += 1
+                    else:
+                        break
+                topic = " ".join(tokens[rest_idx:]).strip()
+                persona_names = explicit if explicit else [
+                    "reviewer", "security", "explainer",
+                ]
+                if not topic:
+                    console.print("[red]/debate needs a topic[/]"); continue
+                personas: list[Agent] = []
+                for n in persona_names:
+                    a = _load_agent(n)
+                    if not a:
+                        console.print(f"[yellow]skipping unknown agent: @@{n}[/]")
+                        continue
+                    personas.append(a)
+                if len(personas) < 2:
+                    console.print(
+                        "[red]/debate needs at least 2 known personas[/]")
+                    continue
+                other_names = lambda me: ", ".join(
+                    f"@@{p.name}" for p in personas if p.name != me
+                )
+                console.print(
+                    f"[bright_blue]debating[/] [bold]{topic}[/]  "
+                    f"[dim]({len(personas)} personas)[/]"
+                )
+                takes: list[tuple[str, str]] = []
+                for p in personas:
+                    spec = (
+                        f"<persona name=\"{p.name}\" description=\"{p.description}\">\n"
+                        f"{p.system_prompt}\n</persona>\n\n"
+                        f"You are debating with {other_names(p.name)}. "
+                        f"Surface disagreement where you genuinely have a different "
+                        f"view; don't manufacture conflict. Be specific: state what "
+                        f"you'd optimise for, what you'd refuse, and the single "
+                        f"strongest reason the other personas might be wrong.\n\n"
+                        f"Topic: {topic}\n\n"
+                        f"Reply in under 200 words. No preamble."
+                    )
+                    try:
+                        out = _ollama_once(p.model, spec, timeout=180).strip()
+                    except Exception as e:
+                        out = f"(error: {e})"
+                    takes.append((p.name, out))
+                    panel(
+                        f"@@{p.name}  [dim]({p.model})[/]",
+                        Markdown(out) if len(out) < 4000 else Text(out[:4000]),
+                        style="bright_blue",
+                    )
+                # Synthesis turn.
+                joined = "\n\n".join(
+                    f"### @@{n}\n{t}" for n, t in takes
+                )
+                synth_spec = (
+                    "Here are takes from "
+                    f"{len(takes)} personas on the same topic. Surface the "
+                    "STRONGEST disagreement (1-3 axes max) and call the "
+                    "winner if you can. If they're all saying roughly the "
+                    "same thing, say so plainly. End with a 1-line "
+                    "recommendation. No fluff.\n\n"
+                    f"Topic: {topic}\n\n{joined}"
+                )
+                try:
+                    synth = _ollama_once(state["model"], synth_spec).strip()
+                except Exception as e:
+                    synth = f"(synthesis failed: {e})"
+                panel(
+                    "synthesis",
+                    Markdown(synth),
+                    style="green",
+                    subtitle=f"{len(takes)} takes on  {topic[:60]}",
+                )
                 continue
             if cmd == "inbox":
                 cmd_inbox(); continue

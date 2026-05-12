@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
-"""joe-schedule: a thin launchd wrapper for arbitrary recurring tasks.
+"""joe-schedule: a thin scheduler wrapper for arbitrary recurring tasks.
 
 Lets you schedule any shell command to run on a cron-style cadence
-without hand-writing a .plist. Wraps launchctl so listing / loading /
-unloading is one command each.
+without hand-writing platform-specific unit files. macOS uses launchd
+(.plist), Linux uses systemd-user (.service + .timer).
 
 Usage:
   joe-schedule add NAME --at "HH:MM" --command "..."        daily at HH:MM
   joe-schedule add NAME --interval 3600 --command "..."     every N seconds
   joe-schedule add NAME --weekday Mon --at "09:00" --command "..."
   joe-schedule list                                         show all joe-* jobs
-  joe-schedule show NAME                                    full plist + state
+  joe-schedule show NAME                                    full unit + state
   joe-schedule run NAME                                     fire it now
   joe-schedule remove NAME                                  unload + delete
 
-NAME is namespaced under $JOE_LABEL_PREFIX<name> (default: com.joe-agent.).
-Plists live at ~/Library/LaunchAgents/<prefix><name>.plist.
-Stdout / stderr go to /tmp/joe-schedule-<name>.{out,err}.log.
+NAME is namespaced under $JOE_LABEL_PREFIX<name> (default: com.joe-agent.
+on macOS, joe- on Linux). Units live at ~/Library/LaunchAgents/<prefix><name>.plist
+on macOS, ~/.config/systemd/user/<prefix><name>.{service,timer} on Linux.
+Stdout / stderr go to /tmp/joe-schedule-<name>.{out,err}.log on both.
 
-This is intentionally a thin convenience layer: there's no fancy
-DSL, just enough surface to spin up an scheduled "every weekday at
-8am, run X" job without leaving the terminal.
+This is intentionally a thin convenience layer: there's no fancy DSL,
+just enough surface to spin up a scheduled "every weekday at 8am, run X"
+job without leaving the terminal.
 """
 
 from __future__ import annotations
@@ -36,9 +37,16 @@ from pathlib import Path
 from typing import Optional
 
 HOME = Path.home()
-PLIST_DIR = HOME / "Library" / "LaunchAgents"
-PLIST_DIR.mkdir(parents=True, exist_ok=True)
-LABEL_PREFIX = os.environ.get("JOE_LABEL_PREFIX", "com.joe-agent.")
+_IS_DARWIN = sys.platform == "darwin"
+
+if _IS_DARWIN:
+    UNIT_DIR = HOME / "Library" / "LaunchAgents"
+    DEFAULT_PREFIX = "com.joe-agent."
+else:
+    UNIT_DIR = HOME / ".config" / "systemd" / "user"
+    DEFAULT_PREFIX = "joe-"
+UNIT_DIR.mkdir(parents=True, exist_ok=True)
+LABEL_PREFIX = os.environ.get("JOE_LABEL_PREFIX", DEFAULT_PREFIX)
 
 WEEKDAY_TO_INT = {
     "sun": 0, "sunday": 0,
@@ -49,6 +57,16 @@ WEEKDAY_TO_INT = {
     "fri": 5, "friday": 5,
     "sat": 6, "saturday": 6,
 }
+# systemd OnCalendar weekday names (different from launchd integer mapping).
+WEEKDAY_TO_SYSTEMD = {
+    "sun": "Sun", "sunday": "Sun",
+    "mon": "Mon", "monday": "Mon",
+    "tue": "Tue", "tuesday": "Tue",
+    "wed": "Wed", "wednesday": "Wed",
+    "thu": "Thu", "thursday": "Thu",
+    "fri": "Fri", "friday": "Fri",
+    "sat": "Sat", "saturday": "Sat",
+}
 
 
 def _label(name: str) -> str:
@@ -58,7 +76,15 @@ def _label(name: str) -> str:
 
 
 def _plist_path(name: str) -> Path:
-    return PLIST_DIR / f"{_label(name)}.plist"
+    return UNIT_DIR / f"{_label(name)}.plist"
+
+
+def _service_path(name: str) -> Path:
+    return UNIT_DIR / f"{_label(name)}.service"
+
+
+def _timer_path(name: str) -> Path:
+    return UNIT_DIR / f"{_label(name)}.timer"
 
 
 def _stdout_log(name: str) -> str:
@@ -79,7 +105,12 @@ def _parse_hhmm(s: str) -> tuple[int, int]:
     return h, mi
 
 
-def cmd_add(args: argparse.Namespace) -> int:
+# --------------------------------------------------------------------------
+# macOS path: launchd .plist
+# --------------------------------------------------------------------------
+
+
+def _macos_add(args: argparse.Namespace) -> int:
     label = _label(args.name)
     p = _plist_path(args.name)
     if p.exists() and not args.force:
@@ -94,11 +125,9 @@ def cmd_add(args: argparse.Namespace) -> int:
     }
 
     schedule_set = False
-
     if args.interval is not None:
         plist["StartInterval"] = int(args.interval)
         schedule_set = True
-
     if args.at:
         h, mi = _parse_hhmm(args.at)
         sched: dict = {"Hour": h, "Minute": mi}
@@ -121,8 +150,6 @@ def cmd_add(args: argparse.Namespace) -> int:
     with p.open("wb") as f:
         plistlib.dump(plist, f)
     print(f"[joe-schedule] wrote {p}")
-
-    # Unload first in case it already exists, then load.
     subprocess.run(["launchctl", "unload", str(p)], capture_output=True)
     cp = subprocess.run(["launchctl", "load", str(p)], capture_output=True, text=True)
     if cp.returncode != 0:
@@ -131,14 +158,13 @@ def cmd_add(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_list(args: argparse.Namespace) -> int:
+def _macos_list() -> int:
     cp = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
     rows = []
     for line in cp.stdout.splitlines():
         if LABEL_PREFIX not in line:
             continue
         parts = line.split()
-        # `pid status label`
         pid, status, label = parts[0], parts[1], parts[2]
         name = label[len(LABEL_PREFIX):]
         plist = _plist_path(name)
@@ -173,14 +199,14 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_show(args: argparse.Namespace) -> int:
-    p = _plist_path(args.name)
+def _macos_show(name: str) -> int:
+    p = _plist_path(name)
     if not p.exists():
         raise SystemExit(f"joe-schedule: no plist at {p}")
     print(p.read_text())
     print()
-    print(f"--- last 20 lines of {_stdout_log(args.name)} ---")
-    log = Path(_stdout_log(args.name))
+    print(f"--- last 20 lines of {_stdout_log(name)} ---")
+    log = Path(_stdout_log(name))
     if log.exists():
         print("\n".join(log.read_text().splitlines()[-20:]))
     else:
@@ -188,43 +214,237 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_run(args: argparse.Namespace) -> int:
+def _macos_run(name: str) -> int:
     cp = subprocess.run(
-        ["launchctl", "start", _label(args.name)],
+        ["launchctl", "start", _label(name)],
         capture_output=True, text=True,
     )
     if cp.returncode != 0:
         raise SystemExit(f"joe-schedule: launchctl start failed: {cp.stderr.strip()}")
-    print(f"[joe-schedule] kicked {args.name}")
-    # Tail the log briefly so user can see something.
+    print(f"[joe-schedule] kicked {name}")
     time.sleep(1)
-    log = Path(_stdout_log(args.name))
+    log = Path(_stdout_log(name))
     if log.exists():
         print(f"--- {log} ---")
         print(log.read_text())
     return 0
 
 
-def cmd_remove(args: argparse.Namespace) -> int:
-    p = _plist_path(args.name)
+def _macos_remove(name: str) -> int:
+    p = _plist_path(name)
     if not p.exists():
         raise SystemExit(f"joe-schedule: no plist at {p}")
     subprocess.run(["launchctl", "unload", str(p)], capture_output=True)
     p.unlink()
-    for log in (_stdout_log(args.name), _stderr_log(args.name)):
+    for log in (_stdout_log(name), _stderr_log(name)):
         try:
             Path(log).unlink()
         except OSError:
             pass
-    print(f"[joe-schedule] removed {args.name}")
+    print(f"[joe-schedule] removed {name}")
     return 0
+
+
+# --------------------------------------------------------------------------
+# Linux path: systemd-user .service + .timer
+# --------------------------------------------------------------------------
+
+
+def _systemctl(*args: str, capture: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["systemctl", "--user", *args],
+        capture_output=capture, text=True,
+    )
+
+
+def _linux_add(args: argparse.Namespace) -> int:
+    label = _label(args.name)
+    svc = _service_path(args.name)
+    tim = _timer_path(args.name)
+    if (svc.exists() or tim.exists()) and not args.force:
+        raise SystemExit(
+            f"joe-schedule: {svc} or {tim} already exists; pass --force to overwrite"
+        )
+
+    # Service unit: oneshot bash -c <command>.
+    cmd_escaped = args.command.replace("\\", "\\\\").replace('"', '\\"')
+    service_body = (
+        f"[Unit]\n"
+        f"Description=joe-schedule {args.name}\n"
+        f"\n"
+        f"[Service]\n"
+        f"Type=oneshot\n"
+        f'ExecStart=/bin/bash -lc "{cmd_escaped}"\n'
+        f"StandardOutput=append:{_stdout_log(args.name)}\n"
+        f"StandardError=append:{_stderr_log(args.name)}\n"
+    )
+    svc.write_text(service_body)
+    print(f"[joe-schedule] wrote {svc}")
+
+    # Timer unit: either OnUnitActiveSec (interval) or OnCalendar (at/weekday).
+    timer_body = (
+        f"[Unit]\n"
+        f"Description=joe-schedule {args.name} timer\n"
+        f"\n"
+        f"[Timer]\n"
+    )
+    schedule_set = False
+    if args.interval is not None:
+        n = int(args.interval)
+        timer_body += f"OnBootSec={n}s\nOnUnitActiveSec={n}s\n"
+        schedule_set = True
+    if args.at:
+        h, mi = _parse_hhmm(args.at)
+        if args.weekday:
+            wd = args.weekday.lower()
+            if wd not in WEEKDAY_TO_SYSTEMD:
+                raise SystemExit(f"joe-schedule: bad --weekday {args.weekday!r}")
+            timer_body += f"OnCalendar={WEEKDAY_TO_SYSTEMD[wd]} *-*-* {h:02d}:{mi:02d}:00\n"
+        elif args.day:
+            timer_body += f"OnCalendar=*-*-{int(args.day):02d} {h:02d}:{mi:02d}:00\n"
+        else:
+            timer_body += f"OnCalendar=*-*-* {h:02d}:{mi:02d}:00\n"
+        timer_body += "Persistent=true\n"
+        schedule_set = True
+    if not schedule_set:
+        if args.run_at_load:
+            # No timer; the service unit will run on systemctl --user start.
+            timer_body = ""
+        else:
+            raise SystemExit(
+                "joe-schedule add: provide one of --at HH:MM, --interval SECONDS, "
+                "or --run-at-load"
+            )
+    if timer_body:
+        timer_body += "\n[Install]\nWantedBy=timers.target\n"
+        tim.write_text(timer_body)
+        print(f"[joe-schedule] wrote {tim}")
+
+    _systemctl("daemon-reload")
+    if timer_body:
+        cp = _systemctl("enable", "--now", f"{label}.timer")
+        if cp.returncode != 0:
+            raise SystemExit(f"[joe-schedule] systemctl enable failed: {cp.stderr.strip()}")
+    if args.run_at_load:
+        _systemctl("start", f"{label}.service")
+    print(f"[joe-schedule] loaded {label}")
+    return 0
+
+
+def _linux_list() -> int:
+    cp = _systemctl("list-timers", "--all", "--no-legend", "--no-pager")
+    rows: list[tuple[str, str, str]] = []
+    for line in cp.stdout.splitlines():
+        if f" {LABEL_PREFIX}" not in line and not line.startswith(LABEL_PREFIX):
+            continue
+        # systemctl output: NEXT LEFT LAST PASSED UNIT ACTIVATES
+        parts = line.split()
+        # find the unit name
+        unit = next((p for p in parts if p.endswith(".timer")), "")
+        if not unit.startswith(LABEL_PREFIX):
+            continue
+        name = unit[len(LABEL_PREFIX):-len(".timer")]
+        sched = " ".join(parts[:2]) if len(parts) >= 2 else "(scheduled)"
+        # Status: read the service active-state.
+        sc = _systemctl("is-active", f"{LABEL_PREFIX}{name}.service")
+        status = sc.stdout.strip()
+        rows.append((name, status, sched))
+    if not rows:
+        print("(no joe-* scheduled jobs)")
+        return 0
+    name_w = max(len(r[0]) for r in rows)
+    print(f"{'NAME':<{name_w}}  {'STATUS':<10}  NEXT FIRE")
+    for name, status, sched in rows:
+        print(f"{name:<{name_w}}  {status:<10}  {sched}")
+    return 0
+
+
+def _linux_show(name: str) -> int:
+    svc = _service_path(name)
+    tim = _timer_path(name)
+    if not svc.exists():
+        raise SystemExit(f"joe-schedule: no service unit at {svc}")
+    print(f"--- {svc} ---")
+    print(svc.read_text())
+    if tim.exists():
+        print(f"--- {tim} ---")
+        print(tim.read_text())
+    print(f"--- last 20 lines of {_stdout_log(name)} ---")
+    log = Path(_stdout_log(name))
+    if log.exists():
+        print("\n".join(log.read_text().splitlines()[-20:]))
+    else:
+        print("(no stdout log yet)")
+    print()
+    print(f"--- systemctl --user status {_label(name)}.timer ---")
+    sc = _systemctl("status", "--no-pager", f"{_label(name)}.timer")
+    print(sc.stdout[:2000])
+    return 0
+
+
+def _linux_run(name: str) -> int:
+    cp = _systemctl("start", f"{_label(name)}.service")
+    if cp.returncode != 0:
+        raise SystemExit(f"joe-schedule: systemctl start failed: {cp.stderr.strip()}")
+    print(f"[joe-schedule] kicked {name}")
+    time.sleep(1)
+    log = Path(_stdout_log(name))
+    if log.exists():
+        print(f"--- {log} ---")
+        print(log.read_text())
+    return 0
+
+
+def _linux_remove(name: str) -> int:
+    svc = _service_path(name)
+    tim = _timer_path(name)
+    if not svc.exists() and not tim.exists():
+        raise SystemExit(f"joe-schedule: no units for {name}")
+    if tim.exists():
+        _systemctl("disable", "--now", f"{_label(name)}.timer")
+        tim.unlink()
+    if svc.exists():
+        svc.unlink()
+    _systemctl("daemon-reload")
+    for log in (_stdout_log(name), _stderr_log(name)):
+        try:
+            Path(log).unlink()
+        except OSError:
+            pass
+    print(f"[joe-schedule] removed {name}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Public commands (platform-dispatched)
+# --------------------------------------------------------------------------
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    return _macos_add(args) if _IS_DARWIN else _linux_add(args)
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    return _macos_list() if _IS_DARWIN else _linux_list()
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    return _macos_show(args.name) if _IS_DARWIN else _linux_show(args.name)
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    return _macos_run(args.name) if _IS_DARWIN else _linux_run(args.name)
+
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    return _macos_remove(args.name) if _IS_DARWIN else _linux_remove(args.name)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(prog="joe-schedule")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    a = sub.add_parser("add", help="create + load a launchd job")
+    a = sub.add_parser("add", help="create + load a scheduled job")
     a.add_argument("name")
     a.add_argument("--command", required=True, help="shell command to run")
     a.add_argument("--at", help="HH:MM time to fire (24-hour)")
@@ -232,12 +452,12 @@ def main() -> int:
     a.add_argument("--weekday", help="restrict --at to a weekday (Mon, Tue, ...)")
     a.add_argument("--day", help="day of month (1-31) for --at")
     a.add_argument("--run-at-load", action="store_true",
-                   help="also run immediately when launchd reloads")
+                   help="also run immediately when the unit loads")
     a.add_argument("--force", action="store_true", help="overwrite if exists")
 
     sub.add_parser("list", help="show all joe-* scheduled jobs")
 
-    sh = sub.add_parser("show", help="print plist + recent log")
+    sh = sub.add_parser("show", help="print unit + recent log")
     sh.add_argument("name")
 
     rn = sub.add_parser("run", help="kick a job now")
