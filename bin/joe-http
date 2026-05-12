@@ -29,9 +29,12 @@ Tunnel or Tailscale rather than opening the Mac firewall.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import html
 import json
 import os
 import secrets
+import sqlite3
 import subprocess
 import threading
 import urllib.request
@@ -39,7 +42,8 @@ from pathlib import Path
 from typing import Optional
 
 try:
-    from fastapi import FastAPI, Header, HTTPException
+    from fastapi import FastAPI, Header, HTTPException, Request
+    from fastapi.responses import HTMLResponse
     from pydantic import BaseModel
     import uvicorn
 except ImportError as e:
@@ -251,6 +255,269 @@ def ios(req: IOSRequest, authorization: Optional[str] = Header(None)):
         args.extend(["--model", req.model])
     args.append(req.prompt)
     return {"answer": _run_joe_agent(args)}
+
+
+# --------------------------------------------------------------------------
+# Web dashboard: one page rendering live state from the joe sqlite DBs.
+# Bearer auth via query string (?token=<TOKEN>) since browsers can't easily
+# send Authorization headers on a top-level page load.
+# --------------------------------------------------------------------------
+
+
+def _check_auth_qs(token: Optional[str]) -> None:
+    if not token or token != TOKEN:
+        raise HTTPException(status_code=403, detail="missing or invalid ?token=")
+
+
+def _safe_query(db: Path, sql: str, params: tuple = ()) -> list[tuple]:
+    if not db.is_file():
+        return []
+    try:
+        c = sqlite3.connect(str(db))
+        rows = c.execute(sql, params).fetchall()
+        c.close()
+        return rows
+    except sqlite3.Error:
+        return []
+
+
+def _eval_sparkline(values: list[float], width: int = 220, height: int = 36) -> str:
+    """Render a tiny inline SVG sparkline for a series of similarity scores."""
+    if not values:
+        return '<span style="color:#888">(no eval runs)</span>'
+    lo, hi = min(values), max(values)
+    span = max(1e-9, hi - lo)
+    pts = []
+    for i, v in enumerate(values):
+        x = (i / max(1, len(values) - 1)) * width
+        y = height - ((v - lo) / span) * (height - 4) - 2
+        pts.append(f"{x:.1f},{y:.1f}")
+    polyline = " ".join(pts)
+    last_x = pts[-1].split(",")[0]
+    last_y = pts[-1].split(",")[1]
+    return (
+        f'<svg width="{width}" height="{height}" '
+        f'style="vertical-align:middle">'
+        f'<polyline points="{polyline}" fill="none" stroke="#7fd17f" stroke-width="2"/>'
+        f'<circle cx="{last_x}" cy="{last_y}" r="3" fill="#7fd17f"/>'
+        f'</svg>'
+    )
+
+
+def _render_dashboard_html() -> str:
+    state = Path.home() / ".joe-agent"
+
+    # Provenance: most-recent 10 writes/edits.
+    prov_rows = _safe_query(
+        state / "provenance.sqlite",
+        "SELECT ts, path, op, agent, model, user_msg, adds, dels"
+        " FROM provenance ORDER BY ts DESC LIMIT 10",
+    )
+
+    # Eval: per-model avg over time.
+    eval_rows = _safe_query(
+        state / "evals.sqlite",
+        "SELECT ts, model, AVG(score) FROM results"
+        " GROUP BY ts, model ORDER BY ts ASC",
+    )
+    by_model: dict[str, list[tuple[str, float]]] = {}
+    for ts, model, avg in eval_rows:
+        by_model.setdefault(model, []).append((ts, avg))
+
+    # Knowledge graph: total triples + 10 newest.
+    kg_count_rows = _safe_query(
+        state / "knowledge.sqlite", "SELECT COUNT(*) FROM triples",
+    )
+    kg_n = kg_count_rows[0][0] if kg_count_rows else 0
+    kg_newest = _safe_query(
+        state / "knowledge.sqlite",
+        "SELECT subject, relation, object, session, ts FROM triples"
+        " ORDER BY ts DESC LIMIT 12",
+    )
+
+    # Lessons active rules.
+    rules = _safe_query(
+        state / "lessons.sqlite",
+        "SELECT rule FROM rules WHERE status = 'active' ORDER BY id ASC",
+    )
+
+    # Sessions: top 10 by recency.
+    sessions = _safe_query(
+        state / "joe-sessions.sqlite",
+        "SELECT session, COUNT(*), MAX(ts) FROM turns"
+        " GROUP BY session ORDER BY MAX(ts) DESC LIMIT 10",
+    )
+
+    # Background tasks: walk the tasks dir.
+    tasks_dir = state / "tasks"
+    task_blocks: list[str] = []
+    if tasks_dir.is_dir():
+        for f in sorted(tasks_dir.glob("*.json"))[-8:]:
+            try:
+                d = json.loads(f.read_text())
+                tid = d.get("id", "")
+                status = d.get("status", "")
+                cmd = d.get("cmd", "")[:80]
+                color = {"running": "#cf9b00", "finished": "#7fd17f",
+                         "failed": "#d94a4a", "orphaned": "#a060c0"}.get(status, "#aaa")
+                task_blocks.append(
+                    f'<li>#{tid} <span style="color:{color}">{status}</span> '
+                    f'<code>{html.escape(cmd)}</code></li>'
+                )
+            except Exception:
+                continue
+
+    # Active model marker.
+    active_model = "joe-gemma"
+    am = state / "active-model"
+    if am.is_file():
+        active_model = am.read_text().strip()
+
+    # Render.
+    parts: list[str] = []
+
+    def section(title: str, body: str) -> None:
+        parts.append(
+            f'<section><h2>{html.escape(title)}</h2>{body}</section>'
+        )
+
+    # Banner.
+    parts.append(
+        f'<header><h1>joe</h1>'
+        f'<div class="sub">local-first agent dashboard '
+        f'<code>{html.escape(active_model)}</code> '
+        f'</div></header>'
+    )
+
+    # Eval sparklines.
+    eval_body = ""
+    for model in sorted(by_model.keys()):
+        series = by_model[model]
+        avgs = [a for _, a in series]
+        latest = avgs[-1] if avgs else 0.0
+        prev = avgs[-2] if len(avgs) >= 2 else latest
+        delta = latest - prev
+        sign = "+" if delta >= 0 else ""
+        color = "#7fd17f" if delta >= 0 else "#d94a4a"
+        eval_body += (
+            f'<div class="evalrow">'
+            f'<code>{html.escape(model)}</code> '
+            f'<span class="score">{latest:.3f}</span> '
+            f'<span style="color:{color}">{sign}{delta:.3f}</span> '
+            f'{_eval_sparkline(avgs)}</div>'
+        )
+    if not eval_body:
+        eval_body = '<p class="dim">No eval runs yet. Try <code>joe eval build && joe eval run</code>.</p>'
+    section("Eval trend (similarity to gold)", eval_body)
+
+    # Provenance.
+    prov_body = '<table><thead><tr><th>when</th><th>op</th><th>path</th><th>agent</th><th>prompt</th><th>±</th></tr></thead><tbody>'
+    for ts, path, op, agent, model, user_msg, adds, dels in prov_rows:
+        agent_display = f"@@{agent}" if agent else "—"
+        path_short = path.replace(str(Path.home()), "~")[-60:]
+        msg_short = (user_msg or "")[:80]
+        prov_body += (
+            f'<tr><td>{html.escape(ts[:16])}</td>'
+            f'<td><code>{op}</code></td>'
+            f'<td title="{html.escape(path)}">{html.escape(path_short)}</td>'
+            f'<td>{html.escape(agent_display)}</td>'
+            f'<td class="dim">{html.escape(msg_short)}</td>'
+            f'<td>+{adds}/-{dels}</td></tr>'
+        )
+    prov_body += '</tbody></table>'
+    if not prov_rows:
+        prov_body = '<p class="dim">No tracked writes yet.</p>'
+    section(f"Provenance (latest 10)", prov_body)
+
+    # Knowledge graph.
+    kg_body = f'<p>{kg_n} triples total.</p>'
+    if kg_newest:
+        kg_body += '<table><thead><tr><th>subject</th><th>relation</th><th>object</th><th>session</th></tr></thead><tbody>'
+        for s, r, o, sess, ts in kg_newest:
+            kg_body += (
+                f'<tr><td>{html.escape(s[:40])}</td>'
+                f'<td><em>{html.escape(r[:30])}</em></td>'
+                f'<td>{html.escape(o[:60])}</td>'
+                f'<td class="dim">{html.escape(sess[:20])} · {html.escape(ts[:10])}</td></tr>'
+            )
+        kg_body += '</tbody></table>'
+    section("Knowledge graph (12 newest triples)", kg_body)
+
+    # Lessons.
+    if rules:
+        rules_body = '<ol>' + "".join(
+            f'<li>{html.escape(r[0])}</li>' for r in rules
+        ) + '</ol>'
+    else:
+        rules_body = '<p class="dim">No distilled rules yet. <code>joe lessons distill</code> turns recent /undo events into rules.</p>'
+    section("Active lessons", rules_body)
+
+    # Sessions + tasks side-by-side.
+    sess_body = '<ul>'
+    for sess, n, last_ts in sessions:
+        sess_body += (
+            f'<li><code>{html.escape(sess)}</code> '
+            f'<span class="dim">{n} turns · {html.escape(last_ts[:16])}</span></li>'
+        )
+    sess_body += '</ul>' if sessions else '</ul><p class="dim">No sessions yet.</p>'
+    section("Recent sessions", sess_body)
+
+    if task_blocks:
+        section("Background tasks", '<ul>' + "".join(task_blocks) + '</ul>')
+
+    # Footer with refresh + token tip.
+    parts.append(
+        '<footer><p class="dim">'
+        'Refresh the page for live data. '
+        'Endpoints under same auth: <code>/health</code> · '
+        '<code>/chat</code> · <code>/ios</code> · <code>/standup/latest</code>.'
+        '</p></footer>'
+    )
+
+    css = """
+    * { box-sizing: border-box; }
+    body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, sans-serif;
+           background: #0e0e10; color: #e8e8e8; margin: 0; padding: 24px;
+           max-width: 980px; margin-inline: auto; }
+    h1 { font-size: 28px; margin: 0; color: #fff; }
+    h2 { font-size: 16px; margin: 32px 0 12px; color: #cfd8dc;
+         text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+    header .sub { color: #888; margin-top: 4px; }
+    section { border-top: 1px solid #1f1f24; padding-top: 4px; }
+    code { font: 12px/1.4 ui-monospace, SFMono-Regular, monospace;
+           background: #1a1a1f; padding: 1px 4px; border-radius: 3px;
+           color: #f0c674; }
+    em { color: #81a1c1; font-style: normal; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 6px 10px; border-bottom: 1px solid #1f1f24;
+             text-align: left; vertical-align: top; font-size: 13px; }
+    th { color: #888; font-weight: 600; text-transform: uppercase;
+         font-size: 11px; letter-spacing: 0.5px; }
+    .dim { color: #888; }
+    .evalrow { padding: 6px 0; display: flex; align-items: center;
+               gap: 12px; }
+    .score { font-weight: 600; color: #7fd17f; font-variant-numeric: tabular-nums; }
+    ol, ul { padding-left: 22px; }
+    li { margin: 4px 0; }
+    footer { margin-top: 48px; color: #555; font-size: 12px;
+             border-top: 1px solid #1f1f24; padding-top: 16px; }
+    """
+    return f"""<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>joe dashboard</title>
+  <style>{css}</style>
+</head><body>
+{"".join(parts)}
+</body></html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard(token: Optional[str] = None) -> HTMLResponse:
+    _check_auth_qs(token)
+    return HTMLResponse(_render_dashboard_html())
 
 
 # --------------------------------------------------------------------------

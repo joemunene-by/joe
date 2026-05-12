@@ -41,7 +41,9 @@ from pathlib import Path
 from typing import Optional
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "joe-gemma"
+# joe-pair fires on every file save, so default to a fast/small model unless
+# the user overrides via --model or the active profile sets fast_model.
+DEFAULT_MODEL = os.environ.get("JOE_PAIR_MODEL", "qwen2.5:3b")
 HOME = Path.home()
 STATE_DIR = HOME / ".joe-agent"
 PROFILES_DIR = STATE_DIR / "profiles"
@@ -90,6 +92,11 @@ def _notify(title: str, body: str, topic: str = "") -> None:
              f'display notification "{body_s}" with title "{title_s}"'],
             capture_output=True,
         )
+    else:
+        nsend = shutil.which("notify-send")
+        if nsend:
+            subprocess.run([nsend, "--app-name=joe-pair", title_s, body_s],
+                           capture_output=True)
     if topic:
         try:
             req = urllib.request.Request(
@@ -199,6 +206,9 @@ def main() -> int:
         return 1
     profile = _load_profile(cwd)
     test_cmd = "" if args.no_test else (profile.get("test_cmd") or "")
+    # Profile override: a per-repo fast_model wins over the binary default.
+    if profile.get("fast_model") and args.model == DEFAULT_MODEL:
+        args.model = profile["fast_model"]
 
     print(
         f"[joe-pair] watching {cwd}\n"

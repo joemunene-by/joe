@@ -2,8 +2,10 @@
 # want joe to treat specially. `joe init` generates this for you if you
 # point it at a fresh repo.
 
-default_coder = "qwen2.5-coder:14b"   # model to delegate code-writing to
-default_base = "main"                  # base branch for /pr review
+default_coder = "qwen2.5-coder:14b"    # model to delegate code-writing to
+planner       = "deepseek-r1:14b"      # used by /plan; falls back to model
+fast_model    = "qwen2.5:3b"           # joe-pair + trivial tasks (low-RAM)
+default_base  = "main"                  # base branch for /pr review
 lint_cmd = "ruff check ."
 test_cmd = "pytest"
 build_cmd = "python3 -m build"

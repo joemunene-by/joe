@@ -7,8 +7,10 @@ the longer you use it.
 
 ```
 joe (your terminal)
-  ├── orchestrator    joe-gemma   (gemma3:4b, personalised via Modelfile)
-  ├── coder delegate  qwen2.5-coder:7b / 14b
+  ├── orchestrator    joe-gemma             (gemma3:4b, Modelfile-personalised)
+  ├── coder delegate  qwen2.5-coder:7b/14b
+  ├── planner         deepseek-r1:14b       (optional; used by /plan)
+  ├── fast model      qwen2.5:3b            (joe-pair save-watcher, trivials)
   └── tools           read/write/edit/bash/grep/glob/web_search/web_fetch
                       test/lint/build/plan/image/delegate
 
@@ -60,7 +62,10 @@ The seven features that make joe interesting:
 Plus the everyday surface: macros, scheduled jobs, cross-session memory,
 voice input/output, vision, iOS bridge over ntfy, cross-machine sync
 through a private git repo, per-repo profiles with auto-detected style
-fingerprints.
+fingerprints, a web dashboard at `joe-http` for the visual view, model
+auto-promotion when a freshly-trained candidate beats the current
+default by a threshold, and time-aware semantic recall ("what was I
+working on yesterday morning?").
 
 ## quickstart
 
@@ -82,13 +87,22 @@ joe doctor                            # confirm everything is wired
 joe                                   # start the REPL
 ```
 
-First time you run `joe`, it auto-seeds four default subagents at
-`~/.joe-agent/agents/{reviewer,doc-writer,security,explainer}.toml`.
+First time you run `joe`, it auto-seeds seven default subagents at
+`~/.joe-agent/agents/{reviewer,doc-writer,security,explainer,oncall,release-manager,refactor-specialist}.toml`.
 Try one:
 
 ```
 @@reviewer review the current diff
 ```
+
+If you'd rather have `joe doctor` install missing pieces for you instead
+of installing manually, run `joe doctor --fix` after `./install.sh`. It
+pulls missing ollama models and pip-installs missing Python deps.
+
+For a guided tour of the killer features on a sample repo, run
+`joe demo`: it creates a fresh project, makes a deliberately-buggy file,
+runs `@@reviewer` and `@@security` on it, then walks you through
+`/blame`, `/ask`, and `/tasks`. The thing to record a launch GIF of.
 
 ## the input prefixes
 
@@ -236,17 +250,36 @@ generation. Cross-session memory uses nomic-embed-text against a
 SQLite-backed vector store. The lessons supplement and knowledge-graph
 triples are stored separately and merged into every prompt's preamble.
 
+## the web dashboard
+
+`joe-http` exposes a single-page dashboard at `GET /` (or `/dashboard`)
+that renders, all in one screen:
+
+- eval-trend sparklines per model (with delta vs previous run)
+- the last 10 provenance entries (which prompt / agent produced each write)
+- knowledge-graph stats and the 12 newest triples
+- active distilled lessons
+- recent sessions and background tasks
+
+Auth is the same bearer token as the JSON endpoints, passed via
+`?token=<TOKEN>` so browsers can hit it without setting headers:
+
+```
+http://localhost:8765/dashboard?token=<from ~/.joe-agent/http-token>
+```
+
+Front it with Tailscale to view from your phone on the couch.
+
 ## what's not in here yet
 
-- Linux feature-parity for the macOS-specific paths (osascript, say,
-  pbpaste, fswatch -> inotify, launchd -> systemd-user). Most of the
-  agent works on Linux; the assistive bits don't.
-- Auto-installer for ollama models.
-- A web dashboard (FastAPI on `joe-http` could render inbox / blame /
-  graph in one pane).
-- Bidirectional MCP (joe driving Claude Code and vice-versa via the
-  same tool set).
-- Multi-agent debate mode.
+- Linux feature parity is mostly there (notify-send instead of osascript,
+  espeak/piper instead of say, xclip/wl-copy instead of pbcopy, fswatch
+  works on Linux too) — but the launchd-only bits (`joe-schedule`) still
+  assume macOS. A systemd-user equivalent is the obvious port.
+- Bidirectional MCP (joe driving Claude Code and vice-versa).
+- Multi-agent debate mode (`/debate <topic>` spawning multiple personas
+  with conflicting prompts).
+- More TTS voices on Linux via piper-tts auto-config.
 
 PRs welcome on any of these.
 

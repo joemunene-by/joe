@@ -102,16 +102,20 @@ def _ntfy_push(topic: str, title: str, body: str) -> None:
 
 
 def _osascript_notify(title: str, body: str) -> None:
-    if sys.platform != "darwin":
-        return
-    # Escape double quotes for AppleScript.
+    """Portable desktop notification: osascript on macOS, notify-send on Linux."""
     body_s = body.replace('"', '\\"')[:240]
     title_s = title.replace('"', '\\"')[:60]
-    subprocess.run(
-        ["osascript", "-e",
-         f'display notification "{body_s}" with title "{title_s}"'],
-        capture_output=True,
-    )
+    if sys.platform == "darwin":
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{body_s}" with title "{title_s}"'],
+            capture_output=True,
+        )
+        return
+    nsend = __import__("shutil").which("notify-send")
+    if nsend:
+        subprocess.run([nsend, "--app-name=joe-watch-logs", title_s, body_s],
+                       capture_output=True)
 
 
 def _ollama_check(model: str, lines: list[tuple[str, str]]) -> Optional[str]:

@@ -84,6 +84,12 @@ def _notify(title: str, body: str, topic: str = "") -> None:
              f'display notification "{body_short}" with title "{title_short}"'],
             capture_output=True,
         )
+    else:
+        import shutil as _sh
+        nsend = _sh.which("notify-send")
+        if nsend:
+            subprocess.run([nsend, "--app-name=joe-proactive", title_short, body_short],
+                           capture_output=True)
     if topic:
         try:
             req = urllib.request.Request(

@@ -83,6 +83,13 @@ OLLAMA_URL = "http://localhost:11434/api/generate"
 # (e.g. joe-gemma:v20260512) without editing this file.
 DEFAULT_MODEL = os.environ.get("JOE_DEFAULT_MODEL", "joe-gemma")
 DEFAULT_CODER = os.environ.get("JOE_DEFAULT_CODER", "qwen2.5-coder:14b")
+# Three-tier model setup for RAM-constrained machines (16 GB target):
+#   fast_model = small + quick (qwen2.5:3b ~ 2 GB) for save-watchers, trivial tasks
+#   default_coder = main coder (qwen2.5-coder:14b ~ 9 GB) for normal codegen
+#   planner = reasoning model (deepseek-r1:14b ~ 9 GB) for /plan, hard tasks
+# Profiles can override any of these per-repo.
+DEFAULT_FAST = os.environ.get("JOE_DEFAULT_FAST", "qwen2.5:3b")
+DEFAULT_PLANNER = os.environ.get("JOE_DEFAULT_PLANNER", "deepseek-r1:14b")
 HARD_MODEL = "deepseek-v4-pro:cloud"
 MAX_AUTO_TURNS = 8  # max tool-call iterations before we stop and ask the user
 HOME = Path.home()
@@ -154,6 +161,137 @@ ALLOWED_BASH_PROGRAMS = {
 # --------------------------------------------------------------------------
 
 console = Console()
+
+
+# --------------------------------------------------------------------------
+# Portable OS helpers: notify, speak, clipboard read/write.
+# joe is Mac-first but everything below has a Linux fallback so the agent
+# core works without code changes when you `joe sync pull` to a Linux box.
+# --------------------------------------------------------------------------
+
+_IS_DARWIN = sys.platform == "darwin"
+
+
+def os_notify(title: str, body: str) -> None:
+    """Pop a desktop notification. macOS uses osascript, Linux notify-send."""
+    title_s = title[:80].replace('"', '\\"')
+    body_s = body[:240].replace('"', '\\"')
+    if _IS_DARWIN:
+        osa = shutil.which("osascript")
+        if not osa:
+            return
+        subprocess.run(
+            [osa, "-e",
+             f'display notification "{body_s}" with title "{title_s}"'],
+            capture_output=True,
+        )
+        return
+    nsend = shutil.which("notify-send")
+    if nsend:
+        subprocess.run([nsend, "--app-name=joe", title_s, body_s],
+                       capture_output=True)
+
+
+def os_speak(text: str, voice: str = "Samantha", rate: int = 200,
+             background: bool = True) -> None:
+    """TTS. macOS: `say`. Linux: piper-tts (preferred), else espeak."""
+    if not text.strip():
+        return
+    if _IS_DARWIN:
+        say = shutil.which("say")
+        if not say:
+            return
+        cmd = [say, "-v", voice, "-r", str(rate), text[:4000]]
+    else:
+        piper = shutil.which("piper-tts") or shutil.which("piper")
+        espeak = shutil.which("espeak") or shutil.which("espeak-ng")
+        if piper:
+            # Piper has no built-in playback; pipe to aplay. Skipping unless
+            # both are present.
+            aplay = shutil.which("aplay") or shutil.which("paplay")
+            if not aplay:
+                espeak = espeak or shutil.which("espeak")
+            else:
+                ph = subprocess.Popen(
+                    [piper, "--model", "en_US-lessac-medium"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                ah = subprocess.Popen([aplay, "-q"], stdin=ph.stdout,
+                                      stderr=subprocess.DEVNULL)
+                ph.stdin.write(text[:4000].encode()); ph.stdin.close()
+                if not background:
+                    ah.wait()
+                return
+        if not espeak:
+            return
+        cmd = [espeak, "-s", str(int(rate * 0.9)), text[:4000]]
+    if background:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(cmd)
+
+
+def os_clip_copy(text: str) -> bool:
+    """Put text on the system clipboard. Returns True on success."""
+    candidates: list[list[str]] = []
+    if _IS_DARWIN:
+        if shutil.which("pbcopy"):
+            candidates.append(["pbcopy"])
+    else:
+        # Wayland first, then X11.
+        if shutil.which("wl-copy"):
+            candidates.append(["wl-copy"])
+        if shutil.which("xclip"):
+            candidates.append(["xclip", "-selection", "clipboard"])
+        if shutil.which("xsel"):
+            candidates.append(["xsel", "--clipboard", "--input"])
+    for cmd in candidates:
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            p.communicate(text.encode())
+            if p.returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def os_clip_image() -> Optional[Path]:
+    """Capture the clipboard image to a temp PNG. Returns path or None."""
+    out_dir = STATE_DIR / "pastes"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"paste-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
+    if _IS_DARWIN:
+        pngpaste = shutil.which("pngpaste")
+        if not pngpaste:
+            raise ToolError("pngpaste not found. Install with: brew install pngpaste")
+        cp = subprocess.run([pngpaste, str(out_path)],
+                            capture_output=True, text=True)
+        if cp.returncode != 0:
+            raise ToolError(
+                f"pngpaste failed; is there an image on the clipboard? "
+                f"(stderr: {cp.stderr.strip()})"
+            )
+    else:
+        xclip = shutil.which("xclip")
+        wl = shutil.which("wl-paste")
+        if wl:
+            cp = subprocess.run([wl, "-t", "image/png", "--no-newline"],
+                                capture_output=True)
+        elif xclip:
+            cp = subprocess.run(
+                [xclip, "-selection", "clipboard", "-t", "image/png", "-o"],
+                capture_output=True,
+            )
+        else:
+            raise ToolError("no clipboard image tool found; install xclip or wl-clipboard")
+        if cp.returncode != 0 or not cp.stdout:
+            raise ToolError("clipboard does not contain an image (or no image tool)")
+        out_path.write_bytes(cp.stdout)
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        raise ToolError("clipboard image is empty")
+    return out_path
 
 
 _BRAND = r"""
@@ -1186,7 +1324,9 @@ def cmd_eval(args: list[str], default_model: str) -> int:
         console.print(f"[green]eval set built[/]: {added} entries")
         return 0
     if sub == "run":
-        model = args[1] if len(args) > 1 else default_model
+        auto_promote = "--auto-promote" in args
+        args_no_flags = [a for a in args if a != "--auto-promote"]
+        model = args_no_flags[1] if len(args_no_flags) > 1 else default_model
         c = _evaldb()
         items = c.execute(
             "SELECT id, user_msg, gold_embed FROM eval_set"
@@ -1224,6 +1364,42 @@ def cmd_eval(args: list[str], default_model: str) -> int:
             f"[green]eval done[/]  model={model}  n={len(scores)}  "
             f"avg_similarity={avg:.3f}"
         )
+        # Auto-promotion: compare to the most-recent eval of any other model.
+        if auto_promote:
+            threshold = float(os.environ.get("JOE_PROMOTE_THRESHOLD", "0.02"))
+            c = _evaldb()
+            rivals = c.execute(
+                "SELECT model, AVG(score), MAX(ts) AS last_ts"
+                " FROM results WHERE model != ? AND ts != ?"
+                " GROUP BY model ORDER BY last_ts DESC LIMIT 5",
+                (model, ts),
+            ).fetchall()
+            c.close()
+            beaten: list[tuple[str, float]] = [
+                (m, avg - a) for m, a, _ in rivals if (avg - a) >= threshold
+            ]
+            current = os.environ.get("JOE_DEFAULT_MODEL", default_model)
+            if beaten and model != current:
+                marker = STATE_DIR / "active-model"
+                marker.write_text(model)
+                deltas = ", ".join(f"{m} (+{d:.3f})" for m, d in beaten)
+                panel(
+                    "model promoted",
+                    Text.from_markup(
+                        f"[bold green]new active model:[/] {model}\n"
+                        f"[bold]beats:[/]              {deltas}\n"
+                        f"[bold]marker:[/]             {marker}\n\n"
+                        f"[dim]flip your shell default to make it stick:\n"
+                        f"  echo 'export JOE_DEFAULT_MODEL={model}' >> ~/.zshrc[/]"
+                    ),
+                    style="green",
+                    subtitle=f"threshold +{threshold:.2f}",
+                )
+            elif auto_promote:
+                console.print(
+                    f"[dim](auto-promote: {model} did not beat current "
+                    f"default by >= {threshold:.2f})[/]"
+                )
         return 0
     if sub == "report":
         c = _evaldb()
@@ -1522,17 +1698,11 @@ def _task_notify(data: dict) -> None:
             urllib.request.urlopen(req, timeout=5).close()
         except Exception:
             pass
-    # Local macOS banner.
-    osa = shutil.which("osascript")
-    if osa:
-        try:
-            subprocess.run(
-                [osa, "-e",
-                 f'display notification "{msg}" with title "joe-task"'],
-                capture_output=True, timeout=3,
-            )
-        except Exception:
-            pass
+    # Local banner (portable: osascript on macOS, notify-send on Linux).
+    try:
+        os_notify("joe-task", msg)
+    except Exception:
+        pass
 
 
 def _task_watch(tid: str, proc: subprocess.Popen) -> None:
@@ -1725,18 +1895,81 @@ def history_remember(session: str, user_msg: str, asst_msg: str) -> None:
     c.commit(); c.close()
 
 
+def _parse_time_phrase(query: str) -> tuple[Optional[str], Optional[str], str]:
+    """Sniff temporal hints out of a free-text query.
+
+    Returns (since_iso, until_iso, cleaned_query) where the ISO strings
+    are UTC timestamps (or None) and cleaned_query has the time phrase
+    stripped if we matched one. Best-effort; misses fall back to no
+    time filter.
+    """
+    now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    patterns: list[tuple[str, dt.datetime, Optional[dt.datetime]]] = [
+        # phrase                         since                              until
+        (r"\btoday\b",                  today_start,                        None),
+        (r"\bthis morning\b",           today_start,                        today_start + dt.timedelta(hours=12)),
+        (r"\bthis afternoon\b",         today_start + dt.timedelta(hours=12), today_start + dt.timedelta(hours=18)),
+        (r"\bthis evening\b",           today_start + dt.timedelta(hours=18), today_start + dt.timedelta(days=1)),
+        (r"\byesterday morning\b",      today_start - dt.timedelta(days=1),  today_start - dt.timedelta(days=1) + dt.timedelta(hours=12)),
+        (r"\byesterday afternoon\b",    today_start - dt.timedelta(days=1) + dt.timedelta(hours=12), today_start - dt.timedelta(days=1) + dt.timedelta(hours=18)),
+        (r"\byesterday\b",              today_start - dt.timedelta(days=1),  today_start),
+        (r"\blast week\b",              today_start - dt.timedelta(days=7),  today_start),
+        (r"\bthis week\b",              today_start - dt.timedelta(days=now.weekday()), None),
+        (r"\blast month\b",             today_start - dt.timedelta(days=30), today_start),
+    ]
+    for pat, since, until in patterns:
+        if re.search(pat, query, re.IGNORECASE):
+            cleaned = re.sub(pat, "", query, flags=re.IGNORECASE).strip()
+            return (
+                since.isoformat(),
+                until.isoformat() if until else None,
+                cleaned or query,  # keep original if cleaning emptied it
+            )
+    # "N hours/days ago"
+    m = re.search(r"\b(\d+)\s+(hour|hr|day|week)s?\s+ago\b", query, re.IGNORECASE)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2).lower()
+        delta = {
+            "hour": dt.timedelta(hours=n), "hr": dt.timedelta(hours=n),
+            "day": dt.timedelta(days=n), "week": dt.timedelta(weeks=n),
+        }[unit]
+        since = now - delta
+        cleaned = re.sub(m.re, "", query).strip()
+        return (since.isoformat(), None, cleaned or query)
+    # explicit ISO date
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", query)
+    if m:
+        y, mo, da = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        start = dt.datetime(y, mo, da)
+        return (start.isoformat(), (start + dt.timedelta(days=1)).isoformat(),
+                re.sub(m.re, "", query).strip() or query)
+    return (None, None, query)
+
+
 def history_recall(user_msg: str, k: int = 3, exclude_session: str = "") -> list[dict]:
-    """Find k most similar past turns to `user_msg`. Empty list on miss."""
+    """Find k most similar past turns to `user_msg`. Empty list on miss.
+
+    If the query contains a time phrase (today / yesterday / last week /
+    N hours ago / 2026-05-10 / etc.), narrow to that window before
+    similarity ranking.
+    """
     if len(user_msg.strip()) < 12:
-        return []  # too short to be a real lookup
-    q = _embed(user_msg)
+        return []
+    since, until, cleaned = _parse_time_phrase(user_msg)
+    q = _embed(cleaned)
     if not q:
         return []
     c = _hidb()
-    rows = c.execute(
-        "SELECT id, session, ts, user_msg, asst_msg, embed FROM hist"
-        " WHERE session != ?", (exclude_session,),
-    ).fetchall()
+    sql = ("SELECT id, session, ts, user_msg, asst_msg, embed FROM hist"
+           " WHERE session != ?")
+    params: list = [exclude_session]
+    if since:
+        sql += " AND ts >= ?"; params.append(since)
+    if until:
+        sql += " AND ts < ?"; params.append(until)
+    rows = c.execute(sql, params).fetchall()
     c.close()
     if not rows:
         return []
@@ -1746,7 +1979,9 @@ def history_recall(user_msg: str, k: int = 3, exclude_session: str = "") -> list
         scored.append((score, {"id": rid, "session": sess, "ts": ts,
                                 "user_msg": um, "asst_msg": am, "score": score}))
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [d for s, d in scored[:k] if s >= 0.35]  # filter by floor
+    # If user gave an explicit time window, lower the similarity floor.
+    floor = 0.18 if (since or until) else 0.35
+    return [d for s, d in scored[:k] if s >= floor]
 
 
 def history_block(picks: list[dict]) -> str:
@@ -2920,6 +3155,60 @@ _SEED_AGENTS: dict[str, dict] = {
         ),
         "auto_yes": False,
     },
+    "oncall": {
+        "description": "Oncall: triage failing runs, error logs, alerts. Fast and surgical.",
+        "model": "joe-gemma",
+        "coder": "qwen2.5-coder:14b",
+        "system_prompt": (
+            "You are on-call. When the user shares a failing log, stack "
+            "trace, or alert, your job is triage: (1) one sentence stating "
+            "the most likely root cause, (2) the single most-leveraged "
+            "next probe (a specific command or file to inspect), (3) the "
+            "blast radius (what else might be affected). No essays. If "
+            "the cause is genuinely unclear, say so and propose two "
+            "branching hypotheses with the cheapest test for each."
+        ),
+        "auto_yes": False,
+    },
+    "release-manager": {
+        "description": "Release manager: runs /test + /lint, drafts CHANGELOG, tags + cuts the release.",
+        "model": "joe-gemma",
+        "coder": "qwen2.5-coder:14b",
+        "system_prompt": (
+            "You cut releases. The sequence is fixed:\n"
+            "  1. Run /lint and /test in the active repo. Block on any failure.\n"
+            "  2. Skim `git log <prev-tag>..HEAD` and draft a markdown "
+            "     CHANGELOG entry: 'Added', 'Changed', 'Fixed' sections, "
+            "     each bullet under 100 chars, no marketing.\n"
+            "  3. Bump the version where the project specifies (package.json, "
+            "     Cargo.toml, pyproject.toml, __version__.py, etc.).\n"
+            "  4. Draft a release commit ('release vX.Y.Z'), then suggest "
+            "     the tag command `git tag -a vX.Y.Z -m \"...\"` for "
+            "     the user to fire.\n"
+            "Refuse to skip steps 1 or 2."
+        ),
+        "auto_yes": False,
+    },
+    "refactor-specialist": {
+        "description": "Refactor specialist: improves structure without changing behaviour.",
+        "model": "joe-gemma",
+        "coder": "qwen2.5-coder:14b",
+        "system_prompt": (
+            "You refactor code. Hard rules:\n"
+            "  - Never change behaviour. If you suspect a change does, stop "
+            "    and call it out instead of making it.\n"
+            "  - Tests must pass before and after; if there are no tests "
+            "    for the surface you're touching, write them FIRST.\n"
+            "  - Prefer smaller, reviewable steps over one big rewrite. "
+            "    A 50-line refactor PR beats a 500-line one.\n"
+            "  - For each change emit: WHAT (the structural move), WHY "
+            "    (the readability / coupling / perf reason), HOW TO "
+            "    VERIFY (the test or command that proves no regression).\n"
+            "  - Move comments and docstrings along with the code they "
+            "    describe; never orphan documentation."
+        ),
+        "auto_yes": False,
+    },
 }
 
 
@@ -3028,24 +3317,8 @@ def _drain_image_base64() -> list[str]:
 
 
 def _paste_clipboard_image() -> Optional[Path]:
-    """Capture the clipboard image via pngpaste (macOS). Returns the temp path."""
-    pngpaste = shutil.which("pngpaste")
-    if not pngpaste:
-        raise ToolError(
-            "pngpaste not found. Install with: brew install pngpaste"
-        )
-    out_dir = STATE_DIR / "pastes"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"paste-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
-    cp = subprocess.run([pngpaste, str(out_path)], capture_output=True, text=True)
-    if cp.returncode != 0:
-        raise ToolError(
-            "pngpaste failed; is there an image on the clipboard? "
-            f"(stderr: {cp.stderr.strip()})"
-        )
-    if not out_path.exists() or out_path.stat().st_size == 0:
-        raise ToolError("clipboard image is empty")
-    return out_path
+    """Capture the clipboard image. Portable across macOS + Linux."""
+    return os_clip_image()
 
 
 def tool_image(attrs: dict, body: str) -> str:
@@ -3110,14 +3383,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     console.print(f"[red]{tool_name}: {e}[/]")
                 except Exception as e:
                     console.print(f"[red]{tool_name} crashed: {e}[/]")
-            # macOS notification when both run cleanly. fswatch keeps streaming.
-            osa = shutil.which("osascript")
-            if osa:
-                subprocess.run(
-                    [osa, "-e",
-                     f'display notification "lint + test re-ran" with title "joe watch"'],
-                    capture_output=True,
-                )
+            # Desktop notification when both run cleanly. fswatch keeps streaming.
+            os_notify("joe watch", "lint + test re-ran")
     except KeyboardInterrupt:
         console.print("\n[dim]watch stopped[/]")
     finally:
@@ -3820,7 +4087,12 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
             if cmd == "plan":
                 if not args:
                     console.print("[red]/plan needs a task description[/]"); continue
-                # Force the model to start with a <plan> tag.
+                # If the active profile names a `planner`, use that model for
+                # the planning turn (typically deepseek-r1 or similar). Falls
+                # back to the orchestrator.
+                profile = _load_profile(state["cwd"])
+                planner = profile.get("planner") or DEFAULT_PLANNER
+                use_planner = planner != state["model"]
                 forced = (
                     f"{args}\n\n"
                     "Treat this as a multi-step task. Your FIRST response "
@@ -3829,8 +4101,13 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                     "tags this turn; the shell will display the plan, ask "
                     "the user to approve, then drive each step."
                 )
+                if use_planner:
+                    console.print(
+                        f"[dim]routing /plan to [bold]{planner}[/] (profile or default)[/]"
+                    )
                 try:
-                    run_turn(model=state["model"], coder_model=state["coder"],
+                    run_turn(model=planner if use_planner else state["model"],
+                             coder_model=state["coder"],
                              user_msg=forced, cwd=state["cwd"], session=state["session"],
                              allow_all_bash=allow_all_bash, max_turns=MAX_AUTO_TURNS)
                 except KeyboardInterrupt:
@@ -4040,9 +4317,6 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                 panel(f"git diff {where}", Syntax(out, "diff", theme="ansi_dark"), style="yellow")
                 continue
             if cmd == "copy":
-                pbcopy = shutil.which("pbcopy")
-                if not pbcopy:
-                    console.print("[red]/copy needs pbcopy (macOS-only)[/]"); continue
                 # Look for a code fence in the most recent assistant turn.
                 c = _db()
                 row = c.execute(
@@ -4063,9 +4337,12 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                     except IndexError:
                         console.print(f"[red]no code block #{args} (have {len(blocks)})[/]")
                         continue
-                p = subprocess.Popen([pbcopy], stdin=subprocess.PIPE)
-                p.communicate(body_to_copy.encode())
-                console.print(f"[green]copied {len(body_to_copy)} chars to clipboard[/]")
+                if os_clip_copy(body_to_copy):
+                    console.print(f"[green]copied {len(body_to_copy)} chars to clipboard[/]")
+                else:
+                    console.print(
+                        "[red]no clipboard tool found (install pbcopy / xclip / wl-clipboard)[/]"
+                    )
                 continue
             if cmd == "explain":
                 if not args:
@@ -4323,20 +4600,15 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                 seconds = max(1.0, minutes * 60)
                 def _fire(secs: float, msg: str) -> None:
                     time.sleep(secs)
-                    osa = shutil.which("osascript")
-                    if osa:
-                        subprocess.run(
-                            [osa, "-e",
-                             f'display notification "{msg} is up" with title "joe timer"'],
-                            capture_output=True,
-                        )
-                    # Also speak it if joe-speak is around.
+                    os_notify("joe timer", f"{msg} is up")
                     speak = shutil.which("joe-speak")
                     if speak:
                         subprocess.Popen(
                             [speak, "--background", f"timer done: {msg}"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         )
+                    else:
+                        os_speak(f"timer done: {msg}", background=True)
                 threading.Thread(target=_fire, args=(seconds, label), daemon=True).start()
                 eta = dt.datetime.now() + dt.timedelta(seconds=seconds)
                 console.print(
@@ -4988,36 +5260,262 @@ def cmd_ios_setup() -> int:
     return 0
 
 
+def cmd_completion(args: list[str]) -> int:
+    """Print a zsh tab-completion script for joe."""
+    if not args or args[0] not in {"zsh", "bash", "fish"}:
+        console.print(
+            "[dim]usage: joe completion zsh|bash|fish[/]\n"
+            "[dim]install with:[/]\n"
+            "  joe completion zsh > ~/.zsh/_joe   # zsh\n"
+            "  (then add 'fpath=(~/.zsh \\$fpath)' + 'autoload -U compinit; compinit'"
+            " to ~/.zshrc)"
+        )
+        return 1
+    shell = args[0]
+    cmds = (
+        "watch init self-update doctor tasks task blame ask inbox reflect "
+        "sync eval train lessons ios-setup completion demo --help -p -s"
+    ).split()
+    slashes = " ".join(f"/{n}" for n in SLASH_COMMAND_NAMES)
+    if shell == "zsh":
+        body = (
+            "#compdef joe\n"
+            "_joe() {\n"
+            "  local -a subs\n"
+            "  subs=(" + " ".join(f"'{c}'" for c in cmds) + ")\n"
+            "  _arguments '1: :->cmd' '*:: :->args'\n"
+            "  case $state in\n"
+            "    cmd)  _describe 'subcommand' subs ;;\n"
+            "    args) _files ;;\n"
+            "  esac\n"
+            "}\n"
+            "_joe \"$@\"\n"
+        )
+    elif shell == "bash":
+        body = (
+            "_joe_complete() {\n"
+            "  local cur prev\n"
+            "  cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
+            "  if [ \"$COMP_CWORD\" -eq 1 ]; then\n"
+            "    COMPREPLY=( $(compgen -W \"" + " ".join(cmds) + "\" -- \"$cur\") )\n"
+            "  else\n"
+            "    COMPREPLY=( $(compgen -f -- \"$cur\") )\n"
+            "  fi\n"
+            "}\n"
+            "complete -F _joe_complete joe\n"
+        )
+    else:  # fish
+        body = (
+            f"complete -c joe -n '__fish_use_subcommand' -a '{' '.join(cmds)}'\n"
+            "complete -c joe -F\n"
+        )
+    print(body)
+    return 0
+
+
+def cmd_demo() -> int:
+    """Run a self-contained walkthrough of joe's killer features on a sample repo.
+
+    Creates /tmp/joe-demo as a fresh Python project, runs joe init, makes a
+    deliberately-flawed file, asks @@reviewer to review it, demonstrates
+    /blame, /recall, /ask, lessons, macros. Auto-approves writes via
+    JOE_AUTO_YES=1 so the demo plays start-to-finish without prompts.
+    """
+    import tempfile
+    demo_root = Path(tempfile.gettempdir()) / "joe-demo"
+    if demo_root.exists():
+        shutil.rmtree(demo_root)
+    demo_root.mkdir(parents=True)
+    os.chdir(demo_root)
+
+    os.environ["JOE_AUTO_YES"] = "1"
+
+    def step(n: int, title: str, body: str = "") -> None:
+        console.rule(f"[bold cyan]step {n}: {title}")
+        if body:
+            console.print(body)
+
+    step(1, "create a sample Python project")
+    (demo_root / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\nversion = "0.1.0"\n'
+    )
+    src = demo_root / "src"; src.mkdir()
+    # Deliberately flawed file: silent except-pass, off-by-one slice, missing tests.
+    (src / "tokenizer.py").write_text(
+        'def split_tokens(text: str, n: int) -> list[str]:\n'
+        '    """Naive whitespace tokenizer; returns the first n tokens."""\n'
+        '    try:\n'
+        '        toks = text.split()\n'
+        '        return toks[1:n]   # bug: off-by-one slice + skips index 0\n'
+        '    except Exception:\n'
+        '        pass               # bug: silently swallows everything\n'
+    )
+    console.print(f"[dim]created {demo_root}/src/tokenizer.py with two known bugs[/]")
+
+    step(2, "joe init  (detects language, writes profile, scans style)")
+    cp = subprocess.run([sys.executable, sys.argv[0], "init", str(demo_root),
+                         "--no-index"], capture_output=True, text=True)
+    print(cp.stdout)
+
+    step(3, "@@reviewer @@security run via one-shot joe -p")
+    for agent in ("reviewer", "security"):
+        console.rule(f"[bold blue]asking @@{agent}")
+        cp = subprocess.run(
+            [sys.executable, sys.argv[0], "-p",
+             f"@@{agent} review src/tokenizer.py"],
+            cwd=str(demo_root), capture_output=True, text=True, timeout=180,
+        )
+        print(cp.stdout[-3000:] if cp.stdout else "(no output)")
+
+    step(4, "joe ask (knowledge graph, may be empty on a fresh install)")
+    cp = subprocess.run(
+        [sys.executable, sys.argv[0], "ask", "what tokenizer bugs exist in demo?"],
+        capture_output=True, text=True, timeout=30,
+    )
+    print(cp.stdout)
+
+    step(5, "/blame  (shows the AI-blame log for the file)")
+    cp = subprocess.run(
+        [sys.executable, sys.argv[0], "blame", str(src / "tokenizer.py")],
+        capture_output=True, text=True, timeout=30,
+    )
+    print(cp.stdout)
+
+    step(6, "tasks: one-line view of background work")
+    cp = subprocess.run([sys.executable, sys.argv[0], "tasks"],
+                        capture_output=True, text=True)
+    print(cp.stdout)
+
+    console.rule("[bold green]demo complete")
+    console.print(
+        f"[bold]sample repo:[/]      {demo_root}\n"
+        f"[bold]what to try next:[/]\n"
+        f"  cd {demo_root}\n"
+        f"  joe                                # start the REPL\n"
+        f"  /macro record my-morning           # capture a workflow\n"
+        f"  /lessons distill                   # turn corrections into rules\n"
+        f"  /reflect                           # write today's journal entry\n"
+        f"  joe train collect && joe train modelfile  # rebuild personalised model\n"
+    )
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
-    """`joe doctor`: dependency / environment health check (also a slash command)."""
-    rows: list[tuple[str, bool, str]] = []
-    def chk(label: str, ok: bool, detail: str = "") -> None:
-        rows.append((label, ok, detail))
+    """`joe doctor`: dependency / environment health check.
+
+    With --fix, attempts to install missing items: pulls missing ollama
+    models, pip-installs missing Python deps. System binaries still need
+    manual brew/apt (we print the command).
+    """
+    rows: list[tuple[str, bool, str, str]] = []  # label, ok, detail, fix_hint
+    def chk(label: str, ok: bool, detail: str = "", fix: str = "") -> None:
+        rows.append((label, ok, detail, fix))
+
+    # Ollama + models.
     try:
         r = urllib.request.urlopen("http://localhost:11434/api/tags", timeout=3)
         tags = json.loads(r.read()).get("models", [])
         chk("ollama", True, f"{len(tags)} models")
         names = {m.get("name", "").split(":")[0] for m in tags}
-        chk("model: joe-gemma", "joe-gemma" in names)
+        chk("model: joe-gemma", "joe-gemma" in names, "",
+            "ollama pull gemma3:4b  # then build a personalised Modelfile")
         chk("model: qwen2.5-coder",
-            any("qwen2.5-coder" in m.get("name", "") for m in tags))
-        chk("model: nomic-embed-text", "nomic-embed-text" in names)
+            any("qwen2.5-coder" in m.get("name", "") for m in tags), "",
+            "ollama pull qwen2.5-coder:14b")
+        chk("model: nomic-embed-text", "nomic-embed-text" in names, "",
+            "ollama pull nomic-embed-text")
     except Exception as e:
-        chk("ollama", False, str(e))
-    for t in ("joe-speak", "joe-listen", "joe-schedule", "gh", "git",
-              "pngpaste", "fswatch", "rec", "whisper-cli", "pbcopy"):
+        chk("ollama", False, str(e), "brew install ollama && ollama serve")
+
+    # Python deps.
+    py_deps = {
+        "rich": "rich", "prompt_toolkit": "prompt_toolkit",
+        "fastapi": "fastapi", "uvicorn": "uvicorn", "mcp": "mcp",
+    }
+    for imp, pkg in py_deps.items():
+        try:
+            __import__(imp)
+            chk(f"python: {pkg}", True)
+        except ImportError:
+            chk(f"python: {pkg}", False, "", f"python3 -m pip install --user {pkg}")
+
+    # Companion binaries (joe-*).
+    for t in ("joe-speak", "joe-listen", "joe-schedule",
+              "joe-pair", "joe-watch-logs", "joe-proactive",
+              "joe-http", "joe-mcp", "joe-index"):
         chk(t, shutil.which(t) is not None)
+
+    # System binaries: per-platform brew vs apt hints.
+    is_linux = sys.platform.startswith("linux")
+    pkg_mgr_hint = "apt install" if is_linux else "brew install"
+    for t, mac_pkg, linux_pkg in [
+        ("gh", "gh", "gh"),
+        ("git", "git", "git"),
+        ("fswatch", "fswatch", "inotify-tools  # joe will use inotifywait on Linux"),
+        ("rec", "sox", "sox"),
+        ("whisper-cli", "whisper-cpp", "(build from source: github.com/ggerganov/whisper.cpp)"),
+        ("pngpaste", "pngpaste", "(macOS only; on Linux joe uses xclip/wl-paste for images)"),
+        ("pbcopy", "(macOS built-in)", "xclip  # OR wl-clipboard"),
+        ("osascript", "(macOS built-in)", "(macOS only; on Linux joe uses notify-send)"),
+        ("notify-send", "(macOS uses osascript)", "libnotify-bin"),
+        ("espeak", "(macOS uses say)", "espeak  # or piper-tts for nicer voices"),
+    ]:
+        present = shutil.which(t) is not None
+        # Skip flagging platform-specific tools missing on the wrong platform.
+        if not present:
+            if is_linux and t in {"pngpaste", "pbcopy", "osascript"}:
+                continue
+            if not is_linux and t in {"notify-send", "espeak"}:
+                continue
+        pkg = linux_pkg if is_linux else mac_pkg
+        chk(t, present, "", f"{pkg_mgr_hint} {pkg}")
+
+    # Optional configuration.
     chk("ntfy topic", bool(NTFY_TOPIC),
-        NTFY_TOPIC or "set NTFY_TOPIC for phone push")
+        NTFY_TOPIC or "set NTFY_TOPIC for phone push",
+        "echo 'export NTFY_TOPIC=joe-<your-unique-tag>' >> ~/.zshrc")
     chk("history-index", HISTORY_INDEX_DB.exists(),
         str(HISTORY_INDEX_DB).replace(str(HOME), "~"))
+
+    # If --fix, attempt to remediate.
+    fixed: list[str] = []
+    if getattr(args, "fix", False):
+        for label, ok, _detail, hint in rows:
+            if ok or not hint:
+                continue
+            # Auto-run ollama pull and pip install; print everything else.
+            if hint.startswith("ollama pull "):
+                model = hint.split("# ", 1)[0].strip().split()[-1]
+                console.print(f"[dim]pulling {model}...[/]")
+                cp = subprocess.run(["ollama", "pull", model],
+                                    capture_output=True, text=True)
+                if cp.returncode == 0:
+                    fixed.append(f"ollama pull {model}")
+                else:
+                    console.print(f"[red]pull failed: {cp.stderr.strip()[:200]}[/]")
+            elif hint.startswith("python3 -m pip install --user "):
+                pkg = hint.split()[-1]
+                console.print(f"[dim]pip-installing {pkg}...[/]")
+                cp = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--user", "--quiet", pkg],
+                    capture_output=True, text=True,
+                )
+                if cp.returncode == 0:
+                    fixed.append(f"pip install {pkg}")
+
     lines = []
-    for label, ok, detail in rows:
+    for label, ok, detail, hint in rows:
         mark = "[green]ok  [/]" if ok else "[red]miss[/]"
         extra = f"  [dim]{detail}[/]" if detail else ""
+        if not ok and hint and not getattr(args, "fix", False):
+            extra += f"\n     [dim italic]fix:[/] [bold]{hint}[/]"
         lines.append(f"{mark}  {label}{extra}")
-    panel("joe doctor", Text.from_markup("\n".join(lines)), style="cyan")
-    return 0 if all(ok for _, ok, _ in rows) else 1
+    body = "\n".join(lines)
+    if fixed:
+        body += "\n\n[green]auto-fixed:[/] " + ", ".join(fixed)
+    panel("joe doctor" + (" --fix" if getattr(args, "fix", False) else ""),
+          Text.from_markup(body), style="cyan")
+    return 0 if all(ok for _, ok, _, _ in rows) else 1
 
 
 def main() -> int:
@@ -5056,7 +5554,13 @@ def main() -> int:
         return cmd_self_update(up.parse_args(argv[1:]))
     if argv and argv[0] == "doctor":
         dp = argparse.ArgumentParser(prog="joe doctor")
+        dp.add_argument("--fix", action="store_true",
+                        help="attempt to install missing ollama models + python deps")
         return cmd_doctor(dp.parse_args(argv[1:]))
+    if argv and argv[0] == "completion":
+        return cmd_completion(argv[1:])
+    if argv and argv[0] == "demo":
+        return cmd_demo()
     if argv and argv[0] == "ios-setup":
         return cmd_ios_setup()
     if argv and argv[0] == "blame":
