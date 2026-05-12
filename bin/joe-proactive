@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""joe-proactive: a daemon that watches your shell for friction patterns.
+
+The premise: most agents wait to be asked. joe-proactive flips that. It
+tails ~/.zsh_history (or whatever HISTFILE points at) and, when it spots
+a pattern that suggests you are stuck, pops a macOS notification offering
+to help. Examples it watches for:
+
+  - the same command run two or more times in a row (likely retry-after-fail)
+  - a recent `git` command followed by long idle (decision-paralysis sign)
+  - any of a user-configurable list of "trigger" regexes
+
+This is opt-in (it's intentionally noisy if mis-configured). Start it
+manually:
+
+  joe-proactive                 watch with defaults
+  joe-proactive --idle 600      idle-window override (seconds)
+  joe-proactive --trigger '^pip install' --trigger 'docker'   # extra rules
+  JOE_PROACTIVE=1 joe-proactive --autostart   # exits unless env var set
+
+Notifications offer a one-liner you can paste into a fresh joe shell:
+
+  joe -p "I just ran `<cmd>` twice and it didn't go through. <thoughts?>"
+
+There is no auto-action. joe-proactive only nudges; you decide what to do.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from collections import deque
+from pathlib import Path
+from typing import Optional
+
+HOME = Path.home()
+DEFAULT_HISTFILE = Path(os.environ.get("HISTFILE", "")) if os.environ.get("HISTFILE") \
+    else HOME / ".zsh_history"
+ZSH_EXT_PAT = re.compile(r"^:\s*(\d+):\d+;(.*)$")
+
+
+def _read_history_tail(path: Path, max_lines: int = 300) -> list[tuple[Optional[int], str]]:
+    """Read up to `max_lines` from the bottom of HISTFILE.
+
+    Returns [(timestamp, command), ...] in chronological order. Timestamp
+    is the zsh extended-history epoch (seconds) if present, else None.
+    """
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            chunk = min(size, 64 * 1024)
+            f.seek(size - chunk)
+            data = f.read()
+    except OSError:
+        return []
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines()[-max_lines:]
+    out: list[tuple[Optional[int], str]] = []
+    for ln in lines:
+        m = ZSH_EXT_PAT.match(ln)
+        if m:
+            ts = int(m.group(1))
+            cmd = m.group(2).strip()
+        else:
+            ts = None
+            cmd = ln.strip()
+        if cmd:
+            out.append((ts, cmd))
+    return out
+
+
+def _notify(title: str, body: str, topic: str = "") -> None:
+    body_short = body[:240].replace('"', '\\"')
+    title_short = title[:60].replace('"', '\\"')
+    if sys.platform == "darwin":
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{body_short}" with title "{title_short}"'],
+            capture_output=True,
+        )
+    if topic:
+        try:
+            req = urllib.request.Request(
+                f"https://ntfy.sh/{topic}",
+                data=body.encode("utf-8"),
+                headers={"Title": title, "Tags": "thinking_face,joe",
+                         "Priority": "low"},  # low so it's a nudge, not an alarm
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5).close()
+        except Exception:
+            pass
+
+
+def _normalize(cmd: str) -> str:
+    """Make commands comparable: collapse whitespace, drop trailing comments."""
+    cmd = re.sub(r"\s+", " ", cmd).strip()
+    cmd = re.sub(r"\s+#.*$", "", cmd)
+    return cmd
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="joe-proactive")
+    ap.add_argument("--histfile", default=str(DEFAULT_HISTFILE),
+                    help=f"shell history file (default: {DEFAULT_HISTFILE})")
+    ap.add_argument("--poll", type=int, default=10,
+                    help="seconds between history scans (default: 10)")
+    ap.add_argument("--repeat-window", type=int, default=120,
+                    help="how recent the duplicate-command check looks (seconds, default: 120)")
+    ap.add_argument("--repeat-threshold", type=int, default=2,
+                    help="same cmd this many times triggers a nudge (default: 2)")
+    ap.add_argument("--idle", type=int, default=900,
+                    help="if last cmd is older than this many seconds, nudge once (default: 900)")
+    ap.add_argument("--trigger", action="append", default=[],
+                    help="regex; matching commands always get a nudge (repeatable)")
+    ap.add_argument("--topic", default=os.environ.get("NTFY_TOPIC", ""),
+                    help="ntfy.sh topic for phone push (default: $NTFY_TOPIC)")
+    ap.add_argument("--autostart", action="store_true",
+                    help="exit immediately if JOE_PROACTIVE != 1; useful in launchd plists")
+    args = ap.parse_args()
+
+    if args.autostart and os.environ.get("JOE_PROACTIVE", "").strip() not in {"1", "true", "yes"}:
+        print("joe-proactive: JOE_PROACTIVE not set, exiting (--autostart).",
+              file=sys.stderr)
+        return 0
+
+    histfile = Path(args.histfile).expanduser()
+    if not histfile.exists():
+        print(f"joe-proactive: HISTFILE not found: {histfile}", file=sys.stderr)
+        return 1
+
+    triggers = [re.compile(t, re.IGNORECASE) for t in args.trigger]
+    print(
+        f"[joe-proactive] watching {histfile}  every {args.poll}s\n"
+        f"[joe-proactive] repeat-threshold={args.repeat_threshold} "
+        f"window={args.repeat_window}s idle={args.idle}s\n"
+        f"[joe-proactive] triggers: {len(triggers)}  topic: {args.topic or '(none)'}",
+        file=sys.stderr,
+    )
+
+    last_seen_count: dict[str, int] = {}
+    nudged: set[str] = set()           # commands we've already nudged about
+    last_idle_nudge = 0.0
+
+    while True:
+        entries = _read_history_tail(histfile, max_lines=200)
+        if not entries:
+            time.sleep(args.poll); continue
+        now = time.time()
+        recent = [
+            (ts, _normalize(cmd)) for ts, cmd in entries
+            if ts is None or (now - ts) <= args.repeat_window
+        ]
+        # 1. Repeat-pattern check (counts dupes within recent window).
+        counts: dict[str, int] = {}
+        for _, cmd in recent[-10:]:  # only look at last few in-window
+            counts[cmd] = counts.get(cmd, 0) + 1
+        for cmd, n in counts.items():
+            prev = last_seen_count.get(cmd, 0)
+            if n >= args.repeat_threshold and n > prev and cmd not in nudged:
+                _notify(
+                    "joe noticed a retry",
+                    f"`{cmd[:80]}` ran {n}x recently. Maybe pair-debug it:\n"
+                    f"  joe -p \"I keep running '{cmd[:80]}' and it isn't going through; help?\"",
+                    topic=args.topic,
+                )
+                nudged.add(cmd)
+        last_seen_count = counts
+        # 2. Idle-after-error check.
+        last_ts: Optional[int] = next(
+            (ts for ts, _ in reversed(entries) if ts is not None), None,
+        )
+        if last_ts is not None:
+            idle = now - last_ts
+            if idle > args.idle and (now - last_idle_nudge) > args.idle:
+                _notify(
+                    "joe noticed you've been quiet",
+                    f"Last terminal action was {int(idle / 60)} min ago. "
+                    f"If you're stuck, drop a note in joe and pick it up.",
+                    topic=args.topic,
+                )
+                last_idle_nudge = now
+        # 3. Explicit triggers (matched against the most recent command only).
+        last_cmd = recent[-1][1] if recent else ""
+        if last_cmd and last_cmd not in nudged:
+            for trig in triggers:
+                if trig.search(last_cmd):
+                    _notify(
+                        f"trigger matched: {trig.pattern}",
+                        f"`{last_cmd[:100]}` matches a configured trigger. "
+                        f"joe is here if you want a hand.",
+                        topic=args.topic,
+                    )
+                    nudged.add(last_cmd)
+                    break
+        # Garbage-collect the nudged set when it gets large so old commands
+        # become nudge-able again the next time they reappear after a gap.
+        if len(nudged) > 200:
+            nudged.clear()
+        time.sleep(args.poll)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

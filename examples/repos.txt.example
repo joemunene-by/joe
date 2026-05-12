@@ -1,0 +1,7 @@
+# ~/.joe-agent/repos.txt: pin the list of repos joe considers "active".
+# One absolute path per line. Tilde expansion is supported. Comments OK.
+# If this file is absent, joe auto-discovers git repos in ~ and ~/Desktop.
+
+~/Desktop/my-project
+~/Desktop/side-project
+~/code/dotfiles

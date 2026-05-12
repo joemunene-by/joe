@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""joe-index: build / refresh a semantic search index over Joe's active repos.
+
+Replaces the grep-based RAG in joe / joe-agent with a vector index that
+retrieves by meaning rather than literal token match. Index is built and
+queried via Ollama's /api/embeddings endpoint using nomic-embed-text
+(small, fast, 768-dim, ~270MB). Storage is plain SQLite with embeddings
+stored as raw bytes; we do cosine similarity in numpy. No LanceDB or
+sqlite-vec needed.
+
+Usage:
+  joe-index build                     index every file under ACTIVE_REPOS
+  joe-index build --repo ~/Desktop/X  index just one repo
+  joe-index query "free-form prompt"  return top-5 hits
+  joe-index status                    show row counts, age, repo coverage
+  joe-index clear                     drop and rebuild from scratch
+
+Files included: source-ish extensions (.py .ts .tsx .js .rs .go .swift
+.md .toml .yml .yaml .json .sql), capped at 256 KB each.
+Files skipped: anything under .git / node_modules / target / .next /
+__pycache__ / .venv / dist / build.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import struct
+import sys
+import time
+import urllib.request
+from pathlib import Path
+from typing import Iterable, Optional
+
+OLLAMA_EMBED_URL = "http://localhost:11434/api/embeddings"
+EMBED_MODEL = "nomic-embed-text:latest"
+EMBED_DIM = 768
+
+HOME = Path.home()
+STATE_DIR = HOME / ".joe-agent"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+INDEX_DB = STATE_DIR / "vector-index.sqlite"
+
+def _resolve_repos() -> list[Path]:
+    """Return the list of repos to index.
+
+    Resolution:
+      1. CLI positional args (handled at call sites).
+      2. ~/.joe-agent/repos.txt: one absolute path per line.
+      3. Otherwise: auto-discover git repos in ~ and ~/Desktop (cap 32).
+    """
+    pinned = STATE_DIR / "repos.txt"
+    if pinned.is_file():
+        out: list[Path] = []
+        for ln in pinned.read_text().splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            p = Path(__import__("os").path.expanduser(ln)).resolve()
+            if p.is_dir():
+                out.append(p)
+        if out:
+            return out
+    seen: set[str] = set()
+    out = []
+    for root in (HOME, HOME / "Desktop"):
+        if not root.is_dir():
+            continue
+        try:
+            children = sorted(root.iterdir())
+        except OSError:
+            continue
+        for p in children:
+            if not p.is_dir() or str(p) in seen:
+                continue
+            if (p / ".git").exists():
+                out.append(p); seen.add(str(p))
+            if len(out) >= 32:
+                return out
+    return out
+
+
+ACTIVE_REPOS: list[Path] = _resolve_repos()
+
+INCLUDE_EXT = {
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".go", ".swift",
+    ".c", ".cpp", ".h", ".hpp", ".rb", ".java", ".kt",
+    ".md", ".rst", ".txt",
+    ".toml", ".yml", ".yaml", ".json", ".jsonc",
+    ".sql", ".css", ".scss", ".html",
+}
+EXCLUDE_DIRS = {
+    ".git", "node_modules", "target", ".next", "__pycache__",
+    ".venv", ".tox", "dist", "build", ".pytest_cache", ".ruff_cache",
+    ".idea", ".vscode", ".DS_Store",
+}
+MAX_FILE_BYTES = 256 * 1024
+CHUNK_LINES = 80
+CHUNK_OVERLAP_LINES = 10
+
+
+# --------------------------------------------------------------------------
+# Database
+# --------------------------------------------------------------------------
+
+
+def _open() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(INDEX_DB))
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS chunks ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " repo TEXT NOT NULL,"
+        " path TEXT NOT NULL,"
+        " line_start INTEGER NOT NULL,"
+        " line_end INTEGER NOT NULL,"
+        " text TEXT NOT NULL,"
+        " embedding BLOB NOT NULL,"
+        " mtime REAL NOT NULL,"
+        " indexed_at REAL NOT NULL)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_repo ON chunks(repo)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path)")
+    return conn
+
+
+def _pack(vec: list[float]) -> bytes:
+    return struct.pack(f"{len(vec)}f", *vec)
+
+
+def _unpack(blob: bytes) -> list[float]:
+    n = len(blob) // 4
+    return list(struct.unpack(f"{n}f", blob))
+
+
+# --------------------------------------------------------------------------
+# Embeddings
+# --------------------------------------------------------------------------
+
+
+class EmbedError(RuntimeError):
+    pass
+
+
+# nomic-embed-text accepts ~8K tokens. We cap to ~6000 chars (~1500 tokens
+# conservative) to stay safely inside while still capturing the chunk shape.
+EMBED_INPUT_MAX_CHARS = 6000
+
+
+def embed(text: str) -> list[float]:
+    if len(text) > EMBED_INPUT_MAX_CHARS:
+        text = text[:EMBED_INPUT_MAX_CHARS]
+    payload = json.dumps({"model": EMBED_MODEL, "prompt": text}).encode()
+    req = urllib.request.Request(
+        OLLAMA_EMBED_URL, data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            obj = json.loads(r.read())
+    except Exception as e:
+        raise EmbedError(f"ollama embeddings call failed: {e}") from e
+    vec = obj.get("embedding")
+    if not vec:
+        raise EmbedError(f"ollama returned no embedding (response: {obj})")
+    return vec
+
+
+# --------------------------------------------------------------------------
+# Walking + chunking
+# --------------------------------------------------------------------------
+
+
+def _iter_files(repo: Path) -> Iterable[Path]:
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        for f in files:
+            p = Path(root) / f
+            if p.suffix.lower() not in INCLUDE_EXT:
+                continue
+            try:
+                if p.stat().st_size > MAX_FILE_BYTES:
+                    continue
+            except OSError:
+                continue
+            yield p
+
+
+def _chunk_lines(text: str) -> list[tuple[int, int, str]]:
+    lines = text.splitlines()
+    if not lines:
+        return []
+    out: list[tuple[int, int, str]] = []
+    i = 0
+    step = max(1, CHUNK_LINES - CHUNK_OVERLAP_LINES)
+    while i < len(lines):
+        end = min(i + CHUNK_LINES, len(lines))
+        body = "\n".join(lines[i:end]).strip()
+        if body:
+            out.append((i + 1, end, body))
+        if end == len(lines):
+            break
+        i += step
+    return out
+
+
+# --------------------------------------------------------------------------
+# Build
+# --------------------------------------------------------------------------
+
+
+def cmd_build(args: argparse.Namespace) -> int:
+    conn = _open()
+    repos: list[Path] = []
+    if args.repo:
+        for r in args.repo:
+            p = Path(os.path.expanduser(r)).resolve()
+            if not p.is_dir():
+                print(f"[joe-index] skipping {p}: not a directory", file=sys.stderr)
+                continue
+            repos.append(p)
+    else:
+        repos = [r for r in ACTIVE_REPOS if r.is_dir()]
+
+    if not repos:
+        print("[joe-index] no repos to index", file=sys.stderr)
+        return 1
+
+    total_chunks = 0
+    total_files = 0
+    skipped_unchanged = 0
+    t0 = time.time()
+
+    for repo in repos:
+        repo_name = repo.name
+        print(f"[joe-index] indexing {repo_name}...", file=sys.stderr)
+
+        # Stale-file detection: existing chunks keyed by path+mtime so we can
+        # skip files that haven't changed since last indexing.
+        existing = {}  # path -> mtime
+        for row in conn.execute(
+            "SELECT DISTINCT path, MAX(mtime) FROM chunks WHERE repo = ? GROUP BY path",
+            (repo_name,),
+        ):
+            existing[row[0]] = row[1]
+
+        for p in _iter_files(repo):
+            mtime = p.stat().st_mtime
+            rel = str(p.relative_to(repo))
+            if existing.get(rel) == mtime:
+                skipped_unchanged += 1
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            chunks = _chunk_lines(text)
+            if not chunks:
+                continue
+            # Replace any old chunks for this file.
+            conn.execute("DELETE FROM chunks WHERE repo = ? AND path = ?", (repo_name, rel))
+            for start, end, body in chunks:
+                try:
+                    vec = embed(body)
+                except EmbedError as e:
+                    print(f"[joe-index] embed failed on {rel}:{start}: {e}", file=sys.stderr)
+                    continue
+                conn.execute(
+                    "INSERT INTO chunks (repo, path, line_start, line_end, text, embedding, mtime, indexed_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (repo_name, rel, start, end, body, _pack(vec), mtime, time.time()),
+                )
+                total_chunks += 1
+            total_files += 1
+            if total_files % 25 == 0:
+                conn.commit()
+                print(f"[joe-index]   {total_files} files, {total_chunks} chunks", file=sys.stderr)
+        conn.commit()
+    conn.close()
+
+    dt = time.time() - t0
+    print(f"[joe-index] done in {dt:.1f}s: {total_files} files reindexed, "
+          f"{total_chunks} chunks added, {skipped_unchanged} skipped (unchanged)",
+          file=sys.stderr)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Query
+# --------------------------------------------------------------------------
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    sa = sum(x * x for x in a) ** 0.5
+    sb = sum(x * x for x in b) ** 0.5
+    if sa == 0 or sb == 0:
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / (sa * sb)
+
+
+def cmd_query(args: argparse.Namespace) -> int:
+    q = " ".join(args.prompt)
+    if not q.strip():
+        print("[joe-index] empty query", file=sys.stderr)
+        return 1
+    try:
+        qv = embed(q)
+    except EmbedError as e:
+        print(f"[joe-index] {e}", file=sys.stderr)
+        return 2
+    conn = _open()
+    rows = list(conn.execute(
+        "SELECT repo, path, line_start, line_end, text, embedding FROM chunks"
+    ))
+    conn.close()
+    if not rows:
+        print("[joe-index] index is empty; run `joe-index build` first.", file=sys.stderr)
+        return 1
+    scored = []
+    for repo, path, ls, le, text, emb in rows:
+        score = _cosine(qv, _unpack(emb))
+        scored.append((score, repo, path, ls, le, text))
+    scored.sort(reverse=True)
+    top = scored[: args.k]
+    if args.format == "json":
+        print(json.dumps([
+            {"score": s, "repo": r, "path": p, "line_start": ls, "line_end": le, "text": t}
+            for s, r, p, ls, le, t in top
+        ], indent=2))
+    else:
+        for s, r, p, ls, le, t in top:
+            print(f"\n[{s:.3f}] {r}/{p}:{ls}-{le}")
+            print("    " + t.replace("\n", "\n    ")[:600])
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Status / clear
+# --------------------------------------------------------------------------
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    conn = _open()
+    n_chunks, = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
+    n_files, = conn.execute("SELECT COUNT(DISTINCT path) FROM chunks").fetchone()
+    n_repos, = conn.execute("SELECT COUNT(DISTINCT repo) FROM chunks").fetchone()
+    last = conn.execute("SELECT MAX(indexed_at) FROM chunks").fetchone()[0] or 0
+    print(f"index: {INDEX_DB}")
+    print(f"  chunks: {n_chunks}")
+    print(f"  files:  {n_files}")
+    print(f"  repos:  {n_repos}")
+    if last:
+        age_h = (time.time() - last) / 3600
+        print(f"  last indexed: {age_h:.1f}h ago")
+    per_repo = conn.execute(
+        "SELECT repo, COUNT(*), COUNT(DISTINCT path) FROM chunks GROUP BY repo ORDER BY 2 DESC"
+    ).fetchall()
+    print("\nper-repo:")
+    for r, c, f in per_repo:
+        print(f"  {r:<30}  {c:>6} chunks  {f:>5} files")
+    conn.close()
+    return 0
+
+
+def cmd_clear(args: argparse.Namespace) -> int:
+    if INDEX_DB.exists():
+        INDEX_DB.unlink()
+        print(f"[joe-index] removed {INDEX_DB}")
+    else:
+        print(f"[joe-index] {INDEX_DB} did not exist")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="joe-index")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    b = sub.add_parser("build", help="walk repos, chunk files, embed via Ollama, store")
+    b.add_argument("--repo", action="append", help="restrict to one repo (repeatable)")
+
+    q = sub.add_parser("query", help="semantic search across all indexed chunks")
+    q.add_argument("prompt", nargs="+")
+    q.add_argument("-k", type=int, default=5)
+    q.add_argument("--format", choices=["text", "json"], default="text")
+
+    sub.add_parser("status", help="row counts + last-indexed age")
+    sub.add_parser("clear", help="drop the index db")
+
+    args = ap.parse_args()
+    if args.cmd == "build": return cmd_build(args)
+    if args.cmd == "query": return cmd_query(args)
+    if args.cmd == "status": return cmd_status(args)
+    if args.cmd == "clear": return cmd_clear(args)
+    ap.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

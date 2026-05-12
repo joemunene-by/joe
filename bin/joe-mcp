@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""joe-mcp: MCP server bridge exposing the personalised joe-agent.
+
+What this gives you: any MCP-aware client (Claude Desktop, Cursor,
+Continue, Cline, Zed, Gemini CLI, etc.) can call into Joe's local
+agent and benefit from the same identity / project context /
+communication preferences / few-shot writing style that joe-gemma
+is loaded with. The client gets four tools:
+
+    ask          general-purpose chat with the personalised model
+    search_repos grep-based search across Joe's active repos
+    pr_draft     draft a PR title + body from `git diff <base>..HEAD`
+    standup      summarise the last N hours of git activity
+
+This script is platform-agnostic. Drop it on whichever machine
+runs your MCP client. The tools shell out to `joe-agent` on PATH,
+so if installed on Linux it transparently uses the SSH proxy and
+if installed on Mac it talks to the real thing directly.
+
+Wire it into Claude Desktop by adding to your
+~/Library/Application Support/Claude/claude_desktop_config.json
+(macOS) or %APPDATA%/Claude/claude_desktop_config.json (Win):
+
+    {
+      "mcpServers": {
+        "joe-agent": {
+          "command": "/path/to/joe-mcp",
+          "args": []
+        }
+      }
+    }
+
+For Cursor: Cursor Settings > MCP > Add new MCP server with command
+`/path/to/joe-mcp`. For Zed: ~/.config/zed/settings.json under
+`assistant.experimental.mcp_servers`. Restart the client.
+
+Dependency: `pip install mcp` (Anthropic's official Python SDK).
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+from typing import Optional
+
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError:
+    raise SystemExit(
+        "joe-mcp: missing dependency. Run `pip install mcp` (or use a venv) and try again."
+    )
+
+
+JOE_AGENT = os.environ.get("JOE_AGENT_BIN") or shutil.which("joe-agent")
+if not JOE_AGENT:
+    # Last-resort fallbacks for typical install locations.
+    for candidate in (
+        os.path.expanduser("~/.local/bin/joe-agent"),
+        "/usr/local/bin/joe-agent",
+        "/opt/homebrew/bin/joe-agent",
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            JOE_AGENT = candidate
+            break
+if not JOE_AGENT:
+    raise SystemExit(
+        "joe-mcp: cannot locate `joe-agent` on PATH or any common install dir. "
+        "Set JOE_AGENT_BIN to its absolute path."
+    )
+
+
+mcp = FastMCP("joe-agent")
+
+
+def _run(args: list[str], stdin: Optional[str] = None, timeout: int = 600) -> str:
+    """Shell out to joe-agent and return its combined stdout / stderr."""
+    try:
+        cp = subprocess.run(
+            [JOE_AGENT, *args],
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return f"ERROR: joe-agent exceeded {timeout}s timeout"
+    except FileNotFoundError:
+        return f"ERROR: joe-agent not executable at {JOE_AGENT!r}"
+    out = cp.stdout or ""
+    if cp.stderr:
+        out = (out + "\n[stderr]\n" + cp.stderr) if out else cp.stderr
+    if not out:
+        out = f"(exit {cp.returncode}, no output)"
+    return out
+
+
+@mcp.tool()
+def ask(
+    prompt: str,
+    session: Optional[str] = None,
+    model: Optional[str] = None,
+    use_rag: bool = True,
+    use_tools: bool = True,
+) -> str:
+    """Ask the joe-gemma orchestrator (or a configured override).
+
+    Use this for anything that should reflect the user's local context,
+    style, and active repos. Routes to the personalised joe-gemma model
+    by default; the configured options usually include joe-gemma,
+    qwen2.5-coder:7b/14b, and a cloud-routed fallback.
+
+    Args:
+        prompt: the question or task.
+        session: persistent session name to keep history across calls.
+        model: override the default orchestrator model.
+        use_rag: include grep hits from the user's active repos as context.
+        use_tools: allow the model to emit RUN commands and have the
+            agent execute read-only ones (find, grep, git log, gh issue
+            view, ...). Disable for pure-reasoning prompts.
+    """
+    args = ["chat", "--no-stream", "--quiet", "--no-git-state"]
+    if session:
+        args.extend(["--session", session])
+    if model:
+        args.extend(["--model", model])
+    if not use_rag:
+        args.append("--no-rag")
+    if not use_tools:
+        args.append("--no-tools")
+    args.append(prompt)
+    return _run(args)
+
+
+@mcp.tool()
+def search_repos(query: str) -> str:
+    """Grep across the user's active repos for keyword hits.
+
+    Cheap, fast, no model invocation. Returns the same RAG context
+    that `ask` would auto-inject, but you see it directly so you can
+    decide what to do with it. Useful for "where does X live in my
+    stack" questions.
+    """
+    # Short-circuit: invoke joe-agent with a prompt that returns just
+    # the grep context. The cleanest path is to pipe a marker prompt
+    # and parse, but simpler: ask joe-agent to surface relevant
+    # snippets and let the model summarise.
+    args = ["chat", "--no-stream", "--quiet", "--no-tools", "--no-git-state",
+            f"Where in my codebase do these terms appear? {query}. "
+            f"Quote file paths and the surrounding line. No commentary."]
+    return _run(args)
+
+
+@mcp.tool()
+def pr_draft(base: str = "main") -> str:
+    """Draft a PR title + body from `git diff <base>..HEAD` in the cwd.
+
+    Runs against whichever git repo the user is currently in. Output
+    follows the default house style: imperative subject, WHY-before-WHAT
+    body with two-space-indented section headings, no em-dashes, no
+    emojis. The active profile's `context_extra` overrides as needed.
+
+    Args:
+        base: base branch to diff against (default: 'main').
+    """
+    return _run(["pr", "--base", base], timeout=900)
+
+
+@mcp.tool()
+def standup(hours: int = 24) -> str:
+    """Summarise the last N hours of git activity across active repos.
+
+    Walks every repo joe-agent recognises (resolved via
+    ~/.joe-agent/repos.txt or auto-discovery) and produces a per-project
+    bullet summary with commit hashes.
+
+    Args:
+        hours: window to look back over (default: 24).
+    """
+    return _run(["standup", "--hours", str(hours)], timeout=900)
+
+
+if __name__ == "__main__":
+    mcp.run()

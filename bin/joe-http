@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""joe-http: tiny HTTP wrapper around joe-agent for LAN / phone access.
+
+Spins up a FastAPI server on the Mac. Endpoints map 1:1 to joe-agent's
+subcommands: /chat, /pr, /standup, /web. Auth is a single bearer token
+read from ~/.joe-agent/http-token or the JOE_HTTP_TOKEN env var.
+
+Usage:
+  joe-http                            listen on 0.0.0.0:8765
+  joe-http --port 9000                custom port
+  joe-http --host 127.0.0.1           local-only
+  joe-http --token <hex>              one-shot token override
+
+First-run setup:
+  1. Run `joe-http`. It will generate a token in ~/.joe-agent/http-token
+     if one doesn't exist, print it once, and start listening.
+  2. Note the Mac's LAN IP (e.g. `ipconfig getifaddr en0`).
+  3. From your phone or another machine on the LAN:
+       curl -sS http://<mac-ip>:8765/chat \\
+            -H "Authorization: Bearer <token>" \\
+            -H "Content-Type: application/json" \\
+            -d '{"prompt": "summarise today"}'
+
+Security: only listen on a trusted LAN. The token is bearer-only, no
+rate limiting, no TLS. For external access, front it with a Cloudflare
+Tunnel or Tailscale rather than opening the Mac firewall.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import secrets
+import subprocess
+import threading
+import urllib.request
+from pathlib import Path
+from typing import Optional
+
+try:
+    from fastapi import FastAPI, Header, HTTPException
+    from pydantic import BaseModel
+    import uvicorn
+except ImportError as e:
+    raise SystemExit(
+        f"joe-http: missing dependency: {e}\n"
+        "Install with: python3 -m pip install --user fastapi uvicorn"
+    )
+
+
+HOME = Path.home()
+STATE_DIR = HOME / ".joe-agent"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+TOKEN_FILE = STATE_DIR / "http-token"
+JOE_AGENT = HOME / ".local" / "bin" / "joe-agent"
+
+
+def _ensure_token() -> str:
+    if os.environ.get("JOE_HTTP_TOKEN"):
+        return os.environ["JOE_HTTP_TOKEN"]
+    if TOKEN_FILE.exists():
+        return TOKEN_FILE.read_text().strip()
+    tok = secrets.token_hex(24)
+    TOKEN_FILE.write_text(tok + "\n")
+    TOKEN_FILE.chmod(0o600)
+    print(f"[joe-http] generated new auth token, saved to {TOKEN_FILE}")
+    print(f"[joe-http] token: {tok}")
+    return tok
+
+
+TOKEN = _ensure_token()
+
+
+def _check_auth(authorization: Optional[str]) -> None:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    if authorization.removeprefix("Bearer ").strip() != TOKEN:
+        raise HTTPException(status_code=403, detail="invalid token")
+
+
+def _run_joe_agent(args: list[str], timeout: int = 600) -> str:
+    if not JOE_AGENT.exists():
+        raise HTTPException(status_code=500, detail=f"joe-agent not found at {JOE_AGENT}")
+    try:
+        cp = subprocess.run(
+            [str(JOE_AGENT), *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail=f"joe-agent timed out after {timeout}s")
+    out = cp.stdout or ""
+    if cp.stderr:
+        out = (out + "\n[stderr]\n" + cp.stderr) if out else cp.stderr
+    return out or f"(exit {cp.returncode}, no output)"
+
+
+# --------------------------------------------------------------------------
+# FastAPI app
+# --------------------------------------------------------------------------
+
+app = FastAPI(title="joe-agent", version="0.2.0")
+
+
+class ChatRequest(BaseModel):
+    prompt: str
+    session: Optional[str] = None
+    model: Optional[str] = None
+    use_rag: bool = True
+    use_tools: bool = True
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"ok": True, "joe_agent": str(JOE_AGENT), "token_file": str(TOKEN_FILE)}
+
+
+@app.post("/chat")
+def chat(req: ChatRequest, authorization: Optional[str] = Header(None)) -> dict:
+    _check_auth(authorization)
+    args = ["chat", "--no-stream", "--quiet", "--no-git-state"]
+    if req.session:
+        args.extend(["--session", req.session])
+    if req.model:
+        args.extend(["--model", req.model])
+    if not req.use_rag:
+        args.append("--no-rag")
+    if not req.use_tools:
+        args.append("--no-tools")
+    args.append(req.prompt)
+    return {"response": _run_joe_agent(args)}
+
+
+class PRRequest(BaseModel):
+    base: str = "main"
+    cwd: Optional[str] = None  # ignored on remote side; relies on cwd of caller
+
+
+@app.post("/pr")
+def pr(req: PRRequest, authorization: Optional[str] = Header(None)) -> dict:
+    _check_auth(authorization)
+    # cwd doesn't propagate via HTTP. PR drafting is most useful when this is
+    # the same machine that has the repo open, so we just run in HOME.
+    return {"response": _run_joe_agent(["pr", "--base", req.base], timeout=900)}
+
+
+class StandupRequest(BaseModel):
+    hours: int = 24
+
+
+@app.post("/standup")
+def standup(req: StandupRequest, authorization: Optional[str] = Header(None)) -> dict:
+    _check_auth(authorization)
+    return {"response": _run_joe_agent(["standup", "--hours", str(req.hours)], timeout=900)}
+
+
+@app.get("/standup/latest")
+def standup_latest(authorization: Optional[str] = Header(None)) -> dict:
+    """Return the most recent launchd-generated standup, if one exists."""
+    _check_auth(authorization)
+    latest = STATE_DIR / "standups" / "latest.md"
+    if not latest.exists():
+        raise HTTPException(status_code=404, detail="no standup generated yet")
+    return {
+        "path": str(latest.resolve()),
+        "mtime": latest.stat().st_mtime,
+        "content": latest.read_text(encoding="utf-8", errors="replace"),
+    }
+
+
+class WebRequest(BaseModel):
+    query: str
+
+
+@app.post("/web")
+def web(req: WebRequest, authorization: Optional[str] = Header(None)) -> dict:
+    _check_auth(authorization)
+    prompt = (
+        f"Search the web for: {req.query}\n"
+        f"Use the <web_search> tool and summarise the first three results."
+    )
+    return {"response": _run_joe_agent(["chat", "--no-stream", "--quiet", "--no-git-state",
+                                        "--no-rag", prompt])}
+
+
+# --------------------------------------------------------------------------
+# iOS bridge: a single endpoint a Shortcut can call from anywhere.
+# --------------------------------------------------------------------------
+
+
+class IOSRequest(BaseModel):
+    prompt: str
+    session: Optional[str] = None
+    model: Optional[str] = None
+    # If set, joe-http runs the model in the background and pushes the
+    # answer to ntfy.sh/<topic> when it finishes (returns 202 immediately).
+    # If unset, the request blocks until the model returns the answer.
+    ntfy: Optional[str] = None
+    # Shortcut/device tag, echoed in the ntfy push title for clarity.
+    source: Optional[str] = "iOS"
+
+
+def _ntfy_push(topic: str, title: str, body: str) -> None:
+    if not topic:
+        return
+    try:
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{topic}",
+            data=body.encode("utf-8"),
+            headers={"Title": title, "Priority": "default", "Tags": "robot,joe"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10).close()
+    except Exception:
+        pass
+
+
+def _ios_run_async(req: IOSRequest) -> None:
+    args = ["chat", "--no-stream", "--quiet", "--no-git-state"]
+    if req.session:
+        args.extend(["--session", req.session])
+    if req.model:
+        args.extend(["--model", req.model])
+    args.append(req.prompt)
+    try:
+        answer = _run_joe_agent(args)
+    except Exception as e:  # never let the bg thread crash the server
+        answer = f"[joe-http error] {e}"
+    # Trim to a phone-friendly length; ntfy caps message size.
+    if len(answer) > 3500:
+        answer = answer[:3500] + "\n[... truncated; tail in joe-http logs ...]"
+    _ntfy_push(
+        req.ntfy or "",
+        f"joe replied to {req.source or 'phone'}",
+        answer.strip() or "(no output)",
+    )
+
+
+@app.post("/ios")
+def ios(req: IOSRequest, authorization: Optional[str] = Header(None)):
+    _check_auth(authorization)
+    if req.ntfy:
+        # Fire-and-forget: respond 202 immediately, push the answer to ntfy.
+        threading.Thread(target=_ios_run_async, args=(req,), daemon=True).start()
+        return {"status": "accepted", "delivery": f"ntfy.sh/{req.ntfy}"}
+    # Synchronous: block and return the answer inline (Shortcut reads it).
+    args = ["chat", "--no-stream", "--quiet", "--no-git-state"]
+    if req.session:
+        args.extend(["--session", req.session])
+    if req.model:
+        args.extend(["--model", req.model])
+    args.append(req.prompt)
+    return {"answer": _run_joe_agent(args)}
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="joe-http")
+    ap.add_argument("--host", default="0.0.0.0", help="bind address (default: 0.0.0.0)")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--token", help="override the bearer token (one-shot, doesn't persist)")
+    args = ap.parse_args()
+
+    if args.token:
+        global TOKEN
+        TOKEN = args.token
+        print(f"[joe-http] using --token override")
+
+    # Print connection hint once.
+    print(f"[joe-http] listening on http://{args.host}:{args.port}")
+    print(f"[joe-http] token file: {TOKEN_FILE}")
+    print(f"[joe-http] health: curl http://{args.host}:{args.port}/health")
+    print(f"[joe-http] chat:   curl -sS -X POST http://{args.host}:{args.port}/chat \\")
+    print(f"           -H \"Authorization: Bearer <token>\" \\")
+    print(f"           -H \"Content-Type: application/json\" \\")
+    print(f"           -d '{{\"prompt\": \"hi\"}}'")
+    print()
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

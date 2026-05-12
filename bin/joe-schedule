@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""joe-schedule: a thin launchd wrapper for arbitrary recurring tasks.
+
+Lets you schedule any shell command to run on a cron-style cadence
+without hand-writing a .plist. Wraps launchctl so listing / loading /
+unloading is one command each.
+
+Usage:
+  joe-schedule add NAME --at "HH:MM" --command "..."        daily at HH:MM
+  joe-schedule add NAME --interval 3600 --command "..."     every N seconds
+  joe-schedule add NAME --weekday Mon --at "09:00" --command "..."
+  joe-schedule list                                         show all joe-* jobs
+  joe-schedule show NAME                                    full plist + state
+  joe-schedule run NAME                                     fire it now
+  joe-schedule remove NAME                                  unload + delete
+
+NAME is namespaced under $JOE_LABEL_PREFIX<name> (default: com.joe-agent.).
+Plists live at ~/Library/LaunchAgents/<prefix><name>.plist.
+Stdout / stderr go to /tmp/joe-schedule-<name>.{out,err}.log.
+
+This is intentionally a thin convenience layer: there's no fancy
+DSL, just enough surface to spin up an scheduled "every weekday at
+8am, run X" job without leaving the terminal.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import plistlib
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+HOME = Path.home()
+PLIST_DIR = HOME / "Library" / "LaunchAgents"
+PLIST_DIR.mkdir(parents=True, exist_ok=True)
+LABEL_PREFIX = os.environ.get("JOE_LABEL_PREFIX", "com.joe-agent.")
+
+WEEKDAY_TO_INT = {
+    "sun": 0, "sunday": 0,
+    "mon": 1, "monday": 1,
+    "tue": 2, "tuesday": 2,
+    "wed": 3, "wednesday": 3,
+    "thu": 4, "thursday": 4,
+    "fri": 5, "friday": 5,
+    "sat": 6, "saturday": 6,
+}
+
+
+def _label(name: str) -> str:
+    if not re.match(r"^[A-Za-z0-9_-]+$", name):
+        raise SystemExit(f"joe-schedule: invalid name {name!r} (use letters, digits, _, -)")
+    return LABEL_PREFIX + name
+
+
+def _plist_path(name: str) -> Path:
+    return PLIST_DIR / f"{_label(name)}.plist"
+
+
+def _stdout_log(name: str) -> str:
+    return f"/tmp/joe-schedule-{name}.out.log"
+
+
+def _stderr_log(name: str) -> str:
+    return f"/tmp/joe-schedule-{name}.err.log"
+
+
+def _parse_hhmm(s: str) -> tuple[int, int]:
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s.strip())
+    if not m:
+        raise SystemExit(f"joe-schedule: --at must be HH:MM, got {s!r}")
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        raise SystemExit(f"joe-schedule: time {s!r} out of range")
+    return h, mi
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    label = _label(args.name)
+    p = _plist_path(args.name)
+    if p.exists() and not args.force:
+        raise SystemExit(f"joe-schedule: {p} already exists; pass --force to overwrite")
+
+    plist: dict = {
+        "Label": label,
+        "ProgramArguments": ["/bin/zsh", "-c", args.command],
+        "StandardOutPath": _stdout_log(args.name),
+        "StandardErrorPath": _stderr_log(args.name),
+        "RunAtLoad": bool(args.run_at_load),
+    }
+
+    schedule_set = False
+
+    if args.interval is not None:
+        plist["StartInterval"] = int(args.interval)
+        schedule_set = True
+
+    if args.at:
+        h, mi = _parse_hhmm(args.at)
+        sched: dict = {"Hour": h, "Minute": mi}
+        if args.weekday:
+            wd = args.weekday.lower()
+            if wd not in WEEKDAY_TO_INT:
+                raise SystemExit(f"joe-schedule: bad --weekday {args.weekday!r}")
+            sched["Weekday"] = WEEKDAY_TO_INT[wd]
+        if args.day:
+            sched["Day"] = int(args.day)
+        plist["StartCalendarInterval"] = sched
+        schedule_set = True
+
+    if not schedule_set:
+        raise SystemExit(
+            "joe-schedule add: provide one of --at HH:MM, --interval SECONDS, "
+            "or --run-at-load (which only fires on launchd reload)"
+        )
+
+    with p.open("wb") as f:
+        plistlib.dump(plist, f)
+    print(f"[joe-schedule] wrote {p}")
+
+    # Unload first in case it already exists, then load.
+    subprocess.run(["launchctl", "unload", str(p)], capture_output=True)
+    cp = subprocess.run(["launchctl", "load", str(p)], capture_output=True, text=True)
+    if cp.returncode != 0:
+        raise SystemExit(f"[joe-schedule] launchctl load failed: {cp.stderr.strip()}")
+    print(f"[joe-schedule] loaded {label}")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    cp = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+    rows = []
+    for line in cp.stdout.splitlines():
+        if LABEL_PREFIX not in line:
+            continue
+        parts = line.split()
+        # `pid status label`
+        pid, status, label = parts[0], parts[1], parts[2]
+        name = label[len(LABEL_PREFIX):]
+        plist = _plist_path(name)
+        sched = "(unknown)"
+        if plist.exists():
+            try:
+                with plist.open("rb") as f:
+                    pl = plistlib.load(f)
+                if "StartInterval" in pl:
+                    sched = f"every {pl['StartInterval']}s"
+                elif "StartCalendarInterval" in pl:
+                    ci = pl["StartCalendarInterval"]
+                    bits = []
+                    if "Weekday" in ci:
+                        bits.append(list(WEEKDAY_TO_INT)[
+                            list(WEEKDAY_TO_INT.values()).index(ci["Weekday"]) * 2
+                        ])
+                    if "Day" in ci:
+                        bits.append(f"day {ci['Day']}")
+                    bits.append(f"{ci.get('Hour', 0):02d}:{ci.get('Minute', 0):02d}")
+                    sched = " ".join(bits)
+            except Exception:
+                pass
+        rows.append((name, pid, status, sched))
+    if not rows:
+        print("(no joe-* scheduled jobs)")
+        return 0
+    name_w = max(len(r[0]) for r in rows)
+    print(f"{'NAME':<{name_w}}  {'PID':>6}  {'EXIT':>5}  SCHEDULE")
+    for name, pid, status, sched in rows:
+        print(f"{name:<{name_w}}  {pid:>6}  {status:>5}  {sched}")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    p = _plist_path(args.name)
+    if not p.exists():
+        raise SystemExit(f"joe-schedule: no plist at {p}")
+    print(p.read_text())
+    print()
+    print(f"--- last 20 lines of {_stdout_log(args.name)} ---")
+    log = Path(_stdout_log(args.name))
+    if log.exists():
+        print("\n".join(log.read_text().splitlines()[-20:]))
+    else:
+        print("(no stdout log yet)")
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    cp = subprocess.run(
+        ["launchctl", "start", _label(args.name)],
+        capture_output=True, text=True,
+    )
+    if cp.returncode != 0:
+        raise SystemExit(f"joe-schedule: launchctl start failed: {cp.stderr.strip()}")
+    print(f"[joe-schedule] kicked {args.name}")
+    # Tail the log briefly so user can see something.
+    time.sleep(1)
+    log = Path(_stdout_log(args.name))
+    if log.exists():
+        print(f"--- {log} ---")
+        print(log.read_text())
+    return 0
+
+
+def cmd_remove(args: argparse.Namespace) -> int:
+    p = _plist_path(args.name)
+    if not p.exists():
+        raise SystemExit(f"joe-schedule: no plist at {p}")
+    subprocess.run(["launchctl", "unload", str(p)], capture_output=True)
+    p.unlink()
+    for log in (_stdout_log(args.name), _stderr_log(args.name)):
+        try:
+            Path(log).unlink()
+        except OSError:
+            pass
+    print(f"[joe-schedule] removed {args.name}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="joe-schedule")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("add", help="create + load a launchd job")
+    a.add_argument("name")
+    a.add_argument("--command", required=True, help="shell command to run")
+    a.add_argument("--at", help="HH:MM time to fire (24-hour)")
+    a.add_argument("--interval", type=int, help="fire every N seconds")
+    a.add_argument("--weekday", help="restrict --at to a weekday (Mon, Tue, ...)")
+    a.add_argument("--day", help="day of month (1-31) for --at")
+    a.add_argument("--run-at-load", action="store_true",
+                   help="also run immediately when launchd reloads")
+    a.add_argument("--force", action="store_true", help="overwrite if exists")
+
+    sub.add_parser("list", help="show all joe-* scheduled jobs")
+
+    sh = sub.add_parser("show", help="print plist + recent log")
+    sh.add_argument("name")
+
+    rn = sub.add_parser("run", help="kick a job now")
+    rn.add_argument("name")
+
+    rm = sub.add_parser("remove", help="unload + delete a job")
+    rm.add_argument("name")
+
+    args = ap.parse_args()
+    if args.cmd == "add": return cmd_add(args)
+    if args.cmd == "list": return cmd_list(args)
+    if args.cmd == "show": return cmd_show(args)
+    if args.cmd == "run": return cmd_run(args)
+    if args.cmd == "remove": return cmd_remove(args)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

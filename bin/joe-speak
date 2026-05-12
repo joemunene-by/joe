@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""joe-speak: thin macOS TTS wrapper.
+
+Pipes text into `say`. Strips markdown, code fences, and our XML tool
+tags before reading so the voice doesn't waste time on syntax noise.
+
+Usage:
+  joe-speak "Hello"
+  echo "long text" | joe-speak
+  joe-speak --voice Daniel --rate 220 "with knobs"
+
+Voices: `say -v ?` lists every voice + sample. Common picks: Samantha,
+Alex, Daniel, Karen, Moira. Rate is words-per-minute (default 200).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+DEFAULT_VOICE = os.environ.get("JOE_VOICE", "Samantha")
+DEFAULT_RATE = os.environ.get("JOE_RATE", "210")
+
+
+# Strip patterns: code fences, inline code, tool tags, headings, link syntax.
+CODE_FENCE = re.compile(r"```[\s\S]*?```")
+INLINE_CODE = re.compile(r"`([^`]*)`")
+TOOL_TAG = re.compile(
+    r"<(?:read|write|edit|bash|grep|glob|delegate|test|lint|build|"
+    r"web_search|web_fetch|plan|tool_result|environment|context|"
+    r"git_state|conversation_history|cwd|old|new)\b[^>]*?>.*?</(?:read|"
+    r"write|edit|bash|grep|glob|delegate|test|lint|build|web_search|"
+    r"web_fetch|plan|tool_result|environment|context|git_state|"
+    r"conversation_history|cwd|old|new)>",
+    re.DOTALL,
+)
+SELF_CLOSING = re.compile(r"<[a-z_]+\s+[^>]*/>", re.DOTALL)
+MARKDOWN_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+HEADING = re.compile(r"^#{1,6}\s+", re.MULTILINE)
+URL = re.compile(r"https?://\S+")
+
+
+def clean_for_speech(text: str) -> str:
+    # Drop code + tool calls outright (they're noise when read aloud).
+    text = CODE_FENCE.sub(" code block omitted. ", text)
+    text = TOOL_TAG.sub(" ", text)
+    text = SELF_CLOSING.sub(" ", text)
+    # Soften the rest.
+    text = INLINE_CODE.sub(r"\1", text)
+    text = MARKDOWN_LINK.sub(r"\1", text)
+    text = HEADING.sub("", text)
+    text = URL.sub(" link omitted ", text)
+    # Collapse whitespace.
+    text = re.sub(r"\s+", " ", text).strip()
+    # Bound to ~2000 chars so we don't read forever.
+    if len(text) > 2000:
+        text = text[:2000] + " ... truncated."
+    return text
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="joe-speak")
+    ap.add_argument("text", nargs="*", help="text to speak; otherwise reads stdin")
+    ap.add_argument("--voice", default=DEFAULT_VOICE,
+                    help=f"voice name (default: {DEFAULT_VOICE}); list with `say -v ?`")
+    ap.add_argument("--rate", default=DEFAULT_RATE,
+                    help=f"speech rate, words per minute (default: {DEFAULT_RATE})")
+    ap.add_argument("--raw", action="store_true",
+                    help="don't strip markdown / tool tags before speaking")
+    ap.add_argument("--background", action="store_true",
+                    help="fork to background so the caller returns immediately")
+    args = ap.parse_args()
+
+    text = " ".join(args.text) if args.text else sys.stdin.read()
+    if not args.raw:
+        text = clean_for_speech(text)
+    if not text:
+        return 0  # nothing to say
+
+    cmd = ["say", "-v", args.voice, "-r", str(args.rate), text]
+    if args.background:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(cmd)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

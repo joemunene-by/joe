@@ -1,0 +1,29 @@
+# build / cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# editor
+.vscode/
+.idea/
+*.swp
+
+# os
+.DS_Store
+
+# local installs / venvs
+.venv/
+venv/
+
+# notebooks
+.ipynb_checkpoints/
+
+# secrets (just in case anyone copies one in)
+*.token
+*.pem
+*.key
+.env
+.env.*

@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""joe-pair: an unobtrusive live pair-programming watcher.
+
+Watches a directory (default: cwd). On every file save, briefly thinks
+about whether anything is worth saying. Two signals get checked:
+
+  1. If the repo's profile defines `test_cmd`, run it; failures escalate.
+  2. Ask joe-gemma: "given the recent change, is anything obviously wrong
+     or improvable? Reply SILENT or one short sentence."
+
+When non-silent, pops an osascript notification with the model's take.
+Optionally pushes to ntfy.
+
+joe-pair is intentionally quiet. It never writes files. The point is to
+have a coworker glancing over your shoulder who only speaks up when it
+actually matters.
+
+Usage:
+  joe-pair                                 watch cwd
+  joe-pair ~/GhostLM/ghostlm                explicit dir
+  joe-pair --debounce 4 --topic phone-joe   tunable
+  joe-pair --no-test                        skip the test_cmd run
+  joe-pair --interval 30                    minimum seconds between thinks
+
+Press Ctrl-C to stop.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.request
+from pathlib import Path
+from typing import Optional
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+DEFAULT_MODEL = "joe-gemma"
+HOME = Path.home()
+STATE_DIR = HOME / ".joe-agent"
+PROFILES_DIR = STATE_DIR / "profiles"
+
+CODE_EXTS = {".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".go", ".rb",
+             ".swift", ".kt", ".java", ".c", ".cpp", ".h", ".m", ".mm",
+             ".sh", ".sql"}
+
+SKIP_DIRS = {".git", "node_modules", "__pycache__", "target", ".next",
+             "dist", "build", ".venv", "venv", ".pytest_cache", ".turbo"}
+
+
+def _load_profile(cwd: Path) -> dict:
+    for ancestor in [cwd] + list(cwd.parents):
+        p = ancestor / ".joe-profile.toml"
+        if p.is_file():
+            try:
+                return tomllib.loads(p.read_text())
+            except Exception:
+                return {}
+    repo = cwd.name
+    try:
+        gp = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        if gp:
+            repo = Path(gp).name
+    except Exception:
+        pass
+    p = PROFILES_DIR / f"{repo}.toml"
+    if p.is_file():
+        try:
+            return tomllib.loads(p.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _notify(title: str, body: str, topic: str = "") -> None:
+    body_s = body[:240].replace('"', '\\"')
+    title_s = title[:60].replace('"', '\\"')
+    if sys.platform == "darwin":
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{body_s}" with title "{title_s}"'],
+            capture_output=True,
+        )
+    if topic:
+        try:
+            req = urllib.request.Request(
+                f"https://ntfy.sh/{topic}",
+                data=body.encode("utf-8"),
+                headers={"Title": title, "Tags": "eyes,joe", "Priority": "low"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5).close()
+        except Exception:
+            pass
+
+
+def _ask_model(model: str, changed_path: Path, snippet: str,
+               test_summary: str) -> Optional[str]:
+    """Ask joe-gemma whether the change is worth commenting on.
+
+    Returns a one-line take, or None for SILENT / failure.
+    """
+    prompt = (
+        "I just saved a code file. Look at the snippet below and decide "
+        "whether to interrupt me. If the code is fine OR the issue is so "
+        "trivial that mentioning it would annoy me, reply EXACTLY:\n"
+        "  SILENT\n"
+        "Otherwise reply with one short sentence (under 140 chars) about the "
+        "single most important thing I should fix or reconsider. Do not "
+        "explain how to fix it; just point at it. Examples of worth-saying:\n"
+        "  - off-by-one in the slice on line 14\n"
+        "  - that error swallows the original cause; bubble it up\n"
+        "  - this regex matches CRLF too, did you mean to?\n"
+        "Examples of NOT worth-saying: nit picks, style preferences the file "
+        "doesn't already follow, naming, comment density.\n\n"
+        f"<file>{changed_path}</file>\n"
+        f"<recent_test_output>\n{test_summary or '(none)'}\n</recent_test_output>\n"
+        f"<snippet>\n{snippet}\n</snippet>"
+    )
+    body = json.dumps({"model": model, "prompt": prompt,
+                       "stream": False, "think": False}).encode()
+    try:
+        req = urllib.request.Request(
+            OLLAMA_URL, data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            out = json.loads(r.read()).get("response", "").strip()
+    except Exception:
+        return None
+    if not out:
+        return None
+    first = out.splitlines()[0].strip()
+    if first.upper().startswith("SILENT"):
+        return None
+    return first[:200]
+
+
+def _read_recent(path: Path, max_chars: int = 6000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    # Snip both ends so we keep imports + the tail (often where edits land).
+    head = text[: max_chars // 3]
+    tail = text[-(max_chars - len(head)):]
+    return head + "\n# ... snip ...\n" + tail
+
+
+def _run_tests(cwd: Path, test_cmd: str) -> str:
+    try:
+        cp = subprocess.run(
+            test_cmd, shell=True, cwd=str(cwd),
+            capture_output=True, text=True, timeout=90,
+        )
+    except subprocess.TimeoutExpired:
+        return "TIMEOUT (90s)"
+    out = (cp.stdout or "") + (("\n[stderr]\n" + cp.stderr) if cp.stderr else "")
+    tail = "\n".join(out.splitlines()[-20:])
+    return f"[exit {cp.returncode}]\n{tail}"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="joe-pair")
+    ap.add_argument("path", nargs="?", default=".",
+                    help="directory to watch (default: cwd)")
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help=f"model for the worth-saying check (default: {DEFAULT_MODEL})")
+    ap.add_argument("--debounce", type=float, default=3.0,
+                    help="seconds to wait after a save before thinking (default: 3)")
+    ap.add_argument("--interval", type=float, default=20.0,
+                    help="minimum seconds between alerts to prevent spam (default: 20)")
+    ap.add_argument("--topic", default=os.environ.get("NTFY_TOPIC", ""),
+                    help="ntfy.sh topic for phone push (default: $NTFY_TOPIC)")
+    ap.add_argument("--no-test", action="store_true",
+                    help="skip running the profile's test_cmd on save")
+    ap.add_argument("--no-llm", action="store_true",
+                    help="only alert on failing tests; never ask the model")
+    args = ap.parse_args()
+
+    fswatch = shutil.which("fswatch")
+    if not fswatch:
+        print("joe-pair: fswatch not found. brew install fswatch", file=sys.stderr)
+        return 1
+    cwd = Path(args.path).expanduser().resolve()
+    if not cwd.is_dir():
+        print(f"joe-pair: not a directory: {cwd}", file=sys.stderr)
+        return 1
+    profile = _load_profile(cwd)
+    test_cmd = "" if args.no_test else (profile.get("test_cmd") or "")
+
+    print(
+        f"[joe-pair] watching {cwd}\n"
+        f"[joe-pair] debounce {args.debounce}s, alert-interval {args.interval}s\n"
+        f"[joe-pair] test_cmd: {test_cmd or '(none)'}\n"
+        f"[joe-pair] model:    {args.model}{' (LLM disabled)' if args.no_llm else ''}\n"
+        f"[joe-pair] ntfy:     {args.topic or '(none)'}\n"
+        f"[joe-pair] Ctrl-C to stop.",
+        file=sys.stderr,
+    )
+
+    proc = subprocess.Popen(
+        [fswatch, "-o", str(cwd)],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    last_alert = 0.0
+    last_save = 0.0
+    last_text: dict[Path, str] = {}
+    debouncing_until = 0.0
+
+    try:
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            now = time.time()
+            # Coalesce events; wait until debounce window passes after the
+            # last save before we react. fswatch -o just signals "something
+            # changed"; we look ourselves.
+            last_save = now
+            debouncing_until = now + args.debounce
+            while time.time() < debouncing_until:
+                # Drain any extra events that arrive during the debounce.
+                proc.stdout.readline()
+                if time.time() >= debouncing_until:
+                    break
+                time.sleep(0.25)
+            # Find what changed by mtime since debouncing_until - debounce*2.
+            cutoff = last_save - args.debounce * 2
+            candidates: list[Path] = []
+            for p in cwd.rglob("*"):
+                try:
+                    if not p.is_file() or p.suffix.lower() not in CODE_EXTS:
+                        continue
+                    if any(part in SKIP_DIRS for part in p.relative_to(cwd).parts):
+                        continue
+                    if p.stat().st_mtime >= cutoff:
+                        candidates.append(p)
+                except OSError:
+                    continue
+            if not candidates:
+                continue
+            # Pick the most recently modified.
+            candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            changed = candidates[0]
+            # Skip if the file content hasn't actually changed (touch / save).
+            snippet = _read_recent(changed)
+            if last_text.get(changed) == snippet:
+                continue
+            last_text[changed] = snippet
+            # Rate-limit alerts.
+            if (now - last_alert) < args.interval:
+                continue
+            test_out = ""
+            if test_cmd:
+                test_out = _run_tests(cwd, test_cmd)
+                if "[exit 0]" not in test_out and "exit 0" not in test_out.split("\n")[0]:
+                    # Failing tests are always interesting.
+                    _notify(
+                        f"joe-pair: test failure",
+                        f"{changed.name} just changed; tests failing:\n"
+                        + "\n".join(test_out.splitlines()[-3:]),
+                        topic=args.topic,
+                    )
+                    last_alert = time.time()
+                    continue
+            if args.no_llm:
+                continue
+            take = _ask_model(args.model, changed, snippet, test_out)
+            if take:
+                _notify(
+                    f"joe-pair: {changed.name}",
+                    take,
+                    topic=args.topic,
+                )
+                print(f"[joe-pair] {changed.name}: {take}", file=sys.stderr)
+                last_alert = time.time()
+    except KeyboardInterrupt:
+        print("\n[joe-pair] stopped.", file=sys.stderr)
+    finally:
+        proc.terminate()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

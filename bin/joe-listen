@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""joe-listen: record audio from the default mic, transcribe via whisper.cpp.
+
+Self-contained voice-input helper:
+
+  joe-listen                       record until silence (default 8s cap)
+  joe-listen --duration 10         hard 10-second record
+  joe-listen --wav some.wav        transcribe an existing WAV instead
+  joe-listen --model medium.en     use a different whisper model
+  joe-listen --keep-wav            don't delete the recording afterwards
+
+Recording uses sox (`rec`); transcription uses whisper-cli (whisper.cpp).
+Both must be on PATH. Install with `brew install whisper-cpp sox`. The
+whisper model is auto-downloaded by whisper-cpp's `download-ggml-model.sh`
+if it's not already in /opt/homebrew/share/whisper-cpp/models/.
+
+The intended caller is the joe interactive shell, which spawns this
+via `/listen` and pipes the transcription into the next user turn.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HOME = Path.home()
+DEFAULT_MODEL = "base.en"
+MODEL_DIR_CANDIDATES = [
+    Path("/opt/homebrew/share/whisper-cpp/models"),
+    Path("/usr/local/share/whisper-cpp/models"),
+    HOME / ".cache" / "whisper-cpp" / "models",
+]
+
+
+def _which(name: str) -> str:
+    p = shutil.which(name)
+    if not p:
+        raise SystemExit(
+            f"joe-listen: missing dependency {name!r}. "
+            f"Run: brew install whisper-cpp sox"
+        )
+    return p
+
+
+def _find_model(name: str) -> Path:
+    candidates = [d / f"ggml-{name}.bin" for d in MODEL_DIR_CANDIDATES]
+    for c in candidates:
+        if c.exists():
+            return c
+    # Try to auto-download via the helper script that whisper-cpp ships.
+    downloader = shutil.which("download-ggml-model.sh") or \
+        "/opt/homebrew/Cellar/whisper-cpp/*/bin/download-ggml-model.sh"
+    raise SystemExit(
+        f"joe-listen: no model {name!r} in any of:\n  "
+        + "\n  ".join(str(c) for c in candidates)
+        + f"\nDownload it with:\n  {downloader} {name}\n"
+        f"or set --model to one already on disk."
+    )
+
+
+def record(duration_s: float, wav_path: Path, vad: bool = True,
+           silence_s: float = 1.2, silence_thresh: str = "2%") -> None:
+    """Record from default mic to wav_path.
+
+    `vad=True` uses sox's `silence` effect so recording auto-stops after
+    `silence_s` seconds at or below `silence_thresh` amplitude, with a
+    hard cap of `duration_s` so an open mic in a quiet room can't loop
+    forever. `vad=False` records a fixed `duration_s` block.
+
+    16-bit, 16 kHz, mono. Matches whisper's expected input.
+    """
+    rec = _which("rec")
+    base = [rec, "-q", "-r", "16000", "-c", "1", "-b", "16", str(wav_path)]
+    if vad:
+        # silence: 1 above-threshold start period of 0.1s; 1 below-threshold
+        # stop period of `silence_s` at `silence_thresh`. trim caps total.
+        effects = [
+            "silence", "1", "0.1", "1%",
+            "1", str(silence_s), silence_thresh,
+            "trim", "0", str(duration_s),
+        ]
+        print(
+            f"[joe-listen] recording (auto-stop on {silence_s}s silence, "
+            f"max {duration_s}s)... speak now.",
+            file=sys.stderr,
+        )
+    else:
+        effects = ["trim", "0", str(duration_s)]
+        print(f"[joe-listen] recording {duration_s}s... speak now.", file=sys.stderr)
+    cp = subprocess.run(base + effects, capture_output=True, text=True)
+    if cp.returncode != 0:
+        raise SystemExit(f"joe-listen: rec failed (exit {cp.returncode}): {cp.stderr}")
+    if not wav_path.exists() or wav_path.stat().st_size < 1000:
+        raise SystemExit("joe-listen: recording is empty or tiny; mic blocked?")
+
+
+def transcribe(wav_path: Path, model_name: str) -> str:
+    cli = _which("whisper-cli")
+    model_path = _find_model(model_name)
+    # `-nt` no timestamps, `-l en` English. `-otxt` writes transcription.txt
+    # next to the wav, but we capture stdout too.
+    cmd = [cli, "-m", str(model_path), "-f", str(wav_path),
+           "-nt", "-l", "en", "--no-prints"]
+    cp = subprocess.run(cmd, capture_output=True, text=True)
+    if cp.returncode != 0:
+        raise SystemExit(f"joe-listen: whisper-cli failed (exit {cp.returncode}): {cp.stderr}")
+    # whisper-cli prints the transcription to stdout when -otxt is omitted.
+    text = (cp.stdout or "").strip()
+    # Some builds prepend metadata lines like "[whisper.cpp] ..."; strip them.
+    lines = [ln for ln in text.splitlines() if ln and not ln.startswith("[")]
+    return " ".join(lines).strip()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="joe-listen")
+    ap.add_argument("--duration", type=float, default=30.0,
+                    help="hard recording cap in seconds (default: 30)")
+    ap.add_argument("--no-vad", action="store_true",
+                    help="disable silence-detection auto-stop; always record full --duration")
+    ap.add_argument("--silence", type=float, default=1.2,
+                    help="seconds of silence required to auto-stop (default: 1.2)")
+    ap.add_argument("--threshold", default="2%",
+                    help="silence amplitude threshold (default: 2%%)")
+    ap.add_argument("--wav", help="transcribe this WAV instead of recording fresh")
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help="whisper model name (default: base.en)")
+    ap.add_argument("--keep-wav", action="store_true",
+                    help="keep the recorded WAV (default: delete)")
+    args = ap.parse_args()
+
+    if args.wav:
+        text = transcribe(Path(args.wav).expanduser(), args.model)
+    else:
+        with tempfile.TemporaryDirectory() as td:
+            wav = Path(td) / "joe-listen.wav"
+            record(
+                args.duration, wav,
+                vad=not args.no_vad,
+                silence_s=args.silence,
+                silence_thresh=args.threshold,
+            )
+            text = transcribe(wav, args.model)
+            if args.keep_wav:
+                kept = HOME / ".joe-agent" / "voice" / wav.name
+                kept.parent.mkdir(parents=True, exist_ok=True)
+                kept.write_bytes(wav.read_bytes())
+                print(f"[joe-listen] kept recording at {kept}", file=sys.stderr)
+
+    if not text:
+        print("[joe-listen] empty transcription", file=sys.stderr)
+        return 1
+    print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

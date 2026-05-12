@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""joe-watch-logs: ambient log tailing with LLM-driven smart alerts.
+
+Tails one or more files, batches recent lines on an interval, and asks a
+local LLM "is anything in here actually interesting?". When the answer is
+yes, fires a phone push (ntfy.sh) + a macOS banner. Designed for the
+"close the laptop while overnight training runs" workflow: the watcher
+sits quiet until something is worth waking you up for.
+
+Usage:
+  joe-watch-logs path/to/run.log
+  joe-watch-logs train.log eval.log --interval 60 --topic phone-joe
+  joe-watch-logs --label "GhostLM v0.9.30 retrain" train.log
+
+How "interesting" is decided:
+  1. Fast-path regex (always interesting): error / traceback / failed /
+     killed / nan / oom / segfault / saved checkpoint / epoch finished /
+     best-so-far / step \\d+/\\d+ done.
+  2. LLM second pass on the remaining batch every --interval seconds.
+     We ask joe-gemma to either say BORING or to produce a one-line
+     summary; only the summary is pushed.
+
+The watcher never re-pushes the same summary twice in a row. Press
+Ctrl-C to stop.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from pathlib import Path
+from typing import Optional
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+DEFAULT_MODEL = "joe-gemma"
+DEFAULT_INTERVAL = 60   # seconds between LLM checks
+MAX_BATCH_LINES = 80    # how many lines we hand to the LLM per check
+
+# Always-interesting fast-path patterns. Case-insensitive. Tuned for ML
+# training logs + generic dev-server output; users can add more via --rule.
+FAST_PATH_RULES = [
+    re.compile(r"\btraceback\b", re.IGNORECASE),
+    re.compile(r"\b(error|exception|panic|fatal|critical)\b[: ]", re.IGNORECASE),
+    re.compile(r"\b(failed|aborted|killed|segfault|oom|out of memory)\b", re.IGNORECASE),
+    re.compile(r"\bnan\b", re.IGNORECASE),
+    re.compile(r"\b(best so far|new best|saved checkpoint|epoch \d+ (done|finished|complete))\b", re.IGNORECASE),
+    re.compile(r"\b(training (done|complete|finished)|run finished)\b", re.IGNORECASE),
+    re.compile(r"\b(deploy(ed)? successful|server (up|listening))\b", re.IGNORECASE),
+]
+
+
+class _Tail:
+    """Wraps `tail -F path` in a thread; pushes new lines into a queue."""
+
+    def __init__(self, path: Path, q: "queue.Queue[tuple[str, str]]") -> None:
+        self.path = path
+        self.q = q
+        self.proc: Optional[subprocess.Popen] = None
+        self.t: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self.proc = subprocess.Popen(
+            ["tail", "-F", "-n", "0", str(self.path)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        self.t = threading.Thread(target=self._reader, daemon=True)
+        self.t.start()
+
+    def stop(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+    def _reader(self) -> None:
+        assert self.proc and self.proc.stdout
+        for raw in self.proc.stdout:
+            ln = raw.rstrip("\n")
+            if ln:
+                self.q.put((str(self.path), ln))
+
+
+def _ntfy_push(topic: str, title: str, body: str) -> None:
+    if not topic:
+        return
+    try:
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{topic}",
+            data=body.encode("utf-8"),
+            headers={"Title": title, "Tags": "eyes,joe", "Priority": "default"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=8).close()
+    except Exception as e:
+        print(f"[joe-watch-logs] ntfy push failed: {e}", file=sys.stderr)
+
+
+def _osascript_notify(title: str, body: str) -> None:
+    if sys.platform != "darwin":
+        return
+    # Escape double quotes for AppleScript.
+    body_s = body.replace('"', '\\"')[:240]
+    title_s = title.replace('"', '\\"')[:60]
+    subprocess.run(
+        ["osascript", "-e",
+         f'display notification "{body_s}" with title "{title_s}"'],
+        capture_output=True,
+    )
+
+
+def _ollama_check(model: str, lines: list[tuple[str, str]]) -> Optional[str]:
+    """Ask the model whether anything in `lines` is interesting.
+
+    Returns a short summary string if so, or None if the model says BORING.
+    Falls back to None on any error so the watcher keeps running.
+    """
+    sample = lines[-MAX_BATCH_LINES:]
+    payload_lines = "\n".join(f"[{Path(p).name}] {l}" for p, l in sample)
+    prompt = (
+        "You are watching log output for me. Decide whether the lines below "
+        "contain anything I should be woken up for: errors, crashes, training "
+        "milestones, finished runs, regressions, security events. Ignore "
+        "routine noise (steady progress bars, repeated heartbeat lines).\n\n"
+        "Reply on a SINGLE line, exactly one of these two shapes:\n"
+        "  BORING\n"
+        "  INTERESTING: <one short sentence summarising what happened>\n\n"
+        f"<log_batch>\n{payload_lines}\n</log_batch>"
+    )
+    body = json.dumps({"model": model, "prompt": prompt,
+                       "stream": False, "think": False}).encode()
+    try:
+        req = urllib.request.Request(
+            OLLAMA_URL, data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=45) as r:
+            out = json.loads(r.read()).get("response", "").strip()
+    except Exception as e:
+        print(f"[joe-watch-logs] ollama call failed: {e}", file=sys.stderr)
+        return None
+    if not out:
+        return None
+    first = out.splitlines()[0].strip()
+    if first.upper().startswith("BORING"):
+        return None
+    m = re.match(r"^INTERESTING\s*[:\-]\s*(.+)$", first, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # Model didn't follow format; treat any non-BORING short answer as interesting.
+    return first[:240]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="joe-watch-logs")
+    ap.add_argument("paths", nargs="+", help="files to tail")
+    ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL,
+                    help=f"seconds between LLM checks (default: {DEFAULT_INTERVAL})")
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help=f"model for the interesting/boring check (default: {DEFAULT_MODEL})")
+    ap.add_argument("--topic", default=os.environ.get("NTFY_TOPIC", ""),
+                    help="ntfy.sh topic to push to (default: $NTFY_TOPIC)")
+    ap.add_argument("--label", default="joe-watch-logs",
+                    help="prefix for the notification title")
+    ap.add_argument("--rule", action="append", default=[],
+                    help="add a regex; matching lines are always interesting (repeatable)")
+    ap.add_argument("--no-llm", action="store_true",
+                    help="rules-only mode, skip the LLM check entirely")
+    args = ap.parse_args()
+
+    paths = [Path(p).expanduser().resolve() for p in args.paths]
+    for p in paths:
+        if not p.exists():
+            print(f"[joe-watch-logs] no such file: {p}", file=sys.stderr)
+            return 1
+
+    user_rules = [re.compile(r, re.IGNORECASE) for r in args.rule]
+    rules = FAST_PATH_RULES + user_rules
+
+    q: "queue.Queue[tuple[str, str]]" = queue.Queue()
+    tails = [_Tail(p, q) for p in paths]
+    for t in tails:
+        t.start()
+
+    print(
+        f"[joe-watch-logs] watching {len(paths)} file(s); "
+        f"interval {args.interval}s; "
+        f"topic {args.topic or '(none)'}; model {args.model}",
+        file=sys.stderr,
+    )
+    print(f"[joe-watch-logs] Ctrl-C to stop.", file=sys.stderr)
+
+    batch: list[tuple[str, str]] = []
+    fast_hits: list[tuple[str, str, str]] = []  # (path, line, matched-rule-summary)
+    last_check = time.time()
+    last_pushed: Optional[str] = None
+
+    def _push(title: str, body: str) -> None:
+        nonlocal last_pushed
+        if body == last_pushed:
+            return
+        last_pushed = body
+        full_title = f"{args.label}: {title}"
+        print(f"[joe-watch-logs] ALERT  {full_title}  ::  {body}", file=sys.stderr)
+        _ntfy_push(args.topic, full_title, body)
+        _osascript_notify(full_title, body)
+
+    try:
+        while True:
+            try:
+                path, line = q.get(timeout=1.0)
+                batch.append((path, line))
+                # Fast-path: any rule hit goes out immediately.
+                for rule in rules:
+                    if rule.search(line):
+                        fast_hits.append((path, line, rule.pattern))
+                        break
+            except queue.Empty:
+                pass
+
+            if fast_hits:
+                # Coalesce all fast-hits since the last drain into one alert.
+                joined = "\n".join(f"{Path(p).name}: {l[:200]}"
+                                   for p, l, _ in fast_hits[-5:])
+                _push("rule hit", joined)
+                fast_hits.clear()
+
+            if not args.no_llm and (time.time() - last_check) >= args.interval and batch:
+                summary = _ollama_check(args.model, batch)
+                last_check = time.time()
+                if summary:
+                    _push("interesting", summary)
+                batch.clear()
+    except KeyboardInterrupt:
+        print("\n[joe-watch-logs] stopped.", file=sys.stderr)
+    finally:
+        for t in tails:
+            t.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
