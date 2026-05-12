@@ -693,6 +693,128 @@ def keys_page(token: Optional[str] = None) -> HTMLResponse:
 
 
 # --------------------------------------------------------------------------
+# OpenAI-shaped shim: /v1/chat/completions + /v1/models
+#
+# This proxies ollama's already-OpenAI-compatible endpoint, with two
+# additions worth the indirection:
+#
+#   1. personalisation injection -- the active lessons supplement gets
+#      prepended as a system message when the caller doesn't supply one,
+#      so any OpenAI-compatible client (ghostloop's LLMPolicy, openai-
+#      python, langchain) talking to joe-http gets joe-gemma personalised
+#      by Joe's accumulated corrections.
+#
+#   2. bearer auth + cross-machine access -- ollama only listens on
+#      localhost. joe-http is auth-gated and can be exposed over the LAN
+#      or via Tailscale. ghostloop running on a separate machine can
+#      reach joe-gemma through joe-http; it can't reach ollama directly.
+#
+# Streaming: SSE pass-through. Non-streaming: standard JSON response.
+# --------------------------------------------------------------------------
+
+
+_OLLAMA_OPENAI_BASE = "http://localhost:11434/v1"
+
+
+def _lessons_supplement_text() -> str:
+    """Read the active prompt supplement so we can inject it as a system
+    message for clients that didn't provide one. Best-effort; empty if
+    the file is absent."""
+    p = Path.home() / ".joe-agent" / "prompt-supplement.md"
+    if p.is_file():
+        return p.read_text(encoding="utf-8", errors="replace").strip()
+    return ""
+
+
+def _inject_personalisation(body: dict) -> dict:
+    """Mutate-and-return the OpenAI chat-completion request body so it
+    carries joe's personalisation context."""
+    if "model" not in body or not body["model"]:
+        body["model"] = os.environ.get("JOE_DEFAULT_MODEL", "joe-gemma")
+    msgs = body.get("messages") or []
+    has_system = any(m.get("role") == "system" for m in msgs)
+    if not has_system:
+        sup = _lessons_supplement_text()
+        if sup:
+            preamble = (
+                "You are joe-gemma, a personalised assistant. "
+                "Apply the following learned preferences:\n\n" + sup
+            )
+            body["messages"] = [
+                {"role": "system", "content": preamble}, *msgs,
+            ]
+    return body
+
+
+def _proxy_chat_completions(body: dict):
+    """Generator: forwards the request to ollama and yields raw response bytes."""
+    payload = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"{_OLLAMA_OPENAI_BASE}/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=600)
+    except Exception as e:
+        yield f'data: {{"error":"{str(e)}"}}\n\n'.encode()
+        return
+    try:
+        for chunk in resp:
+            yield chunk
+    finally:
+        resp.close()
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    _check_auth(authorization)
+    body = await request.json()
+    body = _inject_personalisation(body)
+    stream = bool(body.get("stream"))
+    if stream:
+        return StreamingResponse(
+            _proxy_chat_completions(body),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    # Non-streaming: collect the full response and return as JSON.
+    payload = json.dumps(body).encode()
+    req = urllib.request.Request(
+        f"{_OLLAMA_OPENAI_BASE}/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            data = resp.read()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ollama proxy failed: {e}")
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="ollama returned non-JSON")
+
+
+@app.get("/v1/models")
+def openai_models(authorization: Optional[str] = Header(None)) -> dict:
+    """Pass through ollama's /v1/models so OpenAI-compatible clients
+    that check capabilities at init can see what's available."""
+    _check_auth(authorization)
+    try:
+        with urllib.request.urlopen(
+            f"{_OLLAMA_OPENAI_BASE}/models", timeout=10,
+        ) as resp:
+            data = resp.read()
+        return json.loads(data)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ollama proxy failed: {e}")
+
+
+# --------------------------------------------------------------------------
 # /chat-stream: SSE streaming endpoint for the dashboard chat textarea.
 # Browsers' EventSource only supports GET, so we accept the prompt as a
 # query param. Bearer token also via query param to match the dashboard.

@@ -334,11 +334,14 @@ system prompt and can call them with:
 
 Results come back through the standard `<tool_result>` loop.
 
-### example: joe talking to ghostloop
+### example: joe ↔ ghostloop (bidirectional)
 
-ghostloop (the robotics-agent sister project) already ships an MCP
-server at `examples/mcp_robot.py`. With one config entry in
-`~/.joe-agent/mcp-clients.json` joe becomes a client of that server:
+joe pairs naturally with [ghostloop](https://github.com/joemunene-by/ghostloop),
+the embodied-agent runtime. Both directions of the loop are now wired:
+
+**direction 1 — joe drives ghostloop** (joe as MCP client, ghostloop as MCP server).
+ghostloop ships `examples/mcp_robot.py` as an MCP server. Drop one entry into
+`~/.joe-agent/mcp-clients.json`:
 
 ```json
 {
@@ -353,11 +356,37 @@ server at `examples/mcp_robot.py`. With one config entry in
 }
 ```
 
-joe-gemma now sees `move_to`, `pick`, `place`, `scan` etc. in
-`<mcp_tools>` and can drive a robot from any prompt. ghostloop's
-policy pipeline (geofence, force-cap, human-in-the-loop) still gates
-every intent so joe can use the robot but can't bypass safety. Full
-sample at `examples/mcp-clients.ghostloop.json`.
+joe-gemma now sees `move_to`, `pick`, `place`, `scan` etc. in `<mcp_tools>` and
+can drive the robot from any prompt. ghostloop's policy pipeline (geofence,
+force-cap, human-in-the-loop) still gates every intent so joe can use the
+robot but can't bypass safety. Full sample at
+`examples/mcp-clients.ghostloop.json`.
+
+**direction 2 — ghostloop uses joe-gemma as its policy brain** via the
+OpenAI-shaped shim on `joe-http`:
+
+```sh
+# on the box running joe:
+joe-http --host 0.0.0.0          # exposes /v1/chat/completions + /v1/models
+
+# on the box running ghostloop:
+OPENAI_BASE_URL=http://<joe-host>:8765/v1 \
+OPENAI_API_KEY=$(ssh <joe-host> cat ~/.joe-agent/http-token) \
+OPENAI_MODEL=joe-gemma \
+    python3 examples/direct_llm_arm.py
+```
+
+joe-http proxies ollama's already-OpenAI-compatible endpoint, with two
+additions worth the indirection:
+  1. **personalisation injection** — the active lessons supplement gets
+     prepended as a system message when the caller doesn't supply one,
+     so ghostloop's `LLMPolicy` inherits your distilled preferences.
+  2. **bearer auth + cross-machine access** — ollama only listens on
+     localhost; joe-http can be exposed over LAN or Tailscale, so
+     ghostloop on another machine can reach joe-gemma without exposing
+     ollama directly.
+
+Sample ghostloop runner at `examples/ghostloop-uses-joe.py`.
 
 ## what's not in here yet
 
