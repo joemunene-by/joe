@@ -4140,31 +4140,49 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
             if cmd == "plan":
                 if not args:
                     console.print("[red]/plan needs a task description[/]"); continue
-                # If the active profile names a `planner`, use that model for
-                # the planning turn (typically deepseek-r1 or similar). Falls
-                # back to the orchestrator.
+                # Split planning from execution:
+                #   - the planner (deepseek-r1 by default) emits the
+                #     <plan> block ONLY -- reasoning models often don't
+                #     follow tool-call protocols well
+                #   - each step then runs under the orchestrator
+                #     (joe-gemma), which knows how to emit <write> /
+                #     <delegate> / <test> / etc.
                 profile = _load_profile(state["cwd"])
                 planner = profile.get("planner") or DEFAULT_PLANNER
-                use_planner = planner != state["model"]
                 forced = (
                     f"{args}\n\n"
-                    "Treat this as a multi-step task. Your FIRST response "
-                    "must be a <plan title=\"...\">...</plan> block with one "
-                    "concrete step per numbered line. Don't emit any other "
-                    "tags this turn; the shell will display the plan, ask "
-                    "the user to approve, then drive each step."
+                    "Produce a single <plan title=\"...\">...</plan> block "
+                    "with one concrete step per numbered line. Each step "
+                    "should be a self-contained instruction the executor "
+                    "can act on. Do NOT emit any other tags this turn."
                 )
-                if use_planner:
+                if planner != state["model"]:
                     console.print(
-                        f"[dim]routing /plan to [bold]{planner}[/] (profile or default)[/]"
+                        f"[dim]routing /plan to [bold]{planner}[/] (profile or default); "
+                        f"steps will execute under [bold]{state['model']}[/][/]"
                     )
                 try:
-                    run_turn(model=planner if use_planner else state["model"],
-                             coder_model=state["coder"],
-                             user_msg=forced, cwd=state["cwd"], session=state["session"],
-                             allow_all_bash=allow_all_bash, max_turns=MAX_AUTO_TURNS)
+                    plan_text = _ollama_stream_to_console(planner, forced)
                 except KeyboardInterrupt:
-                    console.print("\n[yellow]plan interrupted[/]")
+                    console.print("\n[yellow]plan interrupted[/]"); continue
+                plan = parse_plan_block(plan_text)
+                if not plan:
+                    console.print(
+                        "[yellow]planner didn't emit a <plan> block. "
+                        "Try /plan again, or give it a more specific task.[/]"
+                    )
+                    continue
+                try:
+                    execute_plan(
+                        plan,
+                        model=state["model"],
+                        coder_model=state["coder"],
+                        cwd=state["cwd"],
+                        session=state["session"],
+                        allow_all_bash=allow_all_bash,
+                    )
+                except KeyboardInterrupt:
+                    console.print("\n[yellow]plan execution interrupted[/]")
                 continue
             if cmd == "test":
                 where = args or "."
