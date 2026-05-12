@@ -2199,9 +2199,21 @@ def tool_write(attrs: dict, body: str, confirm: bool = True) -> str:
     # examples (path/to/file.py, /path/to/..., ~/dir/file.ext, etc.).
     placeholder_patterns = ("path/to/", "/path/to/", "your/path", "<path>", "{path}")
     if any(pat in path for pat in placeholder_patterns):
+        # Auto-capture as a lesson so /lessons distill can teach the model
+        # to stop emitting placeholders next time.
+        try:
+            lesson_capture(
+                source="placeholder-path",
+                rejected=f"<write path={path!r}>",
+                note="emitted a documentation-example placeholder path "
+                     "instead of an absolute or cwd-relative real path",
+            )
+        except Exception:
+            pass
         raise ToolError(
             f"<write path={path!r}>: that's a placeholder, not a real path. "
-            f"Re-emit <write> with the actual target path from the user's request."
+            f"Re-emit <write> with the actual target path from the user's request. "
+            f"If you don't know the path, STOP."
         )
     p = _resolve_path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -2690,6 +2702,58 @@ def parse_plan_block(text: str) -> Optional[Plan]:
     return Plan(title=title, steps=steps)
 
 
+def _plan_grounding(cwd: Path) -> str:
+    """Probe cwd before plan execution so steps don't hallucinate files.
+
+    Captures: real pwd, git repo root (or 'not a git repo'), git ls-files
+    truncated to 60 entries, top-level ls. Injected as <plan_environment>
+    into every step prompt so the executor grounds against actual paths
+    instead of inventing speculative ones.
+    """
+    parts: list[str] = []
+    parts.append(f"pwd: {cwd}")
+    try:
+        gp = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if gp.returncode == 0 and gp.stdout.strip():
+            parts.append(f"git repo: {gp.stdout.strip()}")
+            ls = subprocess.run(
+                ["git", "-C", str(cwd), "ls-files"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if ls.returncode == 0:
+                files = ls.stdout.splitlines()[:60]
+                parts.append(
+                    f"git ls-files (first {len(files)} of "
+                    f"{len(ls.stdout.splitlines())}):\n"
+                    + "\n".join(f"  {f}" for f in files)
+                )
+        else:
+            parts.append("git repo: (cwd is not in a git repo)")
+            ls = subprocess.run(
+                ["ls", "-la", str(cwd)],
+                capture_output=True, text=True, timeout=3,
+            )
+            if ls.returncode == 0:
+                parts.append("ls -la:\n" + ls.stdout[:2000])
+    except Exception as e:
+        parts.append(f"grounding probe error: {e}")
+    return "<plan_environment>\n" + "\n".join(parts) + "\n</plan_environment>"
+
+
+def _plan_change_count() -> int:
+    """How many provenance entries exist right now (for delta tracking)."""
+    try:
+        c = _provdb()
+        n = c.execute("SELECT COUNT(*) FROM provenance").fetchone()[0]
+        c.close()
+        return int(n)
+    except Exception:
+        return 0
+
+
 def execute_plan(
     plan: Plan,
     model: str,
@@ -2698,39 +2762,84 @@ def execute_plan(
     session: Optional[str],
     allow_all_bash: bool,
 ) -> None:
-    """Step through a plan with user approval after each step."""
-    panel(plan.title, plan.render(), style="bright_cyan", subtitle=f"{len(plan.steps)} steps")
+    """Step through a plan with user approval after each step.
+
+    Reports plan complete only if at least one provenance entry was added
+    during execution. Otherwise reports 'plan failed: 0 changes landed' so
+    the user doesn't get a false 'success' when the executor hallucinated
+    against files that don't exist.
+    """
+    panel(plan.title, plan.render(), style="bright_cyan",
+          subtitle=f"{len(plan.steps)} steps")
     if not _confirm(f"Execute this {len(plan.steps)}-step plan?"):
         console.print("[yellow]plan aborted[/]")
         return
+
+    # Snapshot the provenance count up front so we can tell at the end
+    # whether ANY real writes/edits landed during the plan.
+    prov_before = _plan_change_count()
+    grounding = _plan_grounding(cwd)
+
     for i, step in enumerate(plan.steps, 1):
         console.rule(f"[bold cyan]Step {i}/{len(plan.steps)}:[/] {step}")
+        step_prov_before = _plan_change_count()
         prompt = (
+            f"{grounding}\n\n"
             f"<plan_step n=\"{i}\" total=\"{len(plan.steps)}\">{step}</plan_step>\n\n"
             "Execute THIS step ONLY. Use the standard tools (write / edit / "
             "delegate / test / lint / etc.). When the step is complete, stop "
             "emitting tags and confirm in a single sentence.\n\n"
             "HARD RULES:\n"
-            "  - Stay on this step's task. Do NOT pivot to unrelated files or "
-            "    repos if a tool errors. Retry within the step's scope or "
-            "    report the failure and stop.\n"
-            "  - File paths must be absolute or correctly relative to the "
-            "    current cwd (see <cwd> in the environment). If you are about "
-            "    to emit a path like 'src/foo.py' and the cwd isn't a "
-            "    project root that has that path, STOP and ask for the real path.\n"
-            "  - If the step asks for code, your first tag must be <delegate> "
-            "    (per the code-writing protocol), not <write>."
+            "  - Exactly ONE tag per response. Don't stack <write>, <edit>, "
+            "    <read> in the same turn -- emit one, wait for the result.\n"
+            "  - Use ONLY paths that appear in <plan_environment> above, OR "
+            "    absolute paths the user gave you in the original request. "
+            "    Inventing 'src/foo.py' when no such file is listed is a bug. "
+            "    If the step needs a new file, propose the exact path and "
+            "    confirm with a short prose sentence first.\n"
+            "  - Stay on this step's task. Do NOT pivot to unrelated files "
+            "    or repos if a tool errors. If you genuinely cannot proceed, "
+            "    output exactly STOP: <reason> on its own line and stop.\n"
+            "  - For code-writing tasks the first tag must be <delegate>, "
+            "    not <write> (per the code-writing protocol).\n"
         )
         run_turn(
             model=model, coder_model=coder_model, user_msg=prompt,
             cwd=cwd, session=session, allow_all_bash=allow_all_bash,
             max_turns=MAX_AUTO_TURNS,
         )
+        step_changes = _plan_change_count() - step_prov_before
+        console.print(
+            f"[dim]step {i} produced {step_changes} change(s)[/]"
+        )
         if i < len(plan.steps):
             if not _confirm(f"Step {i} done. Continue to step {i + 1}?"):
                 console.print(f"[yellow]plan stopped at step {i}[/]")
-                return
-    console.print(f"[bold green]plan complete: {plan.title}[/]")
+                break
+
+    # Verdict based on actual changes, not on the model declaring victory.
+    total_changes = _plan_change_count() - prov_before
+    if total_changes == 0:
+        panel(
+            "plan failed",
+            Text.from_markup(
+                f"[bold red]0 changes landed.[/]\n"
+                f"The executor declared steps 'complete' but no file was "
+                f"written or edited. Likely causes:\n"
+                f"  - cwd doesn't match the project the plan is about\n"
+                f"  - the planner hallucinated a codebase that doesn't exist\n"
+                f"  - the executor emitted placeholder paths and was rejected\n\n"
+                f"Try: /cwd into the real project, or @reponame your-task."
+            ),
+            style="red",
+            subtitle=plan.title,
+        )
+    else:
+        panel(
+            f"plan complete  ({total_changes} change{'s' if total_changes != 1 else ''})",
+            Text(plan.title),
+            style="green",
+        )
 
 
 def _guess_lexer(p: Path) -> str:
@@ -3714,9 +3823,25 @@ def run_turn(
         # Reflect tool result to the model.
         if len(result) > 4000:
             result = result[:4000] + "\n[... truncated ...]"
+        # If the tool failed (the result contains a leading ERROR: line, or
+        # a known crash signature), nudge the model toward STOP rather than
+        # blind retry.
+        result_is_error = result.startswith("ERROR:") or "Tool error" in result \
+            or "Tool crashed" in result or "no such file" in result.lower()
+        nudge = (
+            "Continue. Either emit another tool tag or answer in plain prose."
+        )
+        if result_is_error:
+            nudge = (
+                "The previous tool call failed. Either:\n"
+                "  - retry with a CORRECTED tag (different path, different args),\n"
+                "  - or, if you cannot make progress on this step, output "
+                "    exactly STOP: <one-sentence reason>  and stop emitting tags.\n"
+                "Do NOT repeat the same tag with the same args."
+            )
         prompt = (
             response + f"\n\n<tool_result name=\"{call.name}\">\n{result}\n</tool_result>\n"
-            "Continue. Either emit another tool tag or answer the user in plain prose."
+            + nudge
         )
     else:
         console.print(f"[yellow]Hit {max_turns}-turn tool-loop cap. Stopping.[/]")
