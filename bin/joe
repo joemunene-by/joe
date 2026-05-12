@@ -2372,8 +2372,12 @@ def tool_delegate(attrs: dict, body: str, coder_model: str) -> str:
     )
     # Wrap the spec with the user's style rules (resolved from the active
     # profile + lessons supplement) so the coder model picks them up even
-    # though it doesn't share the orchestrator's system prompt.
+    # though it doesn't share the orchestrator's system prompt. We also
+    # inject the active cwd so the coder doesn't emit nonsensical paths
+    # ("src/foo.ts" when cwd is /) and the lessons supplement so newly-
+    # distilled preferences propagate down to the code-writing layer.
     cwd_for_style = Path.cwd()
+    short_cwd = str(cwd_for_style).replace(str(HOME), "~")
     style_hint = ""
     try:
         prof = _load_profile(cwd_for_style)
@@ -2382,7 +2386,22 @@ def tool_delegate(attrs: dict, body: str, coder_model: str) -> str:
             style_hint = f"\nProject context:\n{ctx}\n"
     except Exception:
         pass
+    lessons_hint = ""
+    try:
+        rules = lessons_active_rules()
+        if rules:
+            lessons_hint = (
+                "\nLearned preferences (obey before defaults):\n"
+                + "\n".join(f"  - {r}" for r in rules)
+                + "\n"
+            )
+    except Exception:
+        pass
     wrapped = (
+        f"<cwd>{short_cwd}</cwd>\n"
+        "Any file paths you produce MUST be absolute (~/foo or /Users/.../foo) "
+        "or correctly relative to the cwd above. Never emit speculative paths "
+        "like 'src/...' unless the cwd is a project root that has them.\n\n"
         "You are writing code for the user. Match this style by default "
         "(the active repo profile may override):\n"
         "  - Python: type hints, dataclasses where state is plain, "
@@ -2392,7 +2411,7 @@ def tool_delegate(attrs: dict, body: str, coder_model: str) -> str:
         "  - No em-dashes as separators (use commas, colons, parens).\n"
         "  - No emojis in source, READMEs, commit messages, UI strings.\n"
         "  - Comments only when WHY is non-obvious; never WHAT.\n"
-        f"{style_hint}"
+        f"{style_hint}{lessons_hint}"
         "Respond with code only inside a single fenced code block. "
         "Include the language tag. Brief preamble outside the fence is OK.\n\n"
         f"Task:\n{spec}"
@@ -2688,9 +2707,19 @@ def execute_plan(
         console.rule(f"[bold cyan]Step {i}/{len(plan.steps)}:[/] {step}")
         prompt = (
             f"<plan_step n=\"{i}\" total=\"{len(plan.steps)}\">{step}</plan_step>\n\n"
-            "Execute this step now. Use the standard tools (write / edit / "
-            "delegate / test / lint / etc.). When the step is complete, "
-            "stop emitting tags and confirm in a single sentence."
+            "Execute THIS step ONLY. Use the standard tools (write / edit / "
+            "delegate / test / lint / etc.). When the step is complete, stop "
+            "emitting tags and confirm in a single sentence.\n\n"
+            "HARD RULES:\n"
+            "  - Stay on this step's task. Do NOT pivot to unrelated files or "
+            "    repos if a tool errors. Retry within the step's scope or "
+            "    report the failure and stop.\n"
+            "  - File paths must be absolute or correctly relative to the "
+            "    current cwd (see <cwd> in the environment). If you are about "
+            "    to emit a path like 'src/foo.py' and the cwd isn't a "
+            "    project root that has that path, STOP and ask for the real path.\n"
+            "  - If the step asks for code, your first tag must be <delegate> "
+            "    (per the code-writing protocol), not <write>."
         )
         run_turn(
             model=model, coder_model=coder_model, user_msg=prompt,
@@ -4140,6 +4169,25 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
             if cmd == "plan":
                 if not args:
                     console.print("[red]/plan needs a task description[/]"); continue
+                # cwd guard: refuse /plan from / or $HOME when there's no
+                # nearby git repo. Most useful failure mode this prevents:
+                # the executor emits 'src/foo.py' which resolves to '/src/...'
+                # and the OS rejects with EROFS, then the model drifts to
+                # some unrelated file it happens to find.
+                cwd_check = state["cwd"]
+                bad_cwd = (
+                    cwd_check == Path("/") or cwd_check == HOME
+                ) and not any(
+                    (p / ".git").exists() for p in [cwd_check, *cwd_check.parents]
+                )
+                if bad_cwd:
+                    console.print(
+                        f"[red]/plan refused: cwd is {cwd_check} and no git repo "
+                        f"is nearby[/]\n"
+                        f"[dim]switch first: /cwd ~/some-project   "
+                        f"or  @reponame your-task[/]"
+                    )
+                    continue
                 # Split planning from execution:
                 #   - the planner (deepseek-r1 by default) emits the
                 #     <plan> block ONLY -- reasoning models often don't
