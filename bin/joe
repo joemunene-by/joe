@@ -2715,23 +2715,51 @@ def _guess_lexer(p: Path) -> str:
     }.get(p.suffix.lower(), "text")
 
 
+_AFFIRMATIVE = {
+    "y", "yes", "yeah", "yep", "ya", "yup", "yass",
+    "sure", "ok", "okay", "k", "kk",
+    "do it", "go", "go ahead", "ship it", "send it", "send",
+    "absolutely", "definitely", "please",
+    "fine", "alright", "aight", "righto",
+    "+1", "👍",
+}
+_NEGATIVE = {
+    "n", "no", "nope", "nah", "nay", "ne", "naw",
+    "stop", "cancel", "abort", "skip", "pass",
+    "-1", "👎",
+}
+
+
 def _confirm(question: str) -> bool:
     # JOE_AUTO_YES short-circuits everything (intended for scripts / piped use).
     if os.environ.get("JOE_AUTO_YES", "").strip() in {"1", "true", "yes"}:
         console.print(f"[bold yellow]{question}[/] [dim](JOE_AUTO_YES, auto-y)[/]")
         return True
+
+    def _interpret(ans: str) -> bool:
+        a = ans.strip().lower()
+        if not a:
+            return False  # bare Enter = the default 'N'
+        if a in _AFFIRMATIVE:
+            return True
+        if a in _NEGATIVE:
+            return False
+        # Loose match: if the first word is affirmative, take it.
+        first = a.split()[0]
+        return first in _AFFIRMATIVE
+
     # Rich's Prompt.ask returns the default silently when stdin isn't a TTY,
     # which breaks piped tests (`yes y | joe -p ...`). When we detect that,
     # fall back to plain readline so piped input actually feeds the answer.
     if not sys.stdin.isatty():
         console.print(f"[bold yellow]{question}[/] [y/N]:", end=" ")
         try:
-            ans = sys.stdin.readline().strip()
+            ans = sys.stdin.readline()
         except (EOFError, KeyboardInterrupt):
             return False
-        return ans.lower() in {"y", "yes"}
+        return _interpret(ans)
     ans = Prompt.ask(f"[bold yellow]{question}[/] [y/N]", default="N", show_default=False)
-    return ans.strip().lower() in {"y", "yes"}
+    return _interpret(ans)
 
 
 # --------------------------------------------------------------------------
