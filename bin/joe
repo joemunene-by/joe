@@ -5823,6 +5823,174 @@ def cmd_replay(session: str, alt_model: Optional[str] = None) -> int:
     return 0
 
 
+def cmd_stats() -> int:
+    """Local, telemetry-free analytics: scan local SQLite stores and emit
+    aggregates that hint at how you actually use joe. Nothing leaves the
+    machine. All counts derive from data you've already accumulated."""
+    from collections import Counter
+
+    blocks: list[str] = []
+
+    # Sessions: per-day turn counts, total active days, longest session.
+    try:
+        c = _db()
+        rows = c.execute(
+            "SELECT session, ts, role FROM turns ORDER BY ts ASC"
+        ).fetchall()
+        c.close()
+    except Exception:
+        rows = []
+    if rows:
+        days = Counter()
+        per_session = Counter()
+        hour_buckets = Counter()
+        for sess, ts, _role in rows:
+            try:
+                d = dt.datetime.fromisoformat(ts)
+            except ValueError:
+                continue
+            days[d.date()] += 1
+            per_session[sess] += 1
+            hour_buckets[d.hour] += 1
+        active_days = len(days)
+        total_turns = sum(per_session.values())
+        peak_day = max(days.items(), key=lambda kv: kv[1])
+        peak_hour = max(hour_buckets.items(), key=lambda kv: kv[1])
+        top_sessions = per_session.most_common(5)
+        blocks.append(
+            f"[bold cyan]sessions[/]\n"
+            f"  total turns:     {total_turns}\n"
+            f"  active days:     {active_days}\n"
+            f"  peak day:        {peak_day[0]}  ({peak_day[1]} turns)\n"
+            f"  peak hour (UTC): {peak_hour[0]:02d}:00  ({peak_hour[1]} turns)\n"
+            f"  longest sessions:\n"
+            + "\n".join(
+                f"    {n:>4}  {s}" for s, n in top_sessions
+            )
+        )
+
+    # Provenance: writes/edits per repo per day, top files, w:e ratio.
+    try:
+        c = _provdb()
+        prov_rows = c.execute(
+            "SELECT ts, path, op FROM provenance ORDER BY ts ASC"
+        ).fetchall()
+        c.close()
+    except Exception:
+        prov_rows = []
+    if prov_rows:
+        writes = sum(1 for _, _, op in prov_rows if op == "write")
+        edits = sum(1 for _, _, op in prov_rows if op == "edit")
+        repos = Counter()
+        files = Counter()
+        prov_hours = Counter()
+        for ts, path, _op in prov_rows:
+            # Repo guess: walk up for .git
+            try:
+                p = Path(path)
+                for ancestor in p.parents:
+                    if (ancestor / ".git").exists():
+                        repos[ancestor.name] += 1
+                        break
+            except Exception:
+                pass
+            files[path.replace(str(HOME), "~")] += 1
+            try:
+                prov_hours[dt.datetime.fromisoformat(ts).hour] += 1
+            except ValueError:
+                pass
+        top_repos = repos.most_common(5)
+        top_files = files.most_common(5)
+        peak_prov_hour = max(prov_hours.items(), key=lambda kv: kv[1]) \
+            if prov_hours else (0, 0)
+        blocks.append(
+            f"[bold cyan]edits[/]\n"
+            f"  total writes:    {writes}\n"
+            f"  total edits:     {edits}\n"
+            f"  w:e ratio:       "
+            f"{writes / max(1, edits):.1f}:1\n"
+            f"  peak edit hour:  {peak_prov_hour[0]:02d}:00\n"
+            f"  most-touched repos:\n"
+            + "\n".join(f"    {n:>4}  {r}" for r, n in top_repos)
+            + ("\n  most-touched files:\n" if top_files else "")
+            + "\n".join(f"    {n:>4}  {f[-60:]}" for f, n in top_files)
+        )
+
+    # Lessons: active rules + total events.
+    try:
+        c = _lessdb()
+        n_events = c.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        n_rules = c.execute(
+            "SELECT COUNT(*) FROM rules WHERE status = 'active'"
+        ).fetchone()[0]
+        sources = c.execute(
+            "SELECT source, COUNT(*) FROM events GROUP BY source"
+            " ORDER BY 2 DESC"
+        ).fetchall()
+        c.close()
+    except Exception:
+        n_events = n_rules = 0
+        sources = []
+    blocks.append(
+        f"[bold cyan]lessons[/]\n"
+        f"  active rules:    {n_rules}\n"
+        f"  events captured: {n_events}\n"
+        + ("  by source:\n" + "\n".join(f"    {n:>4}  {s}" for s, n in sources)
+           if sources else "")
+    )
+
+    # Knowledge graph + history index sizes.
+    try:
+        c = _kgdb()
+        n_triples = c.execute("SELECT COUNT(*) FROM triples").fetchone()[0]
+        c.close()
+    except Exception:
+        n_triples = 0
+    try:
+        c = _hidb()
+        n_hist = c.execute("SELECT COUNT(*) FROM hist").fetchone()[0]
+        c.close()
+    except Exception:
+        n_hist = 0
+    blocks.append(
+        f"[bold cyan]memory[/]\n"
+        f"  knowledge triples:      {n_triples}\n"
+        f"  embedded chat pairs:    {n_hist}"
+    )
+
+    # Eval runs: count + best model.
+    try:
+        c = _evaldb()
+        n_evals = c.execute(
+            "SELECT COUNT(DISTINCT ts) FROM results"
+        ).fetchone()[0]
+        best = c.execute(
+            "SELECT model, AVG(score) FROM results"
+            " GROUP BY model ORDER BY 2 DESC LIMIT 1"
+        ).fetchone()
+        c.close()
+    except Exception:
+        n_evals = 0
+        best = None
+    if n_evals or best:
+        blocks.append(
+            f"[bold cyan]eval[/]\n"
+            f"  runs:        {n_evals}\n"
+            + (f"  best model:  {best[0]} ({best[1]:.3f})\n" if best else "")
+        )
+
+    if not blocks:
+        console.print("[dim](no data yet; use joe for a while and come back)[/]")
+        return 0
+    panel(
+        f"joe stats  ·  {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        Text.from_markup("\n\n".join(blocks)),
+        style="bright_blue",
+        subtitle="local-only; nothing leaves the machine",
+    )
+    return 0
+
+
 def cmd_ios_setup() -> int:
     """Print the iOS Shortcut recipe + curl examples for the /ios endpoint."""
     token_file = STATE_DIR / "http-token"
@@ -6183,6 +6351,8 @@ def main() -> int:
         return cmd_demo()
     if argv and argv[0] == "ios-setup":
         return cmd_ios_setup()
+    if argv and argv[0] == "stats":
+        return cmd_stats()
     if argv and argv[0] == "replay":
         if len(argv) < 2:
             console.print("[red]usage: joe replay <session> [alt-model][/]"); return 1

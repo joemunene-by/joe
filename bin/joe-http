@@ -488,6 +488,9 @@ def _render_dashboard_html() -> str:
     parts.append(
         '<footer><p class="dim">'
         'Refresh the page for live data. '
+        'Other pages: <a href="/keys?token=' + html.escape(TOKEN) + '" '
+        'style="color:#81a1c1">/keys</a> '
+        '(joe sync --encrypt key management). '
         'Endpoints under same auth: <code>/health</code> · '
         '<code>/chat</code> · <code>/ios</code> · <code>/standup/latest</code>.'
         '</p></footer>'
@@ -593,6 +596,100 @@ def _esc_js(s: str) -> str:
 def dashboard(token: Optional[str] = None) -> HTMLResponse:
     _check_auth_qs(token)
     return HTMLResponse(_render_dashboard_html())
+
+
+def _render_keys_html() -> str:
+    """Small page showing the joe sync --encrypt public key + setup steps."""
+    state = Path.home() / ".joe-agent"
+    key_path = state / "sync-age.key"
+    has_key = key_path.is_file()
+    pubkey = ""
+    if has_key:
+        try:
+            cp = subprocess.run(
+                ["age-keygen", "-y", str(key_path)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if cp.returncode == 0:
+                pubkey = cp.stdout.strip()
+        except Exception:
+            pubkey = "(error reading key)"
+    css = """
+    * { box-sizing: border-box; }
+    body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, sans-serif;
+           background: #0e0e10; color: #e8e8e8; margin: 0; padding: 32px;
+           max-width: 760px; margin-inline: auto; }
+    h1 { font-size: 26px; margin: 0 0 8px; color: #fff; }
+    h2 { font-size: 14px; margin: 24px 0 8px; color: #cfd8dc;
+         text-transform: uppercase; letter-spacing: 0.5px; }
+    code { font: 13px/1.5 ui-monospace, SFMono-Regular, monospace;
+           background: #1a1a1f; padding: 2px 6px; border-radius: 3px;
+           color: #f0c674; }
+    pre { background: #161618; border: 1px solid #2a2a30; border-radius: 4px;
+          padding: 12px; overflow-x: auto; font: 13px/1.5 ui-monospace, monospace;
+          color: #e8e8e8; }
+    .dim { color: #888; }
+    .pub { background: #161618; border: 1px solid #7fd17f33;
+           border-radius: 4px; padding: 10px 14px; font: 12px/1.4 ui-monospace, monospace;
+           word-break: break-all; color: #7fd17f; }
+    a { color: #81a1c1; }
+    """
+    if has_key:
+        body = (
+            f'<h2>your public key</h2>'
+            f'<div class="pub">{html.escape(pubkey)}</div>'
+            f'<p class="dim">file: <code>{html.escape(str(key_path))}</code>'
+            f' &nbsp;(permissions: <code>0600</code>, gitignored, never synced)</p>'
+            '<h2>use it on another machine</h2>'
+            '<ol>'
+            f'<li>Copy <code>{html.escape(str(key_path))}</code> to <code>~/.joe-agent/</code>'
+            ' on the other Mac/Linux box (USB stick, signal, paper QR; any path that'
+            ' is NOT the public internet).</li>'
+            '<li>Make sure permissions are right: <code>chmod 600 ~/.joe-agent/sync-age.key</code></li>'
+            '<li>Pull the encrypted state and decrypt:'
+            ' <pre>joe sync pull --encrypt</pre></li>'
+            '</ol>'
+            '<h2>rotate the key</h2>'
+            '<pre># stops the OLD key from decrypting future commits.\n'
+            'rm ~/.joe-agent/sync-age.key\n'
+            'joe sync encrypt-init\n'
+            'joe sync push --encrypt</pre>'
+            '<p class="dim">All <em>future</em> pushes use the new key.'
+            ' Existing ciphertext in the git history is still readable with'
+            ' the old key, so back the old key up if you might need it.</p>'
+        )
+    else:
+        body = (
+            '<h2>no key yet</h2>'
+            '<p>joe sync --encrypt is not initialised. To enable encrypted sync:</p>'
+            '<pre># macOS:  brew install age\n'
+            '# Linux:  apt install age   (or:  pacman -S age)\n'
+            'joe sync encrypt-init\n'
+            'joe sync push --encrypt</pre>'
+            '<p class="dim">Refresh this page after running encrypt-init to'
+            ' see your public key.</p>'
+        )
+    return f"""<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>joe sync keys</title>
+  <style>{css}</style>
+</head><body>
+<h1>joe sync keys</h1>
+<p class="dim">age-based encryption for joe-state. The plain sqlite files
+stay on your machine; only <code>.age</code> ciphertext lands in the synced
+repo. The key file never leaves <code>~/.joe-agent/</code> unless you copy
+it yourself.</p>
+{body}
+<p class="dim" style="margin-top:32px"><a href="/dashboard?token={html.escape(TOKEN)}">&larr; back to dashboard</a></p>
+</body></html>"""
+
+
+@app.get("/keys", response_class=HTMLResponse)
+def keys_page(token: Optional[str] = None) -> HTMLResponse:
+    _check_auth_qs(token)
+    return HTMLResponse(_render_keys_html())
 
 
 # --------------------------------------------------------------------------

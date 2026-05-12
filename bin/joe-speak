@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""joe-speak: thin macOS TTS wrapper.
+"""joe-speak: cross-platform TTS wrapper.
 
-Pipes text into `say`. Strips markdown, code fences, and our XML tool
-tags before reading so the voice doesn't waste time on syntax noise.
+Pipes text into the right system synthesiser for the platform. Strips
+markdown, code fences, and our XML tool tags before reading so the
+voice doesn't waste time on syntax noise.
+
+Platforms:
+  - macOS: `say -v <voice> -r <rate> text`
+  - Linux: piper-tts (preferred, neural; auto-setup with --setup-piper)
+           else espeak / espeak-ng (fallback, robotic but ubiquitous)
 
 Usage:
   joe-speak "Hello"
   echo "long text" | joe-speak
   joe-speak --voice Daniel --rate 220 "with knobs"
-
-Voices: `say -v ?` lists every voice + sample. Common picks: Samantha,
-Alex, Daniel, Karen, Moira. Rate is words-per-minute (default 200).
+  joe-speak --setup-piper                       # Linux: install piper-tts
+                                                 # + download default voice
 """
 
 from __future__ import annotations
@@ -18,6 +23,8 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
+import sys
 import subprocess
 import sys
 
@@ -61,18 +68,122 @@ def clean_for_speech(text: str) -> str:
     return text
 
 
+_PIPER_VOICE_NAME = "en_US-amy-medium"
+_PIPER_VOICE_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium"
+_PIPER_VOICE_DIR = os.path.expanduser("~/.cache/piper-voices")
+
+
+def setup_piper() -> int:
+    """One-time Linux setup: pip-install piper-tts and download a voice model."""
+    if sys.platform == "darwin":
+        print("[joe-speak] macOS doesn't need piper-tts; `say` is built-in.",
+              file=sys.stderr)
+        return 0
+    if not shutil.which("aplay") and not shutil.which("paplay"):
+        print(
+            "[joe-speak] aplay/paplay not found. Install alsa-utils or "
+            "pulseaudio-utils first.", file=sys.stderr,
+        )
+        return 1
+    # Step 1: pip install piper-tts.
+    if not shutil.which("piper-tts") and not shutil.which("piper"):
+        print("[joe-speak] installing piper-tts via pip...", file=sys.stderr)
+        cp = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--user", "piper-tts"],
+            capture_output=False,
+        )
+        if cp.returncode != 0:
+            print("[joe-speak] piper-tts install failed", file=sys.stderr)
+            return 1
+    # Step 2: download the voice.
+    os.makedirs(_PIPER_VOICE_DIR, exist_ok=True)
+    onnx_path = os.path.join(_PIPER_VOICE_DIR, f"{_PIPER_VOICE_NAME}.onnx")
+    json_path = onnx_path + ".json"
+    if os.path.exists(onnx_path) and os.path.exists(json_path):
+        print(f"[joe-speak] voice already at {onnx_path}", file=sys.stderr)
+    else:
+        import urllib.request
+        for suffix, dst in (
+            (".onnx", onnx_path),
+            (".onnx.json", json_path),
+        ):
+            url = f"{_PIPER_VOICE_BASE}/{_PIPER_VOICE_NAME}{suffix}?download=true"
+            print(f"[joe-speak] downloading {os.path.basename(dst)}...",
+                  file=sys.stderr)
+            try:
+                urllib.request.urlretrieve(url, dst)
+            except Exception as e:
+                print(f"[joe-speak] download failed: {e}", file=sys.stderr)
+                return 1
+    print(
+        f"[joe-speak] piper-tts ready.\n"
+        f"  voice:  {onnx_path}\n"
+        f"  usage:  joe-speak \"hello world\"  (auto-detects piper now)",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _piper_speak(text: str, background: bool) -> int:
+    """Synthesise text with piper-tts -> aplay. Returns 0 on success."""
+    piper = shutil.which("piper-tts") or shutil.which("piper")
+    aplay = shutil.which("aplay") or shutil.which("paplay")
+    if not piper or not aplay:
+        return 1
+    onnx = os.path.join(_PIPER_VOICE_DIR, f"{_PIPER_VOICE_NAME}.onnx")
+    if not os.path.exists(onnx):
+        return 1
+    ph = subprocess.Popen(
+        [piper, "--model", onnx, "--output-raw"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    # aplay reads piper's raw 22050 Hz int16 mono from stdin.
+    ah = subprocess.Popen(
+        [aplay, "-q", "-r", "22050", "-c", "1", "-f", "S16_LE", "-t", "raw"],
+        stdin=ph.stdout, stderr=subprocess.DEVNULL,
+    )
+    ph.stdout.close()
+    try:
+        ph.stdin.write(text[:4000].encode("utf-8"))
+        ph.stdin.close()
+    except BrokenPipeError:
+        return 1
+    if not background:
+        ah.wait()
+        ph.wait()
+    return 0
+
+
+def _espeak_speak(text: str, rate: int, background: bool) -> int:
+    espeak = shutil.which("espeak-ng") or shutil.which("espeak")
+    if not espeak:
+        return 1
+    cmd = [espeak, "-s", str(int(rate * 0.9)), text[:4000]]
+    if background:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="joe-speak")
     ap.add_argument("text", nargs="*", help="text to speak; otherwise reads stdin")
     ap.add_argument("--voice", default=DEFAULT_VOICE,
-                    help=f"voice name (default: {DEFAULT_VOICE}); list with `say -v ?`")
+                    help=f"voice name (default: {DEFAULT_VOICE}); list with `say -v ?` on macOS")
     ap.add_argument("--rate", default=DEFAULT_RATE,
                     help=f"speech rate, words per minute (default: {DEFAULT_RATE})")
     ap.add_argument("--raw", action="store_true",
                     help="don't strip markdown / tool tags before speaking")
     ap.add_argument("--background", action="store_true",
                     help="fork to background so the caller returns immediately")
+    ap.add_argument("--setup-piper", action="store_true",
+                    help="Linux: pip-install piper-tts + download a neural voice")
     args = ap.parse_args()
+
+    if args.setup_piper:
+        return setup_piper()
 
     text = " ".join(args.text) if args.text else sys.stdin.read()
     if not args.raw:
@@ -80,12 +191,30 @@ def main() -> int:
     if not text:
         return 0  # nothing to say
 
-    cmd = ["say", "-v", args.voice, "-r", str(args.rate), text]
-    if args.background:
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    else:
-        subprocess.run(cmd)
-    return 0
+    if sys.platform == "darwin":
+        say = shutil.which("say")
+        if not say:
+            print("[joe-speak] macOS `say` not found", file=sys.stderr)
+            return 1
+        cmd = [say, "-v", args.voice, "-r", str(args.rate), text[:4000]]
+        if args.background:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(cmd)
+        return 0
+
+    # Linux: try piper, fall back to espeak.
+    if _piper_speak(text, args.background) == 0:
+        return 0
+    if _espeak_speak(text, int(args.rate), args.background) == 0:
+        return 0
+    print(
+        "[joe-speak] no TTS available. install one of:\n"
+        "  joe-speak --setup-piper   (recommended, neural)\n"
+        "  apt install espeak-ng     (fast fallback)",
+        file=sys.stderr,
+    )
+    return 1
 
 
 if __name__ == "__main__":

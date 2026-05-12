@@ -300,14 +300,10 @@ reuses your existing `joe-http` server and auth token.
 ## what's not in here yet
 
 - Bidirectional MCP (joe driving other MCP servers' tools as a client,
-  not just exposing itself to Claude Code via joe-mcp).
-- More TTS voices on Linux via piper-tts auto-download + config.
-- A web-based key-management dashboard for `joe sync --encrypt` (right
-  now you ship the `age` key file between machines yourself).
-- Telemetry-free local analytics: most-used slashes, peak hours,
-  longest sessions, per-repo time spent.
+  not just exposing itself to Claude Code via joe-mcp). Substantial
+  async integration work; queued for the next round.
 
-PRs welcome on any of these.
+PRs welcome.
 
 ## license
 
