@@ -1283,9 +1283,34 @@ def _evaldb() -> sqlite3.Connection:
 
 def cmd_eval(args: list[str], default_model: str) -> int:
     if not args:
-        console.print("[dim]joe eval build | run [model] | report[/]")
+        console.print("[dim]joe eval build | run [model] | report | add <user> <gold>[/]")
         return 1
     sub = args[0]
+    if sub == "add":
+        # Manual benchmark entry. Usage: joe eval add "user prompt" "gold answer"
+        if len(args) < 3:
+            console.print(
+                "[red]usage: joe eval add \"<user prompt>\" \"<gold answer>\"[/]"
+            )
+            return 1
+        user_msg, gold = args[1], args[2]
+        if len(user_msg) < 5 or len(gold) < 5:
+            console.print("[red]prompt and gold each need >= 5 chars[/]"); return 1
+        vec = _embed(gold[:EMBED_INPUT_MAX_CHARS])
+        if not vec:
+            console.print("[red]embedding failed (is nomic-embed-text installed?)[/]")
+            return 1
+        c = _evaldb()
+        ts = dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat()
+        c.execute(
+            "INSERT INTO eval_set (ts_built, session, user_msg, gold_asst, gold_embed)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (ts, "manual", user_msg, gold, _pack_vec(vec)),
+        )
+        total = c.execute("SELECT COUNT(*) FROM eval_set").fetchone()[0]
+        c.commit(); c.close()
+        console.print(f"[green]added[/] (eval set is now {total} entries)")
+        return 0
     if sub == "build":
         limit = int(args[1]) if len(args) > 1 and args[1].isdigit() else 40
         c = _db()
@@ -5203,6 +5228,77 @@ def cmd_self_update(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_replay(session: str, alt_model: Optional[str] = None) -> int:
+    """Step through a past session turn-by-turn.
+
+    For each (user, assistant) pair, render both. After every pair, ask the
+    user if they want to rerun the prompt against `alt_model` for a
+    side-by-side comparison ('rerun' or 'rerun <model>'), or press enter to
+    advance. Useful for forensics ("why did the model say that?") and for
+    building eval candidates from real conversation history.
+    """
+    c = _db()
+    rows = c.execute(
+        "SELECT ts, role, content FROM turns WHERE session = ? ORDER BY ts ASC",
+        (session,),
+    ).fetchall()
+    c.close()
+    if not rows:
+        console.print(f"[red]no turns for session {session!r}[/]")
+        return 1
+    # Pair user -> assistant. Skip 'system' rows used by /compact.
+    pairs: list[tuple[str, str, str]] = []
+    pending_u: Optional[tuple[str, str]] = None
+    for ts, role, content in rows:
+        if role == "user":
+            pending_u = (ts, content)
+        elif role == "assistant" and pending_u is not None:
+            pairs.append((pending_u[0], pending_u[1], content))
+            pending_u = None
+    if not pairs:
+        console.print(f"[yellow]session {session!r} has no complete pairs[/]")
+        return 0
+    console.rule(f"[bold cyan]replay  session={session}  pairs={len(pairs)}")
+    for i, (ts, user_msg, asst_msg) in enumerate(pairs, 1):
+        panel(
+            f"[{i}/{len(pairs)}]  user  ·  {ts[:19]}",
+            Text(user_msg),
+            style="yellow",
+        )
+        panel(
+            f"[{i}/{len(pairs)}]  assistant",
+            Markdown(asst_msg) if len(asst_msg) < 6000 else
+                Text(asst_msg[:6000] + "\n[...truncated...]"),
+            style="cyan",
+        )
+        if i == len(pairs):
+            break
+        try:
+            ans = input(
+                "  press enter for next  ·  'r' to rerun against alt model  "
+                "·  'r <model>' for a specific one  ·  'q' to quit > "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]stopped[/]"); break
+        if ans.startswith("q"):
+            break
+        if ans.startswith("r"):
+            parts = ans.split(None, 1)
+            target = parts[1] if len(parts) > 1 else (alt_model or DEFAULT_CODER)
+            console.print(f"[dim]rerunning against [bold]{target}[/]...[/]")
+            try:
+                rerun = _ollama_once(target, user_msg).strip()
+            except Exception as e:
+                console.print(f"[red]rerun failed:[/] {e}")
+                continue
+            panel(
+                f"rerun via {target}",
+                Markdown(rerun) if len(rerun) < 6000 else Text(rerun[:6000]),
+                style="bright_blue",
+            )
+    return 0
+
+
 def cmd_ios_setup() -> int:
     """Print the iOS Shortcut recipe + curl examples for the /ios endpoint."""
     token_file = STATE_DIR / "http-token"
@@ -5563,6 +5659,10 @@ def main() -> int:
         return cmd_demo()
     if argv and argv[0] == "ios-setup":
         return cmd_ios_setup()
+    if argv and argv[0] == "replay":
+        if len(argv) < 2:
+            console.print("[red]usage: joe replay <session> [alt-model][/]"); return 1
+        return cmd_replay(argv[1], argv[2] if len(argv) > 2 else None)
     if argv and argv[0] == "blame":
         if len(argv) < 2:
             console.print("[red]usage: joe blame <path>[:line][/]"); return 1

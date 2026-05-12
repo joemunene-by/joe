@@ -62,10 +62,13 @@ The seven features that make joe interesting:
 Plus the everyday surface: macros, scheduled jobs, cross-session memory,
 voice input/output, vision, iOS bridge over ntfy, cross-machine sync
 through a private git repo, per-repo profiles with auto-detected style
-fingerprints, a web dashboard at `joe-http` for the visual view, model
-auto-promotion when a freshly-trained candidate beats the current
-default by a threshold, and time-aware semantic recall ("what was I
-working on yesterday morning?").
+fingerprints, a web dashboard at `joe-http` for the visual view (with
+streaming-SSE chat right in the browser), model auto-promotion when a
+freshly-trained candidate beats the current default by a threshold,
+time-aware semantic recall ("what was I working on yesterday morning?"),
+`joe replay` to step through any past session and rerun prompts against
+alternate models, `joe-wake` for always-on "hey joe" voice activation,
+and a Tauri menu-bar app for click-to-open access.
 
 ## quickstart
 
@@ -270,6 +273,30 @@ http://localhost:8765/dashboard?token=<from ~/.joe-agent/http-token>
 
 Front it with Tailscale to view from your phone on the couch.
 
+## tests
+
+```sh
+python3 -m pip install --user pytest
+python3 -m pytest tests/ -v
+```
+
+34 tests, all offline, no ollama dependency. Covers the tool-call
+parser, time-phrase extractor, blob store, subagent loader, lessons +
+provenance round-trip, active-repo discovery, and the small math
+helpers underpinning embeddings + eval scoring.
+
+## menu-bar app (Tauri)
+
+```sh
+cd joe-tauri
+cargo tauri dev          # dev build, hot-reload
+cargo tauri build        # signed .app in src-tauri/target/release/bundle/macos/
+```
+
+Click the menu-bar icon to toggle the dashboard window. Left-click
+toggles; right-click opens the menu (Open / Refresh / Quit). The app
+reuses your existing `joe-http` server and auth token.
+
 ## what's not in here yet
 
 - Linux feature parity is mostly there (notify-send instead of osascript,
@@ -279,6 +306,9 @@ Front it with Tailscale to view from your phone on the couch.
 - Bidirectional MCP (joe driving Claude Code and vice-versa).
 - Multi-agent debate mode (`/debate <topic>` spawning multiple personas
   with conflicting prompts).
+- Encrypted state-at-rest for `joe sync` (currently the gitignore keeps
+  large/sensitive blobs out; an `age`-based encrypt-before-commit pass
+  would let `joe-state` live on any host).
 - More TTS voices on Linux via piper-tts auto-config.
 
 PRs welcome on any of these.

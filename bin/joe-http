@@ -43,7 +43,7 @@ from typing import Optional
 
 try:
     from fastapi import FastAPI, Header, HTTPException, Request
-    from fastapi.responses import HTMLResponse
+    from fastapi.responses import HTMLResponse, StreamingResponse
     from pydantic import BaseModel
     import uvicorn
 except ImportError as e:
@@ -389,6 +389,22 @@ def _render_dashboard_html() -> str:
         f'</div></header>'
     )
 
+    # Interactive chat (SSE streaming).
+    parts.append(
+        '<section><h2>Ask</h2>'
+        '<form id="chat-form" onsubmit="return joeAsk(event)">'
+        '<textarea id="chat-input" rows="2" '
+        'placeholder="type and hit Cmd-Enter / Ctrl-Enter to stream a response..."></textarea>'
+        '<div class="chat-controls">'
+        '<input type="text" id="chat-model" placeholder="model (optional)" size="22">'
+        '<button type="submit">Ask</button>'
+        '<button type="button" onclick="document.getElementById(\'chat-output\').innerHTML=\'\'">'
+        'Clear</button>'
+        '</div>'
+        '<pre id="chat-output" class="chat-output"></pre>'
+        '</form></section>'
+    )
+
     # Eval sparklines.
     eval_body = ""
     for model in sorted(by_model.keys()):
@@ -410,16 +426,19 @@ def _render_dashboard_html() -> str:
         eval_body = '<p class="dim">No eval runs yet. Try <code>joe eval build && joe eval run</code>.</p>'
     section("Eval trend (similarity to gold)", eval_body)
 
-    # Provenance.
+    # Provenance. Path cells are clickable: open in VSCode (vscode://) when
+    # the user's editor is VSCode/Cursor; otherwise the link is a no-op.
     prov_body = '<table><thead><tr><th>when</th><th>op</th><th>path</th><th>agent</th><th>prompt</th><th>±</th></tr></thead><tbody>'
     for ts, path, op, agent, model, user_msg, adds, dels in prov_rows:
-        agent_display = f"@@{agent}" if agent else "—"
+        agent_display = f"@@{agent}" if agent else "-"
         path_short = path.replace(str(Path.home()), "~")[-60:]
         msg_short = (user_msg or "")[:80]
         prov_body += (
             f'<tr><td>{html.escape(ts[:16])}</td>'
             f'<td><code>{op}</code></td>'
-            f'<td title="{html.escape(path)}">{html.escape(path_short)}</td>'
+            f'<td title="{html.escape(path)}">'
+            f'<a href="vscode://file{html.escape(path)}" class="editor-link">'
+            f'{html.escape(path_short)}</a></td>'
             f'<td>{html.escape(agent_display)}</td>'
             f'<td class="dim">{html.escape(msg_short)}</td>'
             f'<td>+{adds}/-{dels}</td></tr>'
@@ -488,6 +507,8 @@ def _render_dashboard_html() -> str:
            background: #1a1a1f; padding: 1px 4px; border-radius: 3px;
            color: #f0c674; }
     em { color: #81a1c1; font-style: normal; }
+    a.editor-link { color: #f0c674; text-decoration: none; }
+    a.editor-link:hover { text-decoration: underline; }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 6px 10px; border-bottom: 1px solid #1f1f24;
              text-align: left; vertical-align: top; font-size: 13px; }
@@ -501,7 +522,55 @@ def _render_dashboard_html() -> str:
     li { margin: 4px 0; }
     footer { margin-top: 48px; color: #555; font-size: 12px;
              border-top: 1px solid #1f1f24; padding-top: 16px; }
+    /* Chat form. */
+    textarea, input[type="text"] {
+      width: 100%; background: #1a1a1f; color: #e8e8e8;
+      border: 1px solid #2a2a30; border-radius: 4px; padding: 8px 10px;
+      font: 13px/1.4 ui-monospace, SFMono-Regular, monospace;
+    }
+    textarea:focus, input[type="text"]:focus { outline: 1px solid #7fd17f; }
+    .chat-controls { display: flex; gap: 8px; margin: 8px 0; align-items: center; }
+    .chat-controls input { width: auto; flex: 0 0 220px; }
+    button { background: #2a2a30; color: #e8e8e8; border: 1px solid #3a3a40;
+             border-radius: 4px; padding: 6px 14px; cursor: pointer;
+             font: 13px/1.4 -apple-system, sans-serif; }
+    button:hover { background: #3a3a40; }
+    button[type="submit"] { background: #2d4a2d; }
+    button[type="submit"]:hover { background: #3d5a3d; }
+    .chat-output { background: #161618; border: 1px solid #2a2a30;
+                   border-radius: 4px; padding: 10px; min-height: 60px;
+                   max-height: 400px; overflow-y: auto; white-space: pre-wrap;
+                   font: 13px/1.5 ui-monospace, SFMono-Regular, monospace;
+                   color: #e8e8e8; margin: 0; }
     """
+    js_token = _esc_js(TOKEN)
+    js = """
+    function joeAsk(ev) {
+      ev.preventDefault();
+      const inp = document.getElementById('chat-input');
+      const out = document.getElementById('chat-output');
+      const modelInp = document.getElementById('chat-model');
+      const prompt = inp.value.trim();
+      if (!prompt) return false;
+      out.textContent = '';
+      const params = new URLSearchParams({token: __TOKEN__, prompt});
+      if (modelInp.value.trim()) params.set('model', modelInp.value.trim());
+      const es = new EventSource('/chat-stream?' + params.toString());
+      es.onmessage = (e) => {
+        try { out.textContent += JSON.parse(e.data); }
+        catch (_) { out.textContent += e.data; }
+        out.scrollTop = out.scrollHeight;
+      };
+      es.addEventListener('done', () => es.close());
+      es.addEventListener('error', () => { out.textContent += '\\n[stream error]'; es.close(); });
+      return false;
+    }
+    document.addEventListener('keydown', (ev) => {
+      if ((ev.metaKey || ev.ctrlKey) && ev.key === 'Enter') {
+        document.getElementById('chat-form').dispatchEvent(new Event('submit', {cancelable: true}));
+      }
+    });
+    """.replace("__TOKEN__", f"'{js_token}'")
     return f"""<!doctype html>
 <html lang="en"><head>
   <meta charset="utf-8">
@@ -510,7 +579,13 @@ def _render_dashboard_html() -> str:
   <style>{css}</style>
 </head><body>
 {"".join(parts)}
+<script>{js}</script>
 </body></html>"""
+
+
+def _esc_js(s: str) -> str:
+    """Escape for embedding inside single-quoted JS string."""
+    return s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -518,6 +593,66 @@ def _render_dashboard_html() -> str:
 def dashboard(token: Optional[str] = None) -> HTMLResponse:
     _check_auth_qs(token)
     return HTMLResponse(_render_dashboard_html())
+
+
+# --------------------------------------------------------------------------
+# /chat-stream: SSE streaming endpoint for the dashboard chat textarea.
+# Browsers' EventSource only supports GET, so we accept the prompt as a
+# query param. Bearer token also via query param to match the dashboard.
+# --------------------------------------------------------------------------
+
+
+def _stream_ollama(prompt: str, model: str):
+    """Generator yielding SSE-formatted token events from ollama."""
+    body = json.dumps({"model": model, "prompt": prompt,
+                       "stream": True, "think": False}).encode()
+    req = urllib.request.Request(
+        "http://localhost:11434/api/generate",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=600)
+    except Exception as e:
+        yield f"event: error\ndata: {json.dumps(str(e))}\n\n"
+        return
+    try:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            tok = obj.get("response", "")
+            if tok:
+                yield f"data: {json.dumps(tok)}\n\n"
+            if obj.get("done"):
+                break
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+    yield "event: done\ndata: {}\n\n"
+
+
+@app.get("/chat-stream")
+def chat_stream(
+    token: Optional[str] = None,
+    prompt: Optional[str] = None,
+    model: Optional[str] = None,
+):
+    _check_auth_qs(token)
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+    use_model = model or os.environ.get("JOE_DEFAULT_MODEL", "joe-gemma")
+    return StreamingResponse(
+        _stream_ollama(prompt, use_model),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # --------------------------------------------------------------------------
