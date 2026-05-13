@@ -2596,6 +2596,35 @@ def tool_write(attrs: dict, body: str, confirm: bool = True) -> str:
             f"If you don't know the path, STOP."
         )
     p = _resolve_path(path)
+    # Strangers-in-the-repo check: if the path is in a directory that has
+    # no neighbors AND no git ancestor recognises it, the model is probably
+    # hallucinating a project structure that doesn't exist. We don't refuse
+    # (the user might genuinely be creating a new dir) but we add a clear
+    # warning to the result the model sees in <tool_result>, so it can
+    # reconsider before continuing.
+    stranger_warning = ""
+    if not p.exists():
+        # Check: is ANY part of this path's parent chain a real existing dir
+        # inside the cwd or a parent git repo?
+        try:
+            cwd_now = Path.cwd()
+            existing_ancestor: Optional[Path] = None
+            for ancestor in p.parents:
+                if ancestor.is_dir():
+                    existing_ancestor = ancestor
+                    break
+            if existing_ancestor is None or not (
+                str(existing_ancestor).startswith(str(cwd_now))
+                or str(cwd_now).startswith(str(existing_ancestor))
+            ):
+                stranger_warning = (
+                    f"NOTE: {path} is in a directory that doesn't exist "
+                    f"under {cwd_now}. If you're creating a brand-new tree, "
+                    f"this is fine. If you meant an existing project path, "
+                    f"check <plan_environment> for the real layout."
+                )
+        except Exception:
+            pass
     p.parent.mkdir(parents=True, exist_ok=True)
     existing = p.read_text(encoding="utf-8", errors="replace") if p.exists() else None
     if existing is not None:
@@ -2641,7 +2670,10 @@ def tool_write(attrs: dict, body: str, confirm: bool = True) -> str:
         adds=adds_n, dels=dels_n,
     )
     _maybe_auto_test(p)
-    return f"wrote {len(body)} bytes to {path}"
+    msg = f"wrote {len(body)} bytes to {path}"
+    if stranger_warning:
+        msg += "\n" + stranger_warning
+    return msg
 
 
 def tool_edit(attrs: dict, body: str, confirm: bool = True) -> str:
@@ -2752,10 +2784,35 @@ def tool_glob(attrs: dict, body: str) -> str:
     return out
 
 
+_LAST_DELEGATE_FINGERPRINT: dict[str, list[str]] = {"fps": []}
+
+
+def _fingerprint(s: str, n: int = 200) -> str:
+    """First-N-chars + length, normalised for whitespace. Cheap dup check."""
+    norm = re.sub(r"\s+", " ", s).strip()
+    return f"{len(norm)}::{norm[:n]}"
+
+
 def tool_delegate(attrs: dict, body: str, coder_model: str) -> str:
     spec = body.strip()
     if not spec:
         raise ToolError("<delegate> body is empty")
+    # Delegate-loop detection: if the last two delegates had near-identical
+    # specs, the model is asking the coder the same question twice. Refuse
+    # rather than burn turns + tokens on a stuck pattern.
+    fp = _fingerprint(spec)
+    recent = _LAST_DELEGATE_FINGERPRINT["fps"][-2:]
+    if recent and recent.count(fp) >= 1:
+        _LAST_DELEGATE_FINGERPRINT["fps"].append(fp)
+        raise ToolError(
+            "delegate-loop: this spec matches a recent <delegate>. "
+            "The coder won't give a different answer to the same question. "
+            "Either change the task substantively, switch model, or STOP."
+        )
+    _LAST_DELEGATE_FINGERPRINT["fps"].append(fp)
+    # Trim history so the dict doesn't grow forever.
+    if len(_LAST_DELEGATE_FINGERPRINT["fps"]) > 20:
+        _LAST_DELEGATE_FINGERPRINT["fps"] = _LAST_DELEGATE_FINGERPRINT["fps"][-10:]
     model = attrs.get("model", coder_model)
     panel(
         f"Delegate to {model}",
@@ -3122,16 +3179,88 @@ def _plan_validate(plan: Plan, cwd: Path) -> tuple[list[str], list[str]]:
     return present, missing
 
 
+def _detect_framework(cwd: Path) -> str:
+    """Best-effort hint at the project's framework/stack so the executor
+    doesn't write Express middleware into a Next.js App Router repo.
+    Returns a one-line description like 'Next.js 16 App Router (no src/)'.
+    """
+    hints: list[str] = []
+    # JS/TS world: package.json + dir layout.
+    pkg = cwd / "package.json"
+    if pkg.is_file():
+        try:
+            data = json.loads(pkg.read_text())
+            deps = {**(data.get("dependencies") or {}),
+                    **(data.get("devDependencies") or {})}
+            if "next" in deps:
+                next_v = deps["next"]
+                if (cwd / "app").is_dir():
+                    hints.append(f"Next.js {next_v} App Router (routes at app/api/<name>/route.ts)")
+                elif (cwd / "src" / "app").is_dir():
+                    hints.append(f"Next.js {next_v} App Router (routes at src/app/api/<name>/route.ts)")
+                elif (cwd / "pages").is_dir():
+                    hints.append(f"Next.js {next_v} Pages Router (routes at pages/api/<name>.ts)")
+                else:
+                    hints.append(f"Next.js {next_v}")
+            elif "express" in deps:
+                hints.append(f"Express {deps['express']}")
+            elif "fastify" in deps:
+                hints.append(f"Fastify {deps['fastify']}")
+            elif "@nestjs/core" in deps:
+                hints.append(f"NestJS")
+            elif "react" in deps and "vite" in deps:
+                hints.append(f"Vite + React {deps.get('react', '?')}")
+            elif "react" in deps:
+                hints.append(f"React {deps.get('react', '?')}")
+            if "next-auth" in deps:
+                hints.append(f"next-auth {deps['next-auth']}")
+            if "@prisma/client" in deps:
+                hints.append(f"Prisma {deps['@prisma/client']}")
+            if "drizzle-orm" in deps:
+                hints.append("Drizzle ORM")
+            if "tailwindcss" in deps:
+                hints.append(f"Tailwind {deps['tailwindcss']}")
+        except Exception:
+            pass
+    # Python world.
+    pyproj = cwd / "pyproject.toml"
+    if pyproj.is_file():
+        try:
+            txt = pyproj.read_text()
+            if "fastapi" in txt.lower():
+                hints.append("FastAPI")
+            elif "django" in txt.lower():
+                hints.append("Django")
+            elif "flask" in txt.lower():
+                hints.append("Flask")
+            if "ruff" in txt.lower():
+                hints.append("ruff")
+            if "pytest" in txt.lower():
+                hints.append("pytest")
+        except Exception:
+            pass
+    # Rust.
+    if (cwd / "Cargo.toml").is_file():
+        hints.append("Rust (Cargo)")
+    # Go.
+    if (cwd / "go.mod").is_file():
+        hints.append("Go modules")
+    return "; ".join(hints) if hints else "unknown stack"
+
+
 def _plan_grounding(cwd: Path) -> str:
     """Probe cwd before plan execution so steps don't hallucinate files.
 
-    Captures: real pwd, git repo root (or 'not a git repo'), git ls-files
-    truncated to 60 entries, top-level ls. Injected as <plan_environment>
+    Captures: real pwd, git repo root, framework detection, git ls-files
+    truncated to 80 entries, top-level ls. Injected as <plan_environment>
     into every step prompt so the executor grounds against actual paths
-    instead of inventing speculative ones.
+    and frameworks instead of inventing speculative ones (e.g., Express
+    middleware in a Next.js App Router project).
     """
     parts: list[str] = []
     parts.append(f"pwd: {cwd}")
+    framework = _detect_framework(cwd)
+    parts.append(f"detected stack: {framework}")
     try:
         gp = subprocess.run(
             ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
@@ -3144,10 +3273,12 @@ def _plan_grounding(cwd: Path) -> str:
                 capture_output=True, text=True, timeout=5,
             )
             if ls.returncode == 0:
-                files = ls.stdout.splitlines()[:60]
+                all_files = ls.stdout.splitlines()
+                files = all_files[:80]
                 parts.append(
                     f"git ls-files (first {len(files)} of "
-                    f"{len(ls.stdout.splitlines())}):\n"
+                    f"{len(all_files)}; YOU MUST use only these paths or "
+                    f"propose new files under existing parent dirs):\n"
                     + "\n".join(f"  {f}" for f in files)
                 )
         else:
@@ -3160,7 +3291,16 @@ def _plan_grounding(cwd: Path) -> str:
                 parts.append("ls -la:\n" + ls.stdout[:2000])
     except Exception as e:
         parts.append(f"grounding probe error: {e}")
-    return "<plan_environment>\n" + "\n".join(parts) + "\n</plan_environment>"
+    return (
+        "<plan_environment>\n"
+        + "\n".join(parts)
+        + "\nIMPORTANT: do NOT invent paths that don't appear above. "
+        "If the framework is Next.js App Router, the right place for an "
+        "API route is app/api/<name>/route.ts -- NOT pages/api/, NOT "
+        "src/app/api/ unless src/ appears in the listing above. Match "
+        "the existing convention exactly.\n"
+        "</plan_environment>"
+    )
 
 
 def _plan_change_count() -> int:
