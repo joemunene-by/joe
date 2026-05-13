@@ -988,13 +988,29 @@ def openai_models(authorization: Optional[str] = Header(None)) -> dict:
 # --------------------------------------------------------------------------
 
 
+_WEB_CHAT_PREAMBLE = (
+    "[WEB CHAT MODE -- you are answering inside a browser tab that has "
+    "NO shell, NO filesystem, NO tool executor. Do NOT emit `RUN:`, "
+    "`<bash>`, `<read>`, `<write>`, `<edit>`, `<cd>`, `<grep>`, `<glob>`, "
+    "`<delegate>`, `<plan>`, or any other tool tag -- they will be shown "
+    "to the user as literal text, NOT executed. Answer the user's "
+    "question directly in plain prose. If they ask for something that "
+    "would require shell access (listing files, running commands), "
+    "describe what they could run themselves, but don't pretend to do it.]"
+)
+
+
 def _stream_ollama(prompt: str, model: str):
     """Generator yielding SSE-formatted token events from ollama."""
     # First line tells the browser NOT to auto-reconnect for ~1 day after
     # a clean close. Without this, EventSource fires 'done' AND THEN
     # reconnects 3s later, re-issuing the same prompt indefinitely.
     yield "retry: 86400000\n\n"
-    body = json.dumps({"model": model, "prompt": prompt,
+    # Web chat is conversational; the model has no tool executor here.
+    # Prepend a directive so joe-gemma (which is heavily tool-trained)
+    # answers in prose instead of emitting `RUN: ls -F` style stubs.
+    full_prompt = f"{_WEB_CHAT_PREAMBLE}\n\n{prompt}"
+    body = json.dumps({"model": model, "prompt": full_prompt,
                        "stream": True, "think": False}).encode()
     req = urllib.request.Request(
         "http://localhost:11434/api/generate",

@@ -1876,14 +1876,50 @@ def cmd_train(args: list[str], default_model: str) -> int:
         if not latest_jsonl:
             console.print("[red]no training data; run `joe train collect` first[/]")
             return 1
+        # mlx-lm's local-data path needs the --data directory to contain
+        # train.jsonl, valid.jsonl, test.jsonl by literal name. Concat
+        # every collected jsonl into train, then carve off small valid +
+        # test slices. Without this it falls back to the HuggingFace
+        # dataset loader and crashes for missing `datasets` module.
+        lora_set = TRAINING_DATA_DIR / "lora-set"
+        lora_set.mkdir(exist_ok=True)
+        all_lines: list[str] = []
+        for jp in latest_jsonl:
+            try:
+                all_lines.extend(
+                    ln for ln in jp.read_text().splitlines() if ln.strip()
+                )
+            except OSError:
+                continue
+        if len(all_lines) < 8:
+            console.print(
+                f"[red]LoRA needs at least 8 examples (have {len(all_lines)}); "
+                f"run `joe train collect` a few more times.[/]"
+            )
+            return 1
+        # mlx-lm's default batch_size=4 means valid must have >=4 lines.
+        # Give it 5 to be safe; the rest go to train; test gets a slice
+        # too so end-of-run perplexity isn't trained-on.
+        n_valid = max(4, len(all_lines) // 10)
+        n_test = max(4, len(all_lines) // 10)
+        valid_lines = all_lines[:n_valid]
+        test_lines = all_lines[n_valid:n_valid + n_test]
+        train_lines = all_lines[n_valid + n_test:] or all_lines  # fall back if tiny
+        (lora_set / "train.jsonl").write_text("\n".join(train_lines) + "\n")
+        (lora_set / "valid.jsonl").write_text("\n".join(valid_lines) + "\n")
+        (lora_set / "test.jsonl").write_text("\n".join(test_lines) + "\n")
         cmd = [
             mlx, "--model", "mlx-community/gemma-3-4b-it-4bit",
-            "--train", "--data", str(latest_jsonl[-1].parent),
+            "--train", "--data", str(lora_set),
             "--iters", "200",
             "--adapter-path", str(TRAINING_DATA_DIR / "adapter"),
         ]
-        panel("joe train lora (spawning)", Syntax(" ".join(cmd), "bash",
-              theme="ansi_dark"), style="cyan")
+        panel(
+            f"joe train lora (spawning, {len(train_lines)} train / "
+            f"{len(valid_lines)} valid / {len(test_lines)} test)",
+            Syntax(" ".join(cmd), "bash", theme="ansi_dark"),
+            style="cyan",
+        )
         # Spawn as a background joe-task so progress is captured + ntfy fires.
         data = task_spawn(" ".join(shlex.quote(x) for x in cmd), Path.cwd(),
                           label="joe-train-lora")
