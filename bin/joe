@@ -3924,6 +3924,75 @@ def _rebuild_tag_pattern() -> None:
 # capability augmentations the model picks up on its own.
 
 
+# Aider-style AI markers: `# AI!`, `// AI!`, `<!-- AI! -->` etc. left
+# in source code as a "joe, do this here" trigger. /ai-markers scans
+# the cwd for them; /ai-markers fix runs a turn per marker.
+_AI_MARKER_RE = re.compile(
+    r"(?:#|//|;|--|<!--)\s*AI!\s*(.+?)(?:-->|\*/|$)",
+    re.MULTILINE,
+)
+
+
+def find_ai_markers(cwd: Path, max_files: int = 200) -> list[tuple[Path, int, str]]:
+    """Walk the cwd looking for AI! markers in source files. Returns list
+    of (file, line_number, marker_text). Skips the usual ignore-dirs."""
+    out: list[tuple[Path, int, str]] = []
+    skip = {".git", "node_modules", ".next", "__pycache__", "target",
+            ".venv", "venv", "dist", "build", ".pytest_cache",
+            ".joe-agent", "playwright-browsers"}
+    code_exts = {".py", ".pyi", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs",
+                 ".rs", ".go", ".rb", ".java", ".kt", ".swift",
+                 ".c", ".cc", ".cpp", ".h", ".hpp",
+                 ".css", ".scss", ".sass", ".less",
+                 ".html", ".vue", ".svelte", ".md"}
+    seen = 0
+    try:
+        for p in sorted(cwd.rglob("*")):
+            if seen >= max_files:
+                break
+            if not p.is_file() or p.suffix not in code_exts:
+                continue
+            if any(part in skip for part in p.relative_to(cwd).parts):
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            seen += 1
+            for lineno, line in enumerate(text.splitlines(), 1):
+                m = _AI_MARKER_RE.search(line)
+                if m:
+                    out.append((p, lineno, m.group(1).strip()))
+    except Exception:
+        return out
+    return out
+
+
+def install_skill_from_git(git_url: str) -> tuple[bool, str]:
+    """Clone a SKILL.md package from a git URL into ~/.joe-agent/skills/.
+    The repo must contain a SKILL.md at its root. Returns (ok, message)."""
+    if not shutil.which("git"):
+        return False, "git not on PATH"
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    # Derive a dir name from the URL.
+    name = git_url.rstrip("/").rstrip(".git").rsplit("/", 1)[-1]
+    if not name or not re.match(r"^[a-zA-Z0-9_-]+$", name):
+        return False, f"derived name {name!r} not a clean identifier"
+    target = SKILLS_DIR / name
+    if target.exists():
+        return False, f"already installed at {target}; rm -rf to reinstall"
+    cp = subprocess.run(
+        ["git", "clone", "--depth", "1", git_url, str(target)],
+        capture_output=True, text=True, timeout=60,
+    )
+    if cp.returncode != 0:
+        return False, f"git clone failed: {cp.stderr.strip()[:300]}"
+    if not (target / "SKILL.md").is_file():
+        shutil.rmtree(target, ignore_errors=True)
+        return False, f"{git_url} has no SKILL.md at root; not a skill package"
+    return True, f"installed {name} from {git_url}"
+
+
 def _parse_skill_md(path: Path) -> Optional[dict]:
     """Parse SKILL.md: --- frontmatter --- + body. Returns dict with
     keys name, description, when_to_use, allowed_tools (optional), body."""
@@ -5796,7 +5865,7 @@ SLASH_COMMAND_NAMES = (
     "blame", "passport", "council", "commands", "plugins",
     "diff-model", "diffmodel", "think",
     "output-style", "outputstyle", "style", "statusline",
-    "sandbox", "mode", "skills", "loop",
+    "sandbox", "mode", "skills", "loop", "ai-markers", "aimarkers",
     "read", "run", "diff", "copy", "history", "undo", "redo",
     "plan", "test", "lint", "build", "explain", "profile",
     "commit", "push", "pr", "issue", "snap",
@@ -8950,6 +9019,14 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                     _LOADED_SKILLS = load_skills()
                     console.print(f"[dim]reloaded {len(_LOADED_SKILLS)} skills[/]")
                     continue
+                if sub.startswith("install "):
+                    url = sub[len("install "):].strip()
+                    ok, msg = install_skill_from_git(url)
+                    color = "green" if ok else "red"
+                    console.print(f"[{color}]{msg}[/]")
+                    if ok:
+                        _LOADED_SKILLS = load_skills()
+                    continue
                 if not _LOADED_SKILLS:
                     console.print(
                         f"[dim]no skills loaded. drop dirs into {SKILLS_DIR} "
@@ -8970,6 +9047,48 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                         style="cyan",
                         subtitle=str(SKILLS_DIR),
                     )
+                continue
+            if cmd in {"ai-markers", "aimarkers"}:
+                sub = args.strip().lower()
+                markers = find_ai_markers(state["cwd"])
+                if not markers:
+                    console.print(
+                        "[dim](no AI! markers found in cwd; add comments "
+                        "like # AI! refactor this to async to flag spots)[/]"
+                    )
+                    continue
+                if sub == "fix":
+                    for path, lineno, marker_text in markers:
+                        rel = path.relative_to(state["cwd"])
+                        console.rule(
+                            f"[bold cyan]ai-markers fix: {rel}:{lineno}[/]"
+                        )
+                        # Build a turn that gives joe the file + line + marker.
+                        prompt = (
+                            f"There's an AI! marker at {rel}:{lineno} that "
+                            f"says: {marker_text!r}. Read the file, make the "
+                            f"requested change, then REMOVE the marker line."
+                        )
+                        run_turn(
+                            model=state["model"],
+                            coder_model=state["coder"],
+                            user_msg=prompt,
+                            cwd=state["cwd"],
+                            session=state["session"],
+                            allow_all_bash=allow_all_bash,
+                            max_turns=MAX_AUTO_TURNS,
+                        )
+                    continue
+                lines = []
+                for path, lineno, txt in markers[:40]:
+                    rel = path.relative_to(state["cwd"])
+                    lines.append(f"  [bold]{rel}:{lineno}[/]  [dim]{txt[:80]}[/]")
+                panel(
+                    f"AI! markers in {state['cwd'].name} ({len(markers)} found)",
+                    Text.from_markup("\n".join(lines)),
+                    style="cyan",
+                    subtitle="/ai-markers fix to address all in sequence",
+                )
                 continue
             if cmd == "loop":
                 # /loop N <prompt> -- run the prompt N times sequentially.
