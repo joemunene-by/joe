@@ -13,7 +13,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        # 3.11+ only -- joe imports tomllib (stdlib in 3.11) for macros
+        # and subagents. Adding tomli as a CI-only shim isn't worth the
+        # cognitive load; the Mac runs 3.9 (system) or 3.14 (Library/),
+        # neither is in the matrix.
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

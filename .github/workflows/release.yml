@@ -42,11 +42,20 @@ jobs:
             fi
           } > release-notes.md
           cat release-notes.md
-      - name: Create GitHub release
+      - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           CURRENT_TAG="${GITHUB_REF##*/}"
-          gh release create "$CURRENT_TAG" \
-            --title "$CURRENT_TAG" \
-            --notes-file release-notes.md
+          # Idempotent: if the release was created manually (e.g. ad-hoc
+          # from a dev box), update the notes instead of erroring on
+          # "Release.tag_name already exists". Future-proofs against a
+          # human accidentally racing the workflow.
+          if gh release view "$CURRENT_TAG" >/dev/null 2>&1; then
+            echo "Release $CURRENT_TAG already exists; updating notes"
+            gh release edit "$CURRENT_TAG" --notes-file release-notes.md
+          else
+            gh release create "$CURRENT_TAG" \
+              --title "$CURRENT_TAG" \
+              --notes-file release-notes.md
+          fi
