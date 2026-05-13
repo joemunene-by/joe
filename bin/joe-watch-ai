@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""joe-watch-ai: Aider-style watch loop. Polls the cwd for file saves
+containing `# AI!` / `// AI!` / `<!-- AI! -->` marker comments. On
+detection, fires `joe -p` to address the marker and remove it.
+
+The companion to `joe`'s `/ai-markers fix` slash command: that one is
+manual (the user types it); this is the always-on version. Leave it
+running in a side terminal while you work; flag spots with marker
+comments; joe attends to them in the background.
+
+Usage:
+    joe-watch-ai                # daemon mode (polls every 2s)
+    joe-watch-ai --once         # one pass, exit
+    joe-watch-ai --interval 5   # poll every 5s instead
+    joe-watch-ai --dry-run      # show what would fire, don't actually run
+    joe-watch-ai --path src     # watch a subtree, not the cwd
+    joe-watch-ai --no-commit    # don't auto-commit after fixing
+
+Exit: Ctrl-C cleanly stops the daemon.
+
+Marker styles recognised:
+    # AI! refactor this to async      (Python, shell, Ruby, YAML)
+    // AI! make this lazy             (JS, TS, Rust, Go, C)
+    <!-- AI! add aria-label -->       (HTML, Markdown, XML)
+    ; AI! ...                         (lisp, clojure)
+    -- AI! ...                        (SQL, Haskell, Lua)
+
+Skipped dirs: .git, node_modules, .next, __pycache__, target, .venv,
+venv, dist, build, .pytest_cache, .joe-agent, playwright-browsers.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+_AI_MARKER_RE = re.compile(
+    r"(?:#|//|;|--|<!--)\s*AI!\s*(.+?)(?:-->|\*/|$)",
+    re.MULTILINE,
+)
+
+_SKIP_DIRS = {
+    ".git", "node_modules", ".next", "__pycache__", "target",
+    ".venv", "venv", "dist", "build", ".pytest_cache",
+    ".joe-agent", "playwright-browsers", ".cargo", ".rustup",
+}
+
+_CODE_EXTS = {
+    ".py", ".pyi", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs",
+    ".rs", ".go", ".rb", ".java", ".kt", ".swift",
+    ".c", ".cc", ".cpp", ".h", ".hpp",
+    ".css", ".scss", ".sass", ".less",
+    ".html", ".vue", ".svelte", ".md", ".yaml", ".yml", ".toml",
+    ".sh", ".bash", ".zsh", ".sql", ".lua",
+}
+
+
+def _walk_for_markers(root: Path, max_files: int = 500) -> list[tuple[Path, int, str]]:
+    """Find every AI! marker in source files under root."""
+    out: list[tuple[Path, int, str]] = []
+    seen = 0
+    for p in sorted(root.rglob("*")):
+        if seen >= max_files:
+            break
+        if not p.is_file() or p.suffix not in _CODE_EXTS:
+            continue
+        if any(part in _SKIP_DIRS for part in p.relative_to(root).parts):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        seen += 1
+        for lineno, line in enumerate(text.splitlines(), 1):
+            m = _AI_MARKER_RE.search(line)
+            if m:
+                out.append((p, lineno, m.group(1).strip()))
+    return out
+
+
+def _snapshot_mtimes(root: Path) -> dict[Path, float]:
+    """Return {path: mtime} for every source file under root (one pass)."""
+    out: dict[Path, float] = {}
+    for p in root.rglob("*"):
+        if not p.is_file() or p.suffix not in _CODE_EXTS:
+            continue
+        try:
+            if any(part in _SKIP_DIRS for part in p.relative_to(root).parts):
+                continue
+            out[p] = p.stat().st_mtime
+        except OSError:
+            continue
+    return out
+
+
+def _fix_marker(path: Path, lineno: int, prompt: str,
+                joe_bin: str, auto_commit: bool, dry_run: bool) -> bool:
+    """Fire `joe -p` to address the marker. Returns True on success."""
+    rel_disp = str(path)
+    msg = (
+        f"There is an AI! marker at {rel_disp}:{lineno}.\n\n"
+        f"The marker text says: {prompt!r}\n\n"
+        f"Read the file, make the requested change as a single <write> "
+        f"or <edit>, and CRITICALLY: remove the marker line from the "
+        f"final file (don't keep the AI! comment around)."
+    )
+    print(f"[joe-watch-ai] firing on {rel_disp}:{lineno} -- {prompt[:60]}",
+          flush=True)
+    if dry_run:
+        print(f"[joe-watch-ai] DRY-RUN: would run: {joe_bin} -p '<see above>'",
+              flush=True)
+        return True
+    try:
+        cp = subprocess.run(
+            [joe_bin, "-p", msg],
+            capture_output=True, text=True, timeout=600,
+        )
+        if cp.returncode != 0:
+            print(f"[joe-watch-ai] joe -p failed (rc={cp.returncode}):\n"
+                  f"  {cp.stderr.strip()[:300]}", flush=True)
+            return False
+    except subprocess.TimeoutExpired:
+        print(f"[joe-watch-ai] joe -p timed out after 600s", flush=True)
+        return False
+    except FileNotFoundError:
+        print(f"[joe-watch-ai] {joe_bin!r} not found on PATH", flush=True)
+        return False
+    if auto_commit:
+        try:
+            subprocess.run(
+                ["git", "add", str(path)],
+                capture_output=True, timeout=10, check=False,
+            )
+            subprocess.run(
+                ["git", "commit", "-m",
+                 f"address AI! marker in {path.name}: {prompt[:60]}"],
+                capture_output=True, timeout=15, check=False,
+            )
+        except Exception:
+            pass
+    return True
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="joe-watch-ai", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--path", default=".",
+                    help="directory to watch (default: cwd)")
+    ap.add_argument("--interval", type=float, default=2.0,
+                    help="seconds between polls (default: 2)")
+    ap.add_argument("--once", action="store_true",
+                    help="single pass + exit (no daemon)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="show what would fire, don't actually run joe")
+    ap.add_argument("--no-commit", action="store_true",
+                    help="don't `git commit` after each fix")
+    args = ap.parse_args()
+
+    root = Path(os.path.expanduser(args.path)).resolve()
+    if not root.is_dir():
+        print(f"[joe-watch-ai] not a directory: {root}", file=sys.stderr)
+        return 1
+    joe_bin = shutil.which("joe") or os.path.expanduser("~/.local/bin/joe")
+    if not os.path.exists(joe_bin):
+        print(f"[joe-watch-ai] joe not on PATH; expected at ~/.local/bin/joe",
+              file=sys.stderr)
+        return 1
+    auto_commit = not args.no_commit
+
+    if args.once:
+        markers = _walk_for_markers(root)
+        if not markers:
+            print(f"[joe-watch-ai] no AI! markers in {root}", flush=True)
+            return 0
+        for p, ln, txt in markers:
+            _fix_marker(p, ln, txt, joe_bin, auto_commit, args.dry_run)
+        return 0
+
+    print(f"[joe-watch-ai] watching {root} (every {args.interval}s, "
+          f"Ctrl-C to stop)", flush=True)
+
+    # Stop cleanly on Ctrl-C.
+    stop = {"requested": False}
+    def _sigint(sig, frame):
+        stop["requested"] = True
+        print("\n[joe-watch-ai] stopping after current pass...", flush=True)
+    signal.signal(signal.SIGINT, _sigint)
+
+    prev = _snapshot_mtimes(root)
+    while not stop["requested"]:
+        time.sleep(args.interval)
+        if stop["requested"]:
+            break
+        curr = _snapshot_mtimes(root)
+        changed: list[Path] = []
+        for p, mt in curr.items():
+            if p not in prev or mt > prev[p]:
+                changed.append(p)
+        prev = curr
+        if not changed:
+            continue
+        # Scan each changed file for markers and fire on any present.
+        for p in changed:
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for lineno, line in enumerate(text.splitlines(), 1):
+                m = _AI_MARKER_RE.search(line)
+                if m:
+                    prompt = m.group(1).strip()
+                    if _fix_marker(p, lineno, prompt, joe_bin, auto_commit, args.dry_run):
+                        # Re-snapshot after a successful fix so we don't
+                        # re-fire on our own change.
+                        prev = _snapshot_mtimes(root)
+                    break  # one marker per file per cycle; next pass picks up more
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

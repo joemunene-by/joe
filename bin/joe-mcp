@@ -180,5 +180,129 @@ def standup(hours: int = 24) -> str:
     return _run(["standup", "--hours", str(hours)], timeout=900)
 
 
+# --------------------------------------------------------------------------
+# v0.11.3 -- broader tool surface so MCP clients can drive joe fully.
+# --------------------------------------------------------------------------
+# These wrap joe-agent flags or call out to the joe binary directly to
+# expose: file I/O with provenance + AST guard, blame, council, replay,
+# recall, knowledge graph, skill listing.
+
+
+@mcp.tool()
+def read_file(path: str) -> str:
+    """Read a file's contents. Tilde-expansion supported. Truncated to
+    ~30KB. Counts as a side-effect-free joe <read>; provenance is not
+    stamped (only writes are)."""
+    p = os.path.expanduser(path)
+    if not os.path.isfile(p):
+        return f"ERROR: no such file: {path}"
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            content = f.read(30_000)
+        if os.path.getsize(p) > 30_000:
+            content += "\n[... truncated]"
+        return content
+    except OSError as e:
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def write_file(path: str, content: str) -> str:
+    """Write content to a file. Goes through joe-agent so the write is
+    stamped to the provenance log (visible later via `blame_line`),
+    AST-validated for .py files, and gated by the same safety policies.
+
+    Args:
+        path: target file path.
+        content: full file content to write.
+    """
+    # Build a one-shot prompt that asks joe to <write> exactly this.
+    args = [
+        "chat", "--no-stream", "--quiet", "--no-rag", "--no-git-state",
+        f"Write this content to {path} exactly as given. Emit a single "
+        f"<write path=\"{path}\"> tag with this body and nothing else.\n\n"
+        f"<content>\n{content}\n</content>",
+    ]
+    return _run(args, timeout=120)
+
+
+@mcp.tool()
+def blame_line(path: str, line: int) -> str:
+    """Show the AI provenance for a given file:line -- which prompt,
+    agent, model, session, and timestamp originally wrote it. Git blame
+    for *intent*, not just authorship."""
+    return _run(["blame", f"{path}:{line}"], timeout=30)
+
+
+@mcp.tool()
+def council(prompt: str) -> str:
+    """Multi-model arbitration: fires the same prompt at 3 local models
+    concurrently (joe-gemma + qwen2.5:14b + deepseek-r1:14b by default)
+    and returns each model's response side-by-side with an auto-judge
+    verdict. Useful when one model's answer feels uncertain."""
+    # joe -p with a /council seed isn't supported directly; use chat
+    # mode and prepend /council to the prompt as if user typed it.
+    return _run([
+        "chat", "--no-stream", "--quiet", "--no-rag",
+        f"/council {prompt}",
+    ], timeout=900)
+
+
+@mcp.tool()
+def recall(query: str) -> str:
+    """Semantic search across past joe sessions via BGE embeddings.
+    Returns relevant past turns + their session IDs. Great for "did
+    we already solve this problem?" continuity."""
+    return _run([
+        "chat", "--no-stream", "--quiet", "--no-tools",
+        f"/recall {query}",
+    ], timeout=60)
+
+
+@mcp.tool()
+def list_passports(limit: int = 10) -> str:
+    """List recent reproducibility passports -- the sha256-keyed records
+    of every model call's input space. Each entry is hash + ts + model +
+    prompt preview. Use `replay_passport(hash)` to re-run one exactly."""
+    return _run([
+        "chat", "--no-stream", "--quiet", "--no-tools", "--no-rag",
+        f"/passport list",
+    ], timeout=30)
+
+
+@mcp.tool()
+def replay_passport(passport_hash: str) -> str:
+    """Re-run a past model call by its passport hash. The same prompt,
+    same model, same cwd, same lessons -- bit-for-bit reproducible
+    (within the model's own seed bound)."""
+    return _run([
+        "chat", "--no-stream", "--quiet", "--no-rag",
+        f"/passport replay {passport_hash}",
+    ], timeout=600)
+
+
+@mcp.tool()
+def list_skills() -> str:
+    """List installed Claude-Code-style skills (SKILL.md packages at
+    ~/.joe-agent/skills/<name>/). Each has a description + when_to_use
+    trigger phrase list."""
+    return _run([
+        "chat", "--no-stream", "--quiet", "--no-tools", "--no-rag",
+        f"/skills",
+    ], timeout=30)
+
+
+@mcp.tool()
+def ai_markers_in(path: str = ".") -> str:
+    """Scan a directory tree for `# AI!` / `// AI!` / `<!-- AI! -->`
+    marker comments (Aider style) and return file:line + the marker
+    prompt for each. Use this from a remote agent to inspect what
+    work the user has flagged for joe to address."""
+    return _run([
+        "chat", "--no-stream", "--quiet", "--no-tools", "--no-rag",
+        f"/ai-markers",
+    ], timeout=30)
+
+
 if __name__ == "__main__":
     mcp.run()

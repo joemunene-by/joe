@@ -3778,7 +3778,8 @@ _CATCHALL_GREP_PATTERNS = {".*", ".+", "^", "$", "^$", ".", "[^]", ""}
 
 
 def _screencap(out_path: Path) -> tuple[bool, str]:
-    """Capture the primary screen to `out_path`. Returns (ok, message)."""
+    """Capture the primary screen to `out_path`. Returns (ok, message).
+    Tries platform-native tools first; falls back to pyautogui."""
     if shutil.which("screencapture"):  # macOS
         cp = subprocess.run(
             ["screencapture", "-x", str(out_path)],
@@ -3787,7 +3788,7 @@ def _screencap(out_path: Path) -> tuple[bool, str]:
         if cp.returncode == 0 and out_path.exists():
             return True, f"captured to {out_path}"
         return False, cp.stderr.strip() or "screencapture failed"
-    if shutil.which("gnome-screenshot"):
+    if shutil.which("gnome-screenshot"):  # Linux/GNOME
         cp = subprocess.run(
             ["gnome-screenshot", "-f", str(out_path)],
             capture_output=True, text=True, timeout=15,
@@ -3795,7 +3796,7 @@ def _screencap(out_path: Path) -> tuple[bool, str]:
         if cp.returncode == 0 and out_path.exists():
             return True, f"captured to {out_path}"
         return False, cp.stderr.strip() or "gnome-screenshot failed"
-    if shutil.which("scrot"):
+    if shutil.which("scrot"):  # Linux fallback
         cp = subprocess.run(
             ["scrot", str(out_path)],
             capture_output=True, text=True, timeout=15,
@@ -3803,9 +3804,35 @@ def _screencap(out_path: Path) -> tuple[bool, str]:
         if cp.returncode == 0 and out_path.exists():
             return True, f"captured to {out_path}"
         return False, cp.stderr.strip() or "scrot failed"
+    # Windows: use PowerShell + .NET.
+    if sys.platform == "win32" and shutil.which("powershell"):
+        ps_script = (
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            "Add-Type -AssemblyName System.Drawing;"
+            "$b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds;"
+            f"$bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height;"
+            "$g=[System.Drawing.Graphics]::FromImage($bmp);"
+            "$g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size);"
+            f"$bmp.Save('{out_path}',[System.Drawing.Imaging.ImageFormat]::Png)"
+        )
+        cp = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True, timeout=15,
+        )
+        if cp.returncode == 0 and out_path.exists():
+            return True, f"captured to {out_path}"
+    # Last-resort: pyautogui (works cross-platform when installed).
+    try:
+        import pyautogui as _pa
+        _pa.screenshot(str(out_path))
+        if out_path.exists():
+            return True, f"captured to {out_path} (via pyautogui)"
+    except Exception:
+        pass
     return False, (
-        "no screenshot tool found. install one of: macOS screencapture "
-        "(built-in), gnome-screenshot, or scrot."
+        "no screenshot tool found. install one of: screencapture (macOS, "
+        "built-in), gnome-screenshot, scrot, powershell (Windows, "
+        "built-in), or pyautogui (cross-platform pip install)."
     )
 
 
@@ -4317,18 +4344,23 @@ def tool_open(attrs: dict, body: str, confirm: bool = True) -> str:
     target = (attrs.get("target") or body or "").strip()
     if not target:
         raise ToolError("<open>app-or-url</open> -- empty target")
+    # Pick the platform-native launcher.
     launcher = (
-        "open" if shutil.which("open") else
-        "xdg-open" if shutil.which("xdg-open") else
-        "start" if shutil.which("start") else None
+        "open" if shutil.which("open") else                   # macOS
+        "xdg-open" if shutil.which("xdg-open") else           # Linux
+        # On Windows, `start` is a cmd builtin, not on PATH. Use cmd /c.
+        ("cmd" if sys.platform == "win32" else None)
     )
     if not launcher:
-        raise ToolError("<open>: no launcher found (open / xdg-open / start)")
+        raise ToolError("<open>: no launcher found (open / xdg-open / cmd)")
     panel(f"Open: {target}", "", style="magenta")
     if confirm and not _confirm(f"Open {target}?", tool="open"):
         return "user denied open"
     try:
-        subprocess.run([launcher, target], timeout=10)
+        if launcher == "cmd":  # Windows
+            subprocess.run([launcher, "/c", "start", "", target], timeout=10)
+        else:
+            subprocess.run([launcher, target], timeout=10)
     except Exception as e:
         raise ToolError(f"<open>: {type(e).__name__}: {e}")
     return f"opened {target}"
@@ -4505,8 +4537,23 @@ def tool_clipboard(attrs: dict, body: str, confirm: bool = True) -> str:
                           style="bright_blue",
                           subtitle=f"{len(out)} chars")
                     return out
+        # Windows fallback via PowerShell Get-Clipboard.
+        if sys.platform == "win32" and shutil.which("powershell"):
+            cp = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if cp.returncode == 0:
+                out = cp.stdout
+                panel("Clipboard get (powershell)",
+                      Text(out[:600] + ("..." if len(out) > 600 else ""),
+                           style="dim"),
+                      style="bright_blue",
+                      subtitle=f"{len(out)} chars")
+                return out
         raise ToolError(
-            "<clipboard get>: no clipboard reader on PATH (pbpaste / xclip / wl-paste)"
+            "<clipboard get>: no clipboard reader on PATH "
+            "(pbpaste / xclip / wl-paste / Windows PowerShell)"
         )
     if op == "set":
         text = body
@@ -4531,8 +4578,17 @@ def tool_clipboard(attrs: dict, body: str, confirm: bool = True) -> str:
                 except subprocess.CalledProcessError as e:
                     raise ToolError(f"<clipboard set>: {e}")
                 return f"clipboard set ({len(text)} chars)"
+        # Windows fallback via `clip` (always present on Windows).
+        if sys.platform == "win32" and shutil.which("clip"):
+            try:
+                subprocess.run(["clip"], input=text, text=True,
+                               timeout=5, check=True)
+            except subprocess.CalledProcessError as e:
+                raise ToolError(f"<clipboard set>: {e}")
+            return f"clipboard set ({len(text)} chars; via Windows clip)"
         raise ToolError(
-            "<clipboard set>: no clipboard writer on PATH (pbcopy / xclip / wl-copy)"
+            "<clipboard set>: no clipboard writer on PATH "
+            "(pbcopy / xclip / wl-copy / Windows clip)"
         )
     raise ToolError(f"<clipboard op=\"{op}\">: unknown op (use 'get' or 'set')")
 
