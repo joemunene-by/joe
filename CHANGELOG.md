@@ -2,6 +2,23 @@
 
 The headline feature per release. Full git log between tags has more.
 
+## v0.11.10 — secrets-pattern guardrail
+
+- New `_scan_secrets()` scanner refuses `<write>` / `<edit>` /
+  `<multi_edit>` bodies that match 11 known secret patterns: AWS access
+  + secret keys, OpenAI / Anthropic API keys, GitHub PATs (classic +
+  fine-grained), Stripe live keys, Google API keys, Slack webhooks +
+  tokens, JWTs, PEM-block private keys.
+- Refusals print a redacted finding (first 8 + last 4 chars only) so
+  the matched secret never lands in terminal scrollback.
+- Inspired by Future AGI's gateway-level guardrail action triad
+  (block / warn / log) -- adapted to the local-first threat model
+  where the actual risk is a model writing your live API key into
+  a file you then commit.
+- `JOE_GUARDRAILS=0` disables for a session; bypass is intentionally
+  per-session (not per-write) so even a `/trust=all` flow can't silently
+  leak.
+
 ## v0.11.9 — comprehensive docs sync
 
 - README.md grew a `## v0.11.x — user-research polish + safety

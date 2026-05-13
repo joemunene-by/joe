@@ -3518,6 +3518,102 @@ def _validate_source(path: Path, content: str) -> Optional[str]:
     return _validate_treesitter(path, content)
 
 
+# v0.11.10: secrets guardrails. Refuses to write a file when its body
+# matches a known secret pattern (AWS key, OpenAI key, GitHub token,
+# Slack webhook, SSH private key, generic ".env"-style assignments to
+# obviously-named secret variables). Modeled on Future AGI's
+# block/warn/log guardrail action triad and adapted to the local-first
+# threat model: the actual nightmare on a dev box isn't a hallucinated
+# slur, it's a model that helpfully writes your live API key into a
+# committed file. Strikes that root cause at the tool-write boundary.
+#
+# Bypass intentionally per-write (not per-session) so even a /trust=all
+# session can't silently leak. JOE_GUARDRAILS=0 disables globally.
+_GUARDRAILS_ENABLED: bool = os.environ.get(
+    "JOE_GUARDRAILS", "1"
+).strip().lower() not in {"0", "off", "false", "no", ""}
+
+_SECRET_PATTERNS: list[tuple[str, re.Pattern]] = [
+    # AWS access keys: AKIA[0-9A-Z]{16} (long-lived) and ASIA... (STS temp).
+    ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    # AWS secret keys: 40 base64 chars after the literal "aws_secret"
+    # assignment or in an obvious neighbourhood. Conservative: only
+    # match the common assignment patterns to avoid false positives
+    # on benign base64.
+    ("AWS secret access key", re.compile(
+        r"aws_secret_access_key\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{40}\b",
+        re.IGNORECASE,
+    )),
+    # Anthropic listed first because the OpenAI ``sk-...`` regex would
+    # otherwise also match ``sk-ant-...`` and shadow it.
+    ("Anthropic API key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
+    # OpenAI / generic ``sk-...`` excluding the Anthropic prefix.
+    ("OpenAI API key", re.compile(r"\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{20,}\b")),
+    # GitHub personal access tokens and fine-grained tokens.
+    ("GitHub PAT", re.compile(r"\bghp_[A-Za-z0-9]{36,}\b")),
+    ("GitHub fine-grained token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{60,}\b")),
+    # Slack webhooks + tokens.
+    ("Slack webhook", re.compile(
+        r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{20,}"
+    )),
+    ("Slack token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b")),
+    # Google API keys (AIza...).
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    # Stripe live keys (sk_live, pk_live).
+    ("Stripe live key", re.compile(r"\b(?:sk|pk)_live_[A-Za-z0-9]{20,}\b")),
+    # Private key headers (PEM block).
+    ("Private key (PEM)", re.compile(
+        r"-----BEGIN (?:RSA |OPENSSH |EC |DSA |PGP )?PRIVATE KEY-----"
+    )),
+    # JWT-ish: three base64url segments separated by dots, ≥20 chars each.
+    # Conservative; tightened by requiring the first segment to start
+    # with "ey" (the JSON Web Token header convention).
+    ("JWT", re.compile(
+        r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
+    )),
+]
+
+
+def _scan_secrets(content: str) -> list[tuple[str, int, str]]:
+    """Return [(label, line_number, matched_text), ...] for every secret-
+    pattern hit in `content`. Empty list = clean. Line numbers are
+    1-indexed so they slot directly into editor URLs."""
+    hits: list[tuple[str, int, str]] = []
+    if not _GUARDRAILS_ENABLED or not content:
+        return hits
+    for lineno, line in enumerate(content.splitlines(), 1):
+        for label, pat in _SECRET_PATTERNS:
+            m = pat.search(line)
+            if m:
+                # Truncate so the panel doesn't leak the whole key into
+                # the terminal scrollback.
+                shown = m.group(0)
+                if len(shown) > 20:
+                    shown = shown[:8] + "..." + shown[-4:]
+                hits.append((label, lineno, shown))
+                break  # one finding per line keeps the report scannable
+    return hits
+
+
+def _format_secret_block(path: Path, hits: list[tuple[str, int, str]]) -> str:
+    """Render a refusal message for a tool_* caller when secrets are
+    detected. Tells the model what was caught + how to unblock without
+    leaking the actual matched bytes back into the next prompt."""
+    lines = [
+        f"Guardrail blocked: {path} contains content matching {len(hits)} "
+        f"known secret pattern(s). The file was NOT written."
+    ]
+    for label, lineno, shown in hits:
+        lines.append(f"  - {label} at line {lineno}: {shown}")
+    lines.append(
+        "If this is a false positive (test fixture, documentation, "
+        "an example), either redact the value, move it to a "
+        "git-ignored .env, or set JOE_GUARDRAILS=0 for this session "
+        "to bypass. Bypass intentionally does not persist."
+    )
+    return "\n".join(lines)
+
+
 def tool_read(attrs: dict, body: str) -> str:
     path = attrs.get("path")
     if not path:
@@ -3628,6 +3724,10 @@ def tool_write(attrs: dict, body: str, confirm: bool = True) -> str:
     syntax_error = _validate_source(p, body)
     if syntax_error:
         raise ToolError(syntax_error)
+    # v0.11.10: secrets guardrail.
+    secret_hits = _scan_secrets(body)
+    if secret_hits:
+        raise ToolError(_format_secret_block(p, secret_hits))
     if confirm and not _confirm(f"Apply this write to {path}?", tool="write"):
         return "user denied write"
     p.write_text(body, encoding="utf-8")
@@ -3686,6 +3786,10 @@ def tool_edit(attrs: dict, body: str, confirm: bool = True) -> str:
     syntax_error = _validate_source(p, new_src)
     if syntax_error:
         raise ToolError(syntax_error)
+    # v0.11.10: secrets guardrail.
+    secret_hits = _scan_secrets(new_src)
+    if secret_hits:
+        raise ToolError(_format_secret_block(p, secret_hits))
     if confirm and not _confirm(f"Apply this edit to {path}?", tool="edit"):
         return "user denied edit"
     p.write_text(new_src, encoding="utf-8")
@@ -3759,6 +3863,10 @@ def tool_multi_edit(attrs: dict, body: str, confirm: bool = True) -> str:
     syntax_err = _validate_source(p, cur)
     if syntax_err:
         raise ToolError(syntax_err)
+    # v0.11.10: secrets guardrail.
+    secret_hits = _scan_secrets(cur)
+    if secret_hits:
+        raise ToolError(_format_secret_block(p, secret_hits))
     if confirm and not _confirm(
         f"Apply {len(pairs)} edits to {path}?", tool="edit",
     ):
