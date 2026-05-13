@@ -3334,6 +3334,99 @@ def _validate_python_syntax(path: Path, content: str) -> Optional[str]:
         )
 
 
+# tree-sitter-languages maps file extension to a bundled grammar. When
+# the package is installed, joe parses every non-Python write/edit
+# through the matching grammar and refuses if the parse tree has error
+# nodes -- the cross-language equivalent of the Python ast.parse guard.
+_TS_LANG_FOR_EXT = {
+    ".js": "javascript", ".cjs": "javascript", ".mjs": "javascript",
+    ".jsx": "javascript",
+    ".ts": "typescript", ".tsx": "tsx",
+    ".rs": "rust",
+    ".go": "go",
+    ".rb": "ruby",
+    ".java": "java",
+    ".kt": "kotlin",
+    ".swift": "swift",
+    ".c": "c", ".h": "c",
+    ".cc": "cpp", ".cpp": "cpp", ".hpp": "cpp", ".cxx": "cpp",
+    ".cs": "c_sharp",
+    ".php": "php",
+    ".lua": "lua",
+    ".scala": "scala",
+    ".sh": "bash", ".bash": "bash",
+    ".html": "html",
+    ".css": "css",
+    ".json": "json",
+    ".yaml": "yaml", ".yml": "yaml",
+    ".toml": "toml",
+    ".sql": "sql",
+}
+
+
+def _validate_treesitter(path: Path, content: str) -> Optional[str]:
+    """For non-Python source files: parse via tree-sitter (when installed)
+    and report the line/col of the first error node. No-op when:
+      - the file extension has no known grammar
+      - tree-sitter-languages isn't installed (optional dep)
+      - parsing raises any exception (we never block a write on a
+        validator crash)
+    Returns None on success/skip, error string when the tree has errors.
+    """
+    if path.suffix == ".py":
+        return None  # handled by _validate_python_syntax
+    lang_name = _TS_LANG_FOR_EXT.get(path.suffix)
+    if not lang_name:
+        return None
+    try:
+        from tree_sitter_languages import get_parser
+    except Exception:
+        return None  # optional dep absent; silently skip
+    try:
+        parser = get_parser(lang_name)
+        tree = parser.parse(content.encode("utf-8", errors="replace"))
+    except Exception:
+        return None  # grammar load failure: don't block on validator error
+    if not tree.root_node.has_error:
+        return None
+    # Walk to find the first error node and surface its position.
+    def _first_error(node):
+        if node.type == "ERROR" or node.is_missing:
+            return node
+        for child in node.children:
+            err = _first_error(child)
+            if err is not None:
+                return err
+        return None
+    err_node = _first_error(tree.root_node)
+    if err_node is None:
+        return None
+    line = err_node.start_point[0] + 1
+    col = err_node.start_point[1] + 1
+    offending = ""
+    try:
+        offending = content.splitlines()[max(0, line - 1)]
+    except Exception:
+        pass
+    return (
+        f"{lang_name} syntax error at line {line}, col {col} "
+        f"(tree-sitter rejected the parse)\n"
+        f"  {offending}\n"
+        f"  {' ' * max(0, col - 1)}^\n"
+        f"Fix the syntax and re-emit. The file was NOT written."
+    )
+
+
+def _validate_source(path: Path, content: str) -> Optional[str]:
+    """Combined source validator: Python via ast (stdlib, always on),
+    others via tree-sitter (optional). Called from tool_write,
+    tool_edit, tool_multi_edit before disk hit."""
+    py_err = _validate_python_syntax(path, content)
+    if py_err:
+        return py_err
+    return _validate_treesitter(path, content)
+
+
 def tool_read(attrs: dict, body: str) -> str:
     path = attrs.get("path")
     if not path:
@@ -3439,8 +3532,9 @@ def tool_write(attrs: dict, body: str, confirm: bool = True) -> str:
             style="green",
             subtitle=f"{len(body)} bytes  ·  {len(body.splitlines())} lines",
         )
-    # Block invalid Python syntax before the write hits disk + provenance.
-    syntax_error = _validate_python_syntax(p, body)
+    # Block invalid syntax before the write hits disk + provenance.
+    # Python via stdlib ast; everything else via tree-sitter when installed.
+    syntax_error = _validate_source(p, body)
     if syntax_error:
         raise ToolError(syntax_error)
     if confirm and not _confirm(f"Apply this write to {path}?", tool="write"):
@@ -3496,8 +3590,9 @@ def tool_edit(attrs: dict, body: str, confirm: bool = True) -> str:
         f"Edit {path}", Syntax(diff, "diff", theme="ansi_dark"),
         style="yellow", subtitle=f"+{adds} / -{dels}",
     )
-    # Block invalid Python syntax in the resulting file before write.
-    syntax_error = _validate_python_syntax(p, new_src)
+    # Block invalid syntax in the resulting file before write.
+    # Python via ast; everything else via tree-sitter when installed.
+    syntax_error = _validate_source(p, new_src)
     if syntax_error:
         raise ToolError(syntax_error)
     if confirm and not _confirm(f"Apply this edit to {path}?", tool="edit"):
@@ -3570,7 +3665,7 @@ def tool_multi_edit(attrs: dict, body: str, confirm: bool = True) -> str:
         Syntax(diff, "diff", theme="ansi_dark"),
         style="yellow", subtitle=f"+{adds} / -{dels}",
     )
-    syntax_err = _validate_python_syntax(p, cur)
+    syntax_err = _validate_source(p, cur)
     if syntax_err:
         raise ToolError(syntax_err)
     if confirm and not _confirm(

@@ -582,7 +582,38 @@ def _render_dashboard_html() -> str:
     # Knowledge graph.
     kg_body = f'<p>{kg_n} triples total.</p>'
     if kg_newest:
-        kg_body += '<table><thead><tr><th>subject</th><th>relation</th><th>object</th><th>session</th></tr></thead><tbody>'
+        # Mermaid flowchart of the newest triples. Each triple becomes a
+        # labelled edge. Node IDs are sanitised; long labels truncated to
+        # keep the diagram readable. Mermaid auto-layouts so subjects
+        # with multiple relations cluster naturally.
+        def _safe_id(s: str) -> str:
+            return "n_" + re.sub(r"[^A-Za-z0-9_]", "_", s[:30])
+        nodes_seen: set[str] = set()
+        mermaid_lines = ["flowchart LR"]
+        for s, r, o, sess, ts in kg_newest:
+            sid = _safe_id(s)
+            oid = _safe_id(o)
+            s_lbl = (s[:32] + ("..." if len(s) > 32 else "")).replace('"', '')
+            o_lbl = (o[:32] + ("..." if len(o) > 32 else "")).replace('"', '')
+            r_lbl = r[:24].replace('"', '')
+            if sid not in nodes_seen:
+                mermaid_lines.append(f'  {sid}["{s_lbl}"]')
+                nodes_seen.add(sid)
+            if oid not in nodes_seen:
+                mermaid_lines.append(f'  {oid}["{o_lbl}"]')
+                nodes_seen.add(oid)
+            mermaid_lines.append(f'  {sid} -- "{r_lbl}" --> {oid}')
+        mermaid_src = "\n".join(mermaid_lines)
+        kg_body += (
+            '<div class="mermaid" style="background:#161618;padding:12px;'
+            'border-radius:6px;border:1px solid #2a2a30;overflow-x:auto;">\n'
+            f'{html.escape(mermaid_src)}\n'
+            '</div>\n'
+            '<details style="margin-top:8px;"><summary class="dim">'
+            'show triple table</summary>\n'
+            '<table><thead><tr><th>subject</th><th>relation</th>'
+            '<th>object</th><th>session</th></tr></thead><tbody>'
+        )
         for s, r, o, sess, ts in kg_newest:
             kg_body += (
                 f'<tr><td>{html.escape(s[:40])}</td>'
@@ -590,7 +621,7 @@ def _render_dashboard_html() -> str:
                 f'<td>{html.escape(o[:60])}</td>'
                 f'<td class="dim">{html.escape(sess[:20])} · {html.escape(ts[:10])}</td></tr>'
             )
-        kg_body += '</tbody></table>'
+        kg_body += '</tbody></table></details>'
     section("Knowledge graph (12 newest triples)", kg_body)
 
     # Lessons.
@@ -741,6 +772,15 @@ def _render_dashboard_html() -> str:
   <link rel="apple-touch-icon" href="/icon.svg">
   <title>joe dashboard</title>
   <style>{css}</style>
+  <script type="module">
+    // Mermaid for the knowledge-graph flowchart. Loaded async; the
+    // diagram renders on DOMContentLoaded so a slow CDN doesn't block.
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+    mermaid.initialize({{ startOnLoad: true, theme: 'dark',
+      themeVariables: {{ background: '#0e0e10', primaryColor: '#1a1a1f',
+        primaryTextColor: '#e8e8e8', primaryBorderColor: '#7fd17f',
+        lineColor: '#81a1c1', tertiaryColor: '#161618' }} }});
+  </script>
 </head><body>
 {"".join(parts)}
 <script>{js}</script>

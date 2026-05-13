@@ -2,6 +2,23 @@
 
 The headline feature per release. Full git log between tags has more.
 
+## v0.11.7 — tree-sitter edit validation
+
+- Non-Python writes / edits now route through `tree-sitter-languages`
+  when installed. Same contract as the v0.9.6 Python AST guard: if the
+  parse tree has error nodes, joe refuses the write and reflects the
+  first error's line:col back to the model so the next turn fixes it.
+- 25+ extensions covered: js, ts, tsx, jsx, rs, go, rb, java, kt,
+  swift, c, cpp, cs, php, lua, scala, bash, html, css, json, yaml,
+  toml, sql.
+- `tree-sitter-languages` stays an optional dep; absent => silent skip.
+
+## v0.11.6 — knowledge-graph viz in /dashboard
+
+- `/dashboard` renders the newest subject-relation-object triples as a
+  Mermaid flowchart (dark-themed, lazy-loaded from the CDN). The
+  raw triple table is preserved under a `<details>` toggle.
+
 ## v0.11.0 — 2026-05-13
 
 - Comprehensive README + JOE.md update covering everything shipped
