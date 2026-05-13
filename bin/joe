@@ -6418,6 +6418,107 @@ def cmd_watch(args: argparse.Namespace) -> int:
 # at least one path separator OR exists in the cwd.
 _AT_MENTION_RE = re.compile(r"(?<!\w)@([^\s@]+)")
 
+# --- Aider-style repo map: shallow symbol table per file ---
+# We do a regex pass over recognised file extensions so we don't add a
+# tree-sitter runtime dep. Symbol coverage is broad enough for the model
+# to know what's in the project; full ASTs aren't necessary for the win.
+_SYMBOL_RES = {
+    "python": re.compile(
+        r"^(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)",
+        re.MULTILINE,
+    ),
+    "javascript": re.compile(
+        r"^(?:export\s+)?(?:async\s+)?(?:function|class|const|let)\s+"
+        r"([A-Za-z_$][A-Za-z0-9_$]*)",
+        re.MULTILINE,
+    ),
+    "rust": re.compile(
+        r"^(?:pub\s+)?(?:async\s+)?(?:fn|struct|enum|trait|impl)\s+"
+        r"([A-Za-z_][A-Za-z0-9_]*)",
+        re.MULTILINE,
+    ),
+    "go": re.compile(
+        r"^(?:func|type)\s+([A-Za-z_][A-Za-z0-9_]*)",
+        re.MULTILINE,
+    ),
+}
+_LANG_BY_EXT = {
+    ".py": "python", ".pyi": "python",
+    ".js": "javascript", ".ts": "javascript", ".tsx": "javascript",
+    ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+    ".rs": "rust",
+    ".go": "go",
+}
+# Repo-map cache: avoid rescanning on every turn. Key: cwd. Invalidated
+# when the cache is older than the wall time on the relevant files.
+_REPO_MAP_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def _build_repo_map(cwd: Path, max_files: int = 80, max_bytes: int = 5000) -> str:
+    """Aider-style repo map: per-file symbol table, capped to fit context.
+    Returns a multi-line string suitable for a <repo_map> system-prompt
+    block, or '' when there's nothing useful to show."""
+    cache_key = str(cwd)
+    now = time.time()
+    cached = _REPO_MAP_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < 60:
+        return cached[1]
+    skip = {".git", "node_modules", ".next", "__pycache__", "target",
+            ".venv", "venv", "dist", "build", ".pytest_cache",
+            ".joe-agent", "playwright-browsers"}
+    out_lines: list[str] = []
+    used = 0
+    seen = 0
+    try:
+        for p in sorted(cwd.rglob("*")):
+            if used >= max_bytes or seen >= max_files:
+                break
+            if not p.is_file():
+                continue
+            if any(part in skip for part in p.relative_to(cwd).parts):
+                continue
+            lang = _LANG_BY_EXT.get(p.suffix)
+            if not lang:
+                continue
+            try:
+                if p.stat().st_size > 200_000:  # skip massive files
+                    continue
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            seen += 1
+            syms = _SYMBOL_RES[lang].findall(text)
+            if not syms:
+                continue
+            rel = p.relative_to(cwd)
+            # First 12 symbols per file keeps the map skimmable.
+            preview = ", ".join(syms[:12])
+            extra = f" (+{len(syms) - 12} more)" if len(syms) > 12 else ""
+            line = f"  {rel}: {preview}{extra}"
+            if used + len(line) > max_bytes:
+                out_lines.append(f"  [... {len(_LANG_BY_EXT)} files truncated]")
+                break
+            out_lines.append(line)
+            used += len(line)
+    except Exception:
+        return ""
+    result = "\n".join(out_lines) if out_lines else ""
+    _REPO_MAP_CACHE[cache_key] = (now, result)
+    return result
+
+
+# Modes (Cline / Roo Code): named bundles of output_style + sandbox.
+# Switching mode atomically changes both. Available via /mode <name>.
+_MODES = {
+    "act":       {"style": "ship-it",     "sandbox": "full"},
+    "plan":      {"style": "explanatory", "sandbox": "read-only"},
+    "architect": {"style": "explanatory", "sandbox": "read-only"},
+    "debug":     {"style": "review",      "sandbox": "workspace-write"},
+    "ask":       {"style": "concise",     "sandbox": "read-only"},
+    "review":    {"style": "review",      "sandbox": "read-only"},
+    "security":  {"style": "security",    "sandbox": "read-only"},
+}
+
 
 def _expand_at_mentions(user_msg: str) -> str:
     """Find every @path token in the user message, resolve to a real file,
@@ -6526,6 +6627,11 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
         parts.append(
             f"<output_style name=\"{_ACTIVE_OUTPUT_STYLE}\">\n{style_text}\n</output_style>"
         )
+    # Aider-style repo map: shallow symbol table per file so the model
+    # has a real working memory of the project layout.
+    rmap = _build_repo_map(cwd)
+    if rmap:
+        parts.append(f"<repo_map>\n{rmap}\n</repo_map>")
     parts.append(
         "<environment name=\"joe shell\">\n"
         "You are running inside the `joe` interactive shell. You are the\n"
@@ -6977,6 +7083,7 @@ def run_turn(
 
 def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[str]) -> int:
     global _PENDING_CWD  # written by tool_cd(); flushed into state below
+    global _LLM_DETECTED, _ACTIVE_OUTPUT_STYLE, _SANDBOX_MODE
     cwd = Path.cwd()
     banner(model, cwd)
     # Best-effort: spin up any configured external MCP clients. Failures
@@ -7234,7 +7341,6 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                     pass
                 continue
             if cmd == "lora":
-                global _LLM_DETECTED
                 if not args or args == "status":
                     _LLM_DETECTED = None  # force re-detect
                     endpoint = _detect_llm()
@@ -8625,8 +8731,40 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                         console.print(f"[red]could not kill #{rest}[/]")
                     continue
                 cmd_task_show(sub); continue
+            if cmd == "mode":
+                sub = args.strip().lower()
+                if not sub:
+                    cur_style = _ACTIVE_OUTPUT_STYLE or "default"
+                    lines = [f"current: style={cur_style}  sandbox={_SANDBOX_MODE}"]
+                    lines.append("")
+                    for m, cfg in _MODES.items():
+                        lines.append(
+                            f"  /mode [bold]{m:<10}[/]  "
+                            f"style=[cyan]{cfg['style']}[/]  "
+                            f"sandbox=[yellow]{cfg['sandbox']}[/]"
+                        )
+                    panel(
+                        "Modes (Cline / Roo Code style)",
+                        Text.from_markup("\n".join(lines)),
+                        style="cyan",
+                        subtitle="/mode <name> to switch atomically",
+                    )
+                    continue
+                if sub not in _MODES:
+                    console.print(
+                        f"[red]unknown mode {sub!r}[/]; valid: "
+                        f"{', '.join(_MODES)}"
+                    )
+                    continue
+                cfg = _MODES[sub]
+                _ACTIVE_OUTPUT_STYLE = cfg["style"]
+                _SANDBOX_MODE = cfg["sandbox"]
+                console.print(
+                    f"[green]mode:[/] {sub}  "
+                    f"[dim](style={cfg['style']}, sandbox={cfg['sandbox']})[/]"
+                )
+                continue
             if cmd == "sandbox":
-                global _SANDBOX_MODE
                 sub = args.strip().lower()
                 if not sub:
                     console.print(
@@ -8647,7 +8785,6 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                 console.print(f"[green]sandbox:[/] {sub}")
                 continue
             if cmd in {"output-style", "outputstyle", "style"}:
-                global _ACTIVE_OUTPUT_STYLE
                 sub = args.strip()
                 if not sub or sub == "list":
                     names = list_output_styles()
