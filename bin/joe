@@ -55,6 +55,34 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
 
+def _import_required_or_die(module: str, extras: str = "") -> None:
+    """Catch ImportError on a hard-required dep and print a friendly install
+    hint pointing at the EXACT interpreter that's running joe right now.
+    Avoids the cryptic `ModuleNotFoundError: No module named 'X'` from a
+    venv that joe got picked up by (e.g. VS Code terminal in a project)."""
+    import importlib
+    try:
+        importlib.import_module(module)
+    except ImportError:
+        import sys
+        py = sys.executable
+        sibling = f" {extras}" if extras else ""
+        msg = (
+            f"\njoe: missing required Python module '{module}' for the "
+            f"interpreter at:\n  {py}\n\n"
+            f"Fix with:\n  {py} -m pip install --user {module}{sibling}\n\n"
+            f"This usually happens when joe is launched from a VS Code "
+            f"terminal that picked up a venv where joe's deps aren't "
+            f"installed. Either install the deps into that venv with the "
+            f"command above, OR deactivate the venv before running joe, "
+            f"OR launch joe from a non-VS Code terminal.\n"
+        )
+        sys.stderr.write(msg)
+        sys.exit(1)
+
+
+_import_required_or_die("rich", "prompt_toolkit")
+
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
@@ -432,6 +460,82 @@ def banner(model: str, cwd: Path) -> None:
         ),
     )
     console.print(Panel(body, border_style="cyan", padding=(0, 1)))
+    _orient(cwd)
+
+
+def _orient(cwd: Path) -> None:
+    """Print a short "I see you're in X" context line under the banner so
+    the user knows joe picked up the project. Skipped when cwd is HOME or
+    a non-project dir. Best-effort: every probe is wrapped so a broken
+    git checkout / unreadable README never blocks startup."""
+    try:
+        if cwd == HOME or cwd == Path("/"):
+            return
+        lines: list[str] = []
+        name = cwd.name
+        # Framework detection (Next.js, FastAPI, Cargo, Rails, etc.).
+        try:
+            framework = _detect_framework(cwd)
+        except Exception:
+            framework = ""
+        header = f"[bold]project:[/] [cyan]{name}[/]"
+        if framework:
+            header += f"  [dim]·[/]  [yellow]{framework}[/]"
+        lines.append(header)
+        # Git: branch + last commit subject + relative age.
+        if (cwd / ".git").exists():
+            try:
+                branch = subprocess.run(
+                    ["git", "-C", str(cwd), "rev-parse", "--abbrev-ref", "HEAD"],
+                    capture_output=True, text=True, timeout=2,
+                ).stdout.strip()
+                last = subprocess.run(
+                    ["git", "-C", str(cwd), "log", "-1", "--format=%s (%cr)"],
+                    capture_output=True, text=True, timeout=2,
+                ).stdout.strip()
+                dirty = subprocess.run(
+                    ["git", "-C", str(cwd), "status", "--porcelain"],
+                    capture_output=True, text=True, timeout=2,
+                ).stdout.strip()
+                dirty_tag = " [yellow](uncommitted changes)[/]" if dirty else ""
+                if branch:
+                    lines.append(
+                        f"[dim]git:[/]     [bold]{branch}[/] · {last}{dirty_tag}"
+                    )
+            except Exception:
+                pass
+        # README first non-empty, non-markdown-image line.
+        for readme in (cwd / "README.md", cwd / "readme.md", cwd / "README"):
+            if not readme.is_file():
+                continue
+            try:
+                text = readme.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                break
+            for raw in text.splitlines():
+                clean = raw.strip().lstrip("#").strip()
+                if not clean:
+                    continue
+                if clean.startswith("![") or clean.startswith("<img"):
+                    continue
+                if len(clean) > 110:
+                    clean = clean[:107] + "..."
+                lines.append(f"[dim]about:[/]   {clean}")
+                break
+            break
+        # Active LoRA endpoint if any (informational; nudge for /lora status).
+        endpoint = _detect_llm()
+        if endpoint:
+            lines.append(
+                f"[dim]llm:[/]     [green]mlx_lm.server[/] @ {endpoint} "
+                "[dim](/lora off to revert)[/]"
+            )
+        for ln in lines:
+            console.print(Text.from_markup(ln))
+        console.print()  # spacer before status line / prompt
+    except Exception:
+        # Orient is decorative; never block startup if anything breaks.
+        pass
 
 
 def panel(title: str, body, style: str = "white", subtitle: Optional[str] = None) -> None:
