@@ -160,6 +160,8 @@ TRAINING_DATA_DIR = STATE_DIR / "training-data"
 TRAINING_DATA_DIR.mkdir(parents=True, exist_ok=True)
 DEVELOPER_JOURNAL = STATE_DIR / "journal" / "developer-journal.md"
 MCP_CLIENTS_CONFIG = STATE_DIR / "mcp-clients.json"
+COMMANDS_DIR = STATE_DIR / "commands"
+HOOKS_DIR = STATE_DIR / "hooks"
 
 # Per-turn context, set by run_turn (and the @@agent dispatch) so tools like
 # write/edit can stamp provenance with the original user message + persona.
@@ -2882,7 +2884,8 @@ class ToolCall:
 #   block:         <tool_name attr="val">body</tool_name>
 TAG_PAT = re.compile(
     r"<(?P<name>read|write|edit|bash|cd|grep|glob|delegate|"
-    r"test|lint|build|web_search|web_fetch|plan|image|mcp)"
+    r"test|lint|build|web_search|web_fetch|plan|image|mcp|"
+    r"screen|click|type|key|open|clipboard)"
     # attrs: greedy any-char-but-> with a tail-trim of optional `/` so we still
     # detect self-closing tags. Previous version excluded `/` which broke
     # paths like `/tmp/foo`.
@@ -2901,7 +2904,8 @@ RUN_LEGACY_PAT = re.compile(r"^RUN:\s*(.+?)\s*$", re.MULTILINE)
 # happens to mention the tag name.
 OPENER_FALLBACK_PAT = re.compile(
     r"<(?P<name>read|write|edit|bash|cd|grep|glob|delegate|"
-    r"test|lint|build|web_search|web_fetch|plan|image|mcp)"
+    r"test|lint|build|web_search|web_fetch|plan|image|mcp|"
+    r"screen|click|type|key|open|clipboard)"
     r"(?P<attrs>\s+[^>]+?)\s*/?>"
     r"(?!.*</(?P=name)>)",  # only if there's no matching close downstream
     re.DOTALL,
@@ -2913,6 +2917,7 @@ OPENER_FALLBACK_PAT = re.compile(
 _KNOWN_TOOL_NAMES = (
     "read", "write", "edit", "bash", "cd", "grep", "glob", "delegate",
     "test", "lint", "build", "web_search", "web_fetch", "plan", "image", "mcp",
+    "screen", "click", "type", "key", "open", "clipboard",
 )
 
 
@@ -3298,6 +3303,328 @@ def tool_cd(attrs: dict, body: str) -> str:
 # block <grep pattern=".*"> and friends, which dump tens of thousands of
 # rows and crash the model's context window.
 _CATCHALL_GREP_PATTERNS = {".*", ".+", "^", "$", "^$", ".", "[^]", ""}
+
+
+# --------------------------------------------------------------------------
+# Agentic PC control
+# --------------------------------------------------------------------------
+# These tools let joe see and act on the host machine: screen capture +
+# attach as an image (joe-gemma is vision-capable), mouse click, keyboard
+# type, hotkeys, app launch, clipboard r/w. Each gated by _confirm with
+# the tool name so /trust grants are scoped (`/trust click` etc.).
+#
+# Implementation choices:
+#   - Screenshots use `screencapture -x` on macOS, `gnome-screenshot -f`
+#     or `scrot` on Linux. Falls back to a clear error if none present.
+#   - Mouse/keyboard use pyautogui when installed; otherwise the tool
+#     refuses with an install hint.
+#   - Clipboard uses pbpaste/pbcopy (macOS) or xclip / wl-copy (Linux).
+
+
+def _screencap(out_path: Path) -> tuple[bool, str]:
+    """Capture the primary screen to `out_path`. Returns (ok, message)."""
+    if shutil.which("screencapture"):  # macOS
+        cp = subprocess.run(
+            ["screencapture", "-x", str(out_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if cp.returncode == 0 and out_path.exists():
+            return True, f"captured to {out_path}"
+        return False, cp.stderr.strip() or "screencapture failed"
+    if shutil.which("gnome-screenshot"):
+        cp = subprocess.run(
+            ["gnome-screenshot", "-f", str(out_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if cp.returncode == 0 and out_path.exists():
+            return True, f"captured to {out_path}"
+        return False, cp.stderr.strip() or "gnome-screenshot failed"
+    if shutil.which("scrot"):
+        cp = subprocess.run(
+            ["scrot", str(out_path)],
+            capture_output=True, text=True, timeout=15,
+        )
+        if cp.returncode == 0 and out_path.exists():
+            return True, f"captured to {out_path}"
+        return False, cp.stderr.strip() or "scrot failed"
+    return False, (
+        "no screenshot tool found. install one of: macOS screencapture "
+        "(built-in), gnome-screenshot, or scrot."
+    )
+
+
+# --------------------------------------------------------------------------
+# Custom slash commands + hooks
+# --------------------------------------------------------------------------
+# ~/.joe-agent/commands/<name>.toml -- each one defines `/<name> [args]`.
+# ~/.joe-agent/hooks/<event>.sh    -- shell scripts fired on lifecycle events.
+#
+# Mirrors the surfaces Claude Code / Codex / OpenCode standardise on, so a
+# muscle-memory user lands on familiar ground.
+
+
+_CUSTOM_COMMANDS: dict[str, dict] = {}
+
+
+def load_custom_commands() -> dict[str, dict]:
+    """Read every TOML file in ~/.joe-agent/commands/. Return a dict keyed
+    by file stem with fields: description, template, model, allowed_tools.
+    Idempotent; safe to re-call on /commands reload."""
+    global _CUSTOM_COMMANDS
+    out: dict[str, dict] = {}
+    if not COMMANDS_DIR.is_dir():
+        _CUSTOM_COMMANDS = out
+        return out
+    try:
+        import tomllib
+    except ImportError:
+        return out
+    for f in sorted(COMMANDS_DIR.glob("*.toml")):
+        try:
+            data = tomllib.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if "template" not in data:
+            continue
+        out[f.stem] = {
+            "description": data.get("description", ""),
+            "template": data["template"],
+            "model": data.get("model"),
+            "allowed_tools": data.get("allowed_tools"),
+        }
+    _CUSTOM_COMMANDS = out
+    return out
+
+
+def render_custom_command(name: str, args: str) -> Optional[str]:
+    """If `name` matches a custom command, render its template with the
+    given args and return the resulting prompt. Else None.
+
+    Template substitutions:
+      {{args}}    the full args string
+      {{cwd}}     current working directory
+      {{date}}    YYYY-MM-DD
+    """
+    cmd = _CUSTOM_COMMANDS.get(name)
+    if not cmd:
+        return None
+    rendered = cmd["template"]
+    rendered = rendered.replace("{{args}}", args or "")
+    rendered = rendered.replace("{{cwd}}", str(Path.cwd()))
+    rendered = rendered.replace(
+        "{{date}}",
+        dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d"),
+    )
+    return rendered
+
+
+def _fire_hook(event: str, env_overrides: Optional[dict] = None) -> tuple[int, str]:
+    """Fire a hook script if one exists at ~/.joe-agent/hooks/<event>.sh.
+    Returns (exit_code, stderr) so the caller can act on the result.
+    pre_tool can return non-zero to BLOCK the tool call.
+
+    Hook scripts receive these env vars:
+      JOE_HOOK_EVENT        the event name ("pre_tool" etc.)
+      JOE_HOOK_TOOL         the tool name (for tool events)
+      JOE_HOOK_USER_MSG     the user message (for user_prompt + stop)
+      JOE_HOOK_CWD          current working directory
+      JOE_HOOK_SESSION      session id
+      JOE_HOOK_MODEL        model id
+
+    Best-effort: missing hook dir = no-op = exit 0.
+    """
+    script = HOOKS_DIR / f"{event}.sh"
+    if not script.is_file() or not os.access(script, os.X_OK):
+        return 0, ""
+    env = os.environ.copy()
+    env["JOE_HOOK_EVENT"] = event
+    env["JOE_HOOK_CWD"] = str(Path.cwd())
+    env["JOE_HOOK_SESSION"] = _TURN_CTX.get("session", "")
+    env["JOE_HOOK_MODEL"] = _TURN_CTX.get("model", "")
+    env["JOE_HOOK_USER_MSG"] = _TURN_CTX.get("user_msg", "")[:4000]
+    if env_overrides:
+        env.update({k: str(v) for k, v in env_overrides.items()})
+    try:
+        cp = subprocess.run(
+            [str(script)], capture_output=True, text=True,
+            env=env, timeout=15,
+        )
+        return cp.returncode, (cp.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "hook timed out after 15s"
+    except Exception as e:
+        return 1, str(e)
+
+
+def tool_screen(attrs: dict, body: str) -> str:
+    """Capture the screen and attach it as an image for the next turn.
+    joe-gemma (gemma3-4b) is vision-capable, so the model will literally
+    see the screen on its next response. No confirm: read-only side
+    effect on the user's display (a flash for the capture)."""
+    out_path = STATE_DIR / "screenshots"
+    out_path.mkdir(exist_ok=True)
+    fname = out_path / f"screen-{dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.png"
+    ok, msg = _screencap(fname)
+    if not ok:
+        raise ToolError(f"<screen>: {msg}")
+    # Hand to the same pipeline that <image> uses so the next model call
+    # gets it as an image attachment.
+    _pending_images.append(str(fname))
+    panel(
+        f"Screen captured -> {fname.name}",
+        Text(f"{fname.stat().st_size // 1024} KB · attached to next turn",
+             style="dim"),
+        style="bright_blue",
+    )
+    return f"screen captured ({fname}); model will see it on the next turn"
+
+
+def _require_pyautogui() -> "Any":
+    try:
+        import pyautogui
+        return pyautogui
+    except ImportError:
+        raise ToolError(
+            "pyautogui not installed. Add it with:\n"
+            "  pip install --user pyautogui\n"
+            "On Linux you may also need: sudo apt install python3-tk python3-dev"
+        )
+
+
+def tool_click(attrs: dict, body: str, confirm: bool = True) -> str:
+    """Move + click at (x, y). Optional `button` (left|right|middle) and
+    `clicks` (default 1)."""
+    try:
+        x = int(attrs.get("x", "")); y = int(attrs.get("y", ""))
+    except ValueError:
+        raise ToolError("<click x=N y=N /> -- both x and y must be integers")
+    button = attrs.get("button", "left")
+    clicks = int(attrs.get("clicks", "1"))
+    pyautogui = _require_pyautogui()
+    panel(f"Click ({x}, {y}) {button} x{clicks}", "", style="magenta")
+    if confirm and not _confirm(f"Click at ({x}, {y})?", tool="click"):
+        return "user denied click"
+    try:
+        pyautogui.click(x, y, clicks=clicks, button=button)
+    except Exception as e:
+        raise ToolError(f"<click>: {type(e).__name__}: {e}")
+    return f"clicked ({x}, {y}) {button} x{clicks}"
+
+
+def tool_type(attrs: dict, body: str, confirm: bool = True) -> str:
+    """Type a literal string at the current focus."""
+    text = body
+    if not text:
+        raise ToolError("<type>text</type> -- body is empty")
+    pyautogui = _require_pyautogui()
+    preview = text if len(text) < 80 else text[:77] + "..."
+    panel(f"Type ({len(text)} chars)", Text(preview), style="magenta")
+    if confirm and not _confirm(f"Type {len(text)} chars at focus?", tool="type"):
+        return "user denied type"
+    try:
+        pyautogui.typewrite(text, interval=0.01)
+    except Exception as e:
+        raise ToolError(f"<type>: {type(e).__name__}: {e}")
+    return f"typed {len(text)} chars"
+
+
+def tool_key(attrs: dict, body: str, confirm: bool = True) -> str:
+    """Press a key combo. Body is a string like 'cmd+c', 'enter', 'ctrl+w'."""
+    combo = body.strip()
+    if not combo:
+        raise ToolError("<key>combo</key> -- body is empty")
+    pyautogui = _require_pyautogui()
+    panel(f"Key: {combo}", "", style="magenta")
+    if confirm and not _confirm(f"Press {combo}?", tool="key"):
+        return "user denied key"
+    parts = [k.strip().lower() for k in combo.replace("-", "+").split("+") if k.strip()]
+    try:
+        if len(parts) > 1:
+            pyautogui.hotkey(*parts)
+        elif len(parts) == 1:
+            pyautogui.press(parts[0])
+        else:
+            raise ToolError("<key>: empty combo")
+    except Exception as e:
+        raise ToolError(f"<key>: {type(e).__name__}: {e}")
+    return f"pressed {combo}"
+
+
+def tool_open(attrs: dict, body: str, confirm: bool = True) -> str:
+    """Open an app or URL via the platform launcher (`open` on macOS,
+    `xdg-open` on Linux). Body or `target` attr is the thing to launch."""
+    target = (attrs.get("target") or body or "").strip()
+    if not target:
+        raise ToolError("<open>app-or-url</open> -- empty target")
+    launcher = (
+        "open" if shutil.which("open") else
+        "xdg-open" if shutil.which("xdg-open") else
+        "start" if shutil.which("start") else None
+    )
+    if not launcher:
+        raise ToolError("<open>: no launcher found (open / xdg-open / start)")
+    panel(f"Open: {target}", "", style="magenta")
+    if confirm and not _confirm(f"Open {target}?", tool="open"):
+        return "user denied open"
+    try:
+        subprocess.run([launcher, target], timeout=10)
+    except Exception as e:
+        raise ToolError(f"<open>: {type(e).__name__}: {e}")
+    return f"opened {target}"
+
+
+def tool_clipboard(attrs: dict, body: str, confirm: bool = True) -> str:
+    """Read or write the system clipboard.
+        <clipboard op="get" />          -> returns current contents
+        <clipboard op="set">text</clipboard>  -> writes text
+    """
+    op = (attrs.get("op", "get") or "get").lower()
+    if op == "get":
+        for binname in ("pbpaste", "xclip", "wl-paste"):
+            bp = shutil.which(binname)
+            if bp:
+                args = [bp]
+                if binname == "xclip":
+                    args.extend(["-selection", "clipboard", "-o"])
+                cp = subprocess.run(args, capture_output=True, text=True, timeout=5)
+                if cp.returncode == 0:
+                    out = cp.stdout
+                    panel("Clipboard get",
+                          Text(out[:600] + ("..." if len(out) > 600 else ""),
+                               style="dim"),
+                          style="bright_blue",
+                          subtitle=f"{len(out)} chars")
+                    return out
+        raise ToolError(
+            "<clipboard get>: no clipboard reader on PATH (pbpaste / xclip / wl-paste)"
+        )
+    if op == "set":
+        text = body
+        if not text:
+            raise ToolError("<clipboard op=\"set\">text</clipboard> -- body empty")
+        panel("Clipboard set",
+              Text(text[:200] + ("..." if len(text) > 200 else ""),
+                   style="dim"),
+              style="magenta")
+        if confirm and not _confirm(
+            f"Replace clipboard with {len(text)} chars?", tool="clipboard",
+        ):
+            return "user denied clipboard set"
+        for binname in ("pbcopy", "xclip", "wl-copy"):
+            bp = shutil.which(binname)
+            if bp:
+                args = [bp]
+                if binname == "xclip":
+                    args.extend(["-selection", "clipboard"])
+                try:
+                    subprocess.run(args, input=text, text=True, timeout=5, check=True)
+                except subprocess.CalledProcessError as e:
+                    raise ToolError(f"<clipboard set>: {e}")
+                return f"clipboard set ({len(text)} chars)"
+        raise ToolError(
+            "<clipboard set>: no clipboard writer on PATH (pbcopy / xclip / wl-copy)"
+        )
+    raise ToolError(f"<clipboard op=\"{op}\">: unknown op (use 'get' or 'set')")
 
 
 def tool_grep(attrs: dict, body: str) -> str:
@@ -4431,7 +4758,7 @@ SLASH_COMMAND_NAMES = (
     "help", "exit", "quit", "cwd", "cd", "model", "coder", "lora",
     "clear", "save", "load", "voice",
     "sessions", "whoami", "cost", "compact", "yolo", "trust", "doctor",
-    "blame", "passport", "council",
+    "blame", "passport", "council", "commands",
     "read", "run", "diff", "copy", "history", "undo", "redo",
     "plan", "test", "lint", "build", "explain", "profile",
     "commit", "push", "pr", "issue", "snap",
@@ -5214,6 +5541,20 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
         "  <web_fetch url=\"...\" />           fetch + strip HTML to text\n"
         "  <plan title=\"...\">numbered steps</plan>  trigger plan mode\n"
         "\n"
+        "Agentic PC control (each prompts for confirm; /trust <tool> to\n"
+        "grant blanket approval for the session):\n"
+        "  <screen />                  capture the screen; attached to the\n"
+        "                              NEXT turn as an image (joe-gemma is\n"
+        "                              vision-capable, will see it directly).\n"
+        "                              Use this BEFORE <click> so you know\n"
+        "                              where to aim.\n"
+        "  <click x=\"N\" y=\"N\" button=\"left|right|middle\" clicks=\"1\" />\n"
+        "  <type>literal text to type</type>\n"
+        "  <key>cmd+c</key>            hotkey or single key like 'enter'\n"
+        "  <open>app-name OR url</open>     launches via system opener\n"
+        "  <clipboard op=\"get\" />          read system clipboard\n"
+        "  <clipboard op=\"set\">text</clipboard>   write system clipboard\n"
+        "\n"
         "Plan mode: if the task touches multiple files or has independent\n"
         "phases, emit a <plan> tag with one step per numbered line. The\n"
         "shell will display the plan, ask the user to approve, then drive\n"
@@ -5336,6 +5677,16 @@ def run_turn(
         model=model,
         coder=coder_model,
     )
+    # user_prompt hook: fires BEFORE the model sees the prompt. Non-zero
+    # exit silently cancels the turn (use sparingly -- mainly for content
+    # filters, prompt injection guards).
+    up_rc, up_err = _fire_hook("user_prompt")
+    if up_rc != 0:
+        console.print(
+            f"[yellow]user_prompt hook blocked turn (exit {up_rc}): "
+            f"{up_err.strip()[:200]}[/]"
+        )
+        return
     prompt = _initial_prompt(user_msg, cwd, session)
     full_response_chunks: list[str] = []
     last_call_signature: Optional[str] = None
@@ -5377,6 +5728,27 @@ def run_turn(
             same_call_count = 0
             last_call_signature = sig
 
+        # Pre-tool hook: if the user has a ~/.joe-agent/hooks/pre_tool.sh
+        # and it exits non-zero, BLOCK the tool call and feed the hook's
+        # stderr back to the model as the tool result.
+        pre_rc, pre_err = _fire_hook("pre_tool", {
+            "JOE_HOOK_TOOL": call.name,
+            "JOE_HOOK_TOOL_ARGS": json.dumps(call.attrs)[:2000],
+            "JOE_HOOK_TOOL_BODY": call.body[:4000],
+        })
+        if pre_rc != 0:
+            result = (
+                f"BLOCKED by pre_tool hook (exit {pre_rc}). "
+                f"{pre_err.strip()[:400] if pre_err else ''}"
+            )
+            console.print(f"[yellow]pre_tool hook blocked <{call.name}>: {pre_err.strip()[:200]}[/]")
+            prompt = (
+                response
+                + f"\n\n<tool_result name=\"{call.name}\">\n{result}\n</tool_result>\n"
+                + "The user's pre_tool hook refused this call. Pick a different "
+                + "approach or output STOP: <reason>."
+            )
+            continue
         # Execute the call. ToolError gets reflected back to the model.
         try:
             if call.name == "read":
@@ -5409,6 +5781,18 @@ def run_turn(
                 result = tool_image(call.attrs, call.body)
             elif call.name == "mcp":
                 result = tool_mcp(call.attrs, call.body)
+            elif call.name == "screen":
+                result = tool_screen(call.attrs, call.body)
+            elif call.name == "click":
+                result = tool_click(call.attrs, call.body)
+            elif call.name == "type":
+                result = tool_type(call.attrs, call.body)
+            elif call.name == "key":
+                result = tool_key(call.attrs, call.body)
+            elif call.name == "open":
+                result = tool_open(call.attrs, call.body)
+            elif call.name == "clipboard":
+                result = tool_clipboard(call.attrs, call.body)
             elif call.name == "plan":
                 # Don't execute inline; hand back to the user so they can
                 # approve. The model will see this as "plan acknowledged".
@@ -5425,6 +5809,16 @@ def run_turn(
         except Exception as e:
             console.print(f"[red]Tool crashed:[/] {e}")
             result = f"ERROR: {e}"
+
+        # Post-tool hook: fires regardless of success/failure with the
+        # result piped via env var (truncated). Doesn't block; non-zero
+        # exit just logs.
+        post_rc, post_err = _fire_hook("post_tool", {
+            "JOE_HOOK_TOOL": call.name,
+            "JOE_HOOK_TOOL_RESULT": (result or "")[:4000],
+        })
+        if post_rc != 0 and post_err:
+            console.print(f"[dim]post_tool hook exit {post_rc}: {post_err.strip()[:120]}[/]")
 
         # Reflect tool result to the model.
         if len(result) > 4000:
@@ -5470,6 +5864,9 @@ def run_turn(
         console.print(f"[yellow]Hit {max_turns}-turn tool-loop cap. Stopping.[/]")
 
     full = "\n".join(full_response_chunks)
+    # stop hook: fires after the turn is complete (success or capped). Gets
+    # the user_msg + full response via env. Non-blocking.
+    _fire_hook("stop", {"JOE_HOOK_RESPONSE": full[:8000]})
     if session:
         session_append(session, "user", user_msg)
         session_append(session, "assistant", full)
@@ -5500,6 +5897,13 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
     # Best-effort: spin up any configured external MCP clients. Failures
     # are printed inline and don't block REPL start.
     _mcp_connect_all()
+    # Load file-defined custom slash commands (Claude-Code-style).
+    cmds = load_custom_commands()
+    if cmds:
+        console.print(
+            f"[dim]loaded {len(cmds)} custom command(s): "
+            f"{', '.join('/' + n for n in cmds)}[/]"
+        )
     state = {
         "model": model,
         "coder": coder_model,
@@ -7090,6 +7494,45 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                         console.print(f"[red]could not kill #{rest}[/]")
                     continue
                 cmd_task_show(sub); continue
+            if cmd == "commands":
+                sub = args.strip()
+                if sub == "reload":
+                    cmds = load_custom_commands()
+                    console.print(
+                        f"[dim]reloaded {len(cmds)} custom commands[/]"
+                    )
+                    continue
+                cmds = _CUSTOM_COMMANDS
+                if not cmds:
+                    console.print(
+                        f"[dim]no custom commands. drop *.toml into {COMMANDS_DIR}[/]"
+                    )
+                else:
+                    lines = [
+                        f"/{n}  [dim]{cmds[n].get('description', '')}[/]"
+                        for n in sorted(cmds)
+                    ]
+                    panel(
+                        "Custom commands",
+                        Text.from_markup("\n".join(lines)),
+                        style="cyan",
+                        subtitle=str(COMMANDS_DIR),
+                    )
+                continue
+            # Custom command dispatch (file-defined templates). Runs LAST so
+            # built-in commands always win.
+            rendered = render_custom_command(cmd, args)
+            if rendered is not None:
+                console.print(
+                    f"[dim]running /{cmd} from {COMMANDS_DIR / (cmd + '.toml')}[/]"
+                )
+                run_turn(
+                    model=state["model"], coder_model=state["coder"],
+                    user_msg=rendered, cwd=state["cwd"],
+                    session=state["session"], allow_all_bash=allow_all_bash,
+                    max_turns=MAX_AUTO_TURNS,
+                )
+                continue
             console.print(f"[red]unknown command:[/] /{cmd} ([dim]/help[/])")
             continue
 
