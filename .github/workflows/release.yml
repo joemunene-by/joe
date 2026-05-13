@@ -1,0 +1,53 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio
+      - name: Run tests
+        run: pytest tests/ --tb=short
+      - name: Build release notes from commits since last tag
+        id: notes
+        run: |
+          set -euo pipefail
+          CURRENT_TAG="${GITHUB_REF##*/}"
+          PREV_TAG="$(git describe --tags --abbrev=0 "${CURRENT_TAG}^" 2>/dev/null || echo '')"
+          {
+            echo "## Changes in ${CURRENT_TAG}"
+            echo ""
+            if [ -n "$PREV_TAG" ]; then
+              echo "Commits since \`${PREV_TAG}\`:"
+              echo ""
+              git log --pretty=format:'- %s (%h)' "${PREV_TAG}..${CURRENT_TAG}"
+            else
+              echo "Initial release."
+            fi
+          } > release-notes.md
+          cat release-notes.md
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT_TAG="${GITHUB_REF##*/}"
+          gh release create "$CURRENT_TAG" \
+            --title "$CURRENT_TAG" \
+            --notes-file release-notes.md

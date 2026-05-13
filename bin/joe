@@ -79,6 +79,13 @@ except ImportError:
 # --------------------------------------------------------------------------
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
+# When set, route /chat through this OpenAI-compatible endpoint (mlx_lm.server,
+# vLLM, etc.) instead of ollama. Leave empty to auto-detect mlx_lm.server on
+# :8081, fall back to ollama on :11434.
+LLM_BASE_URL = os.environ.get("JOE_LLM_BASE_URL", "").rstrip("/")
+# Cached endpoint detection ("" = ollama, URL = mlx-style /v1 endpoint).
+# None means "not probed yet"; cleared by /lora on|off and on fresh REPL.
+_LLM_DETECTED: Optional[str] = None
 # JOE_DEFAULT_MODEL lets `joe train activate` swap in a freshly-built model
 # (e.g. joe-gemma:v20260512) without editing this file.
 DEFAULT_MODEL = os.environ.get("JOE_DEFAULT_MODEL", "joe-gemma")
@@ -464,7 +471,7 @@ def session_recall(name: str, max_pairs: int = 12) -> str:
 def session_append(name: str, role: str, content: str) -> None:
     c = _db()
     c.execute("INSERT INTO turns (session, ts, role, content) VALUES (?, ?, ?, ?)",
-              (name, dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat(), role, content))
+              (name, dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(), role, content))
     c.commit(); c.close()
 
 
@@ -504,7 +511,7 @@ def _load_blob(h: str) -> str:
 def log_edit(path: str, before: Optional[str], after: str, op: str, note: str = "") -> None:
     """Append an entry to the edit log. before=None for new files."""
     entry = {
-        "ts": dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat(),
+        "ts": dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(),
         "path": str(_resolve_path(path)),
         "before_blob": _store_blob(before) if before is not None else None,
         "after_blob": _store_blob(after),
@@ -543,7 +550,7 @@ def cmd_history(limit: int = 15) -> None:
         panel("Edit history", "(no edits yet)", style="dim")
         return
     rows: list[str] = []
-    now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     for i, e in enumerate(reversed(entries[-limit:])):
         ts = dt.datetime.fromisoformat(e["ts"])
         age = now - ts
@@ -669,7 +676,7 @@ def provenance_record(
             " user_msg, line_start, line_end, adds, dels, before_blob, after_blob)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat(),
+                dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(),
                 str(path),
                 op,
                 _TURN_CTX.get("session", ""),
@@ -786,7 +793,7 @@ def lesson_capture(source: str, rejected: str, note: str = "") -> None:
             "INSERT INTO events (ts, source, session, model, agent, user_msg,"
             " rejected, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat(),
+                dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(),
                 source,
                 _TURN_CTX.get("session", ""),
                 _TURN_CTX.get("model", ""),
@@ -838,7 +845,7 @@ def lessons_distill(model: str) -> int:
     """Read recent (last 14 days) events, ask the model to distill rules,
     insert new ones into the rules table, return the count added."""
     c = _lessdb()
-    cutoff = (dt.datetime.now(dt.UTC).replace(tzinfo=None) - dt.timedelta(days=14)).isoformat()
+    cutoff = (dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) - dt.timedelta(days=14)).isoformat()
     events = c.execute(
         "SELECT source, user_msg, rejected, note FROM events"
         " WHERE ts > ? ORDER BY ts DESC LIMIT 60",
@@ -882,7 +889,7 @@ def lessons_distill(model: str) -> int:
             c.execute(
                 "INSERT INTO rules (ts, rule, source_event_count, status)"
                 " VALUES (?, ?, ?, 'active')",
-                (dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat(),
+                (dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(),
                  cand, len(events)),
             )
             added += 1
@@ -965,7 +972,7 @@ def kg_remember(session: str, model: str, user_msg: str, asst_msg: str) -> None:
         return
     try:
         c = _kgdb()
-        ts = dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat()
+        ts = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat()
         for t in triples:
             c.execute(
                 "INSERT INTO triples (ts, subject, relation, object, session)"
@@ -1180,7 +1187,7 @@ def cmd_reflect(model: str) -> int:
     # Lessons captured today.
     try:
         c = _lessdb()
-        cutoff = (dt.datetime.now(dt.UTC).replace(tzinfo=None)
+        cutoff = (dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
                   - dt.timedelta(hours=24)).isoformat()
         events = c.execute(
             "SELECT source, user_msg, rejected FROM events"
@@ -1198,7 +1205,7 @@ def cmd_reflect(model: str) -> int:
     # Counts of writes/edits today.
     try:
         c = _provdb()
-        cutoff = (dt.datetime.now(dt.UTC).replace(tzinfo=None)
+        cutoff = (dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
                   - dt.timedelta(hours=24)).isoformat()
         n_writes = c.execute(
             "SELECT COUNT(*) FROM provenance WHERE ts > ? AND op = 'write'",
@@ -1556,7 +1563,7 @@ def cmd_eval(args: list[str], default_model: str) -> int:
             console.print("[red]embedding failed (is nomic-embed-text installed?)[/]")
             return 1
         c = _evaldb()
-        ts = dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat()
+        ts = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat()
         c.execute(
             "INSERT INTO eval_set (ts_built, session, user_msg, gold_asst, gold_embed)"
             " VALUES (?, ?, ?, ?, ?)",
@@ -1588,7 +1595,7 @@ def cmd_eval(args: list[str], default_model: str) -> int:
             return 1
         c = _evaldb()
         c.execute("DELETE FROM eval_set")
-        ts = dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat()
+        ts = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat()
         added = 0
         for sess, um, am in pairs:
             vec = _embed(am[:EMBED_INPUT_MAX_CHARS])
@@ -1615,7 +1622,7 @@ def cmd_eval(args: list[str], default_model: str) -> int:
         if not items:
             console.print("[red]eval set empty; run `joe eval build` first[/]")
             return 1
-        ts = dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat()
+        ts = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat()
         scores: list[float] = []
         c = _evaldb()
         for eid, um, ge in items:
@@ -1742,7 +1749,7 @@ def cmd_train(args: list[str], default_model: str) -> int:
             le.close()
         except Exception:
             pass
-        ts_str = dt.datetime.now(dt.UTC).replace(tzinfo=None).strftime("%Y%m%d-%H%M%S")
+        ts_str = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).strftime("%Y%m%d-%H%M%S")
         out_path = TRAINING_DATA_DIR / f"jsonl-{ts_str}.jsonl"
         n = 0
         with out_path.open("w") as f:
@@ -2260,7 +2267,7 @@ def _task_watch(tid: str, proc: subprocess.Popen) -> None:
     data = _task_load(tid) or {}
     data["status"] = "finished" if exit_code == 0 else "failed"
     data["exit_code"] = exit_code
-    data["finished"] = dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat()
+    data["finished"] = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat()
     _task_save(tid, data)
     _task_notify(data)
 
@@ -2277,7 +2284,7 @@ def task_spawn(cmd: str, cwd: Path, label: str = "") -> dict:
     )
     data = {
         "id": tid, "cmd": cmd, "pid": proc.pid, "status": "running",
-        "started": dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat(), "finished": None,
+        "started": dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(), "finished": None,
         "exit_code": None, "cwd": str(cwd), "label": label,
     }
     _task_save(tid, data)
@@ -2321,7 +2328,7 @@ def cmd_tasks(state_unused=None) -> None:
     rows = task_list()
     if not rows:
         panel("Background tasks", "(no tasks yet)", style="dim"); return
-    now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     lines: list[str] = []
     for d in rows[-12:]:
         started = dt.datetime.fromisoformat(d["started"])
@@ -2438,7 +2445,7 @@ def history_remember(session: str, user_msg: str, asst_msg: str) -> None:
     c.execute(
         "INSERT INTO hist (session, ts, user_msg, asst_msg, embed)"
         " VALUES (?, ?, ?, ?, ?)",
-        (session, dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat(),
+        (session, dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(),
          user_msg[:4000], asst_msg[:4000], _pack_vec(vec)),
     )
     c.commit(); c.close()
@@ -2452,7 +2459,7 @@ def _parse_time_phrase(query: str) -> tuple[Optional[str], Optional[str], str]:
     stripped if we matched one. Best-effort; misses fall back to no
     time filter.
     """
-    now = dt.datetime.now(dt.UTC).replace(tzinfo=None)
+    now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     patterns: list[tuple[str, dt.datetime, Optional[dt.datetime]]] = [
         # phrase                         since                              until
@@ -3703,7 +3710,81 @@ def _confirm(question: str) -> bool:
 # --------------------------------------------------------------------------
 
 
+def _detect_llm() -> str:
+    """Return base URL of an OpenAI-compatible LLM endpoint when one is
+    reachable, else "" meaning use the ollama default.
+
+    Priority:
+      1. $JOE_LLM_BASE_URL (explicit override; trusted, no probe)
+      2. mlx_lm.server on http://127.0.0.1:8081/v1 (probed)
+      3. "" (ollama on :11434)
+
+    Cached after first call; clear by setting joe_module._LLM_DETECTED = None
+    or via the /lora slash command.
+    """
+    global _LLM_DETECTED
+    if _LLM_DETECTED is not None:
+        return _LLM_DETECTED
+    if LLM_BASE_URL:
+        _LLM_DETECTED = LLM_BASE_URL
+        return _LLM_DETECTED
+    try:
+        with urllib.request.urlopen(
+            "http://127.0.0.1:8081/v1/models", timeout=0.4,
+        ) as r:
+            if r.status == 200:
+                _LLM_DETECTED = "http://127.0.0.1:8081/v1"
+                return _LLM_DETECTED
+    except Exception:
+        pass
+    _LLM_DETECTED = ""
+    return ""
+
+
+def _mlx_resolve_model(model: str, base: str) -> str:
+    """mlx_lm.server identifies models by their full filesystem path. If
+    the user passed a short tag ('joe-gemma', 'mlx', etc.), pick the first
+    available LoRA-fused model on the server."""
+    if model.startswith("/") or "/" in model and not model.startswith("joe-gemma"):
+        return model
+    try:
+        with urllib.request.urlopen(f"{base}/models", timeout=2) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return model
+    entries = data.get("data") or []
+    for e in entries:
+        mid = e.get("id", "")
+        if "lora" in mid.lower() or "/fused" in mid:
+            return mid
+    return entries[0]["id"] if entries else model
+
+
+def _mlx_server_once(model: str, prompt: str, base: str, timeout: int) -> str:
+    """One-shot non-streaming call to mlx_lm.server /v1/chat/completions."""
+    body = {
+        "model": _mlx_resolve_model(model, base),
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 4096,
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read())
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"mlx_lm.server response malformed: {e}; raw={data}")
+
+
 def _ollama_once(model: str, prompt: str, timeout: int = 600) -> str:
+    base = _detect_llm()
+    if base:
+        return _mlx_server_once(model, prompt, base, timeout)
     body = {"model": model, "prompt": prompt, "stream": False, "think": False}
     images = _drain_image_base64()
     if images:
@@ -3717,6 +3798,65 @@ def _ollama_once(model: str, prompt: str, timeout: int = 600) -> str:
         return json.loads(r.read())["response"]
 
 
+def _mlx_server_stream_to_console(model: str, prompt: str, base: str) -> str:
+    """Stream tokens to console from mlx_lm.server's OpenAI-style SSE."""
+    body = {
+        "model": _mlx_resolve_model(model, base),
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 4096,
+        "stream": True,
+    }
+    req = urllib.request.Request(
+        f"{base}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+    )
+    buf: list[str] = []
+    with console.status(
+        Text.from_markup(f"[bold cyan]{model}[/] is thinking..."),
+        spinner="dots",
+        spinner_style="cyan",
+    ) as status:
+        try:
+            resp = urllib.request.urlopen(req, timeout=600)
+        except Exception as e:
+            console.print(f"[red]mlx_lm.server call failed:[/] {e}")
+            raise
+        first_token_seen = False
+        for raw in resp:
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if not line or not line.startswith("data: "):
+                continue
+            payload = line[len("data: "):].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            try:
+                tok = obj["choices"][0]["delta"].get("content", "")
+            except (KeyError, IndexError):
+                tok = ""
+            if tok:
+                if not first_token_seen:
+                    status.stop()
+                    console.print(f"[bold cyan]{model}:[/]", end=" ")
+                    first_token_seen = True
+                console.print(tok, end="", soft_wrap=True)
+                sys.stdout.flush()
+                buf.append(tok)
+            try:
+                if obj["choices"][0].get("finish_reason"):
+                    break
+            except (KeyError, IndexError):
+                pass
+        resp.close()
+    if buf:
+        console.print()
+    return "".join(buf)
+
+
 def _ollama_stream_to_console(model: str, prompt: str) -> str:
     """Stream tokens to the console, Claude-Code-style.
 
@@ -3724,6 +3864,9 @@ def _ollama_stream_to_console(model: str, prompt: str) -> str:
     first non-empty token arrives, then it's replaced by a streaming label
     and the tokens print as they come. Returns the full text.
     """
+    base = _detect_llm()
+    if base:
+        return _mlx_server_stream_to_console(model, prompt, base)
     body = {"model": model, "prompt": prompt, "stream": True, "think": False}
     images = _drain_image_base64()
     if images:
@@ -3775,7 +3918,8 @@ def _ollama_stream_to_console(model: str, prompt: str) -> str:
 
 
 SLASH_COMMAND_NAMES = (
-    "help", "exit", "quit", "cwd", "model", "coder", "clear", "save", "load",
+    "help", "exit", "quit", "cwd", "cd", "model", "coder", "lora",
+    "clear", "save", "load", "voice",
     "sessions", "whoami", "cost", "compact", "yolo", "doctor",
     "read", "run", "diff", "copy", "history", "undo", "redo",
     "plan", "test", "lint", "build", "explain", "profile",
@@ -5047,6 +5191,56 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                     state["coder"] = args
                 console.print(f"[dim]coder-delegate: {state['coder']}[/]")
                 continue
+            if cmd == "voice":
+                # Press-to-talk: invokes joe-voice in --once mode so this
+                # one user turn comes from the mic, plays the response.
+                voice_bin = shutil.which("joe-voice")
+                if not voice_bin:
+                    console.print(
+                        "[red]/voice: joe-voice not on PATH[/]; "
+                        "install with the repo's install.sh"
+                    )
+                    continue
+                voice_cmd = [voice_bin, "--once"]
+                if args:
+                    voice_cmd.extend(args.split())
+                try:
+                    subprocess.run(voice_cmd, check=False)
+                except KeyboardInterrupt:
+                    pass
+                continue
+            if cmd == "lora":
+                global _LLM_DETECTED
+                if not args or args == "status":
+                    _LLM_DETECTED = None  # force re-detect
+                    endpoint = _detect_llm()
+                    if endpoint:
+                        console.print(
+                            f"[dim]LoRA endpoint:[/] [green]{endpoint}[/] "
+                            "[dim](mlx_lm.server)[/]"
+                        )
+                    else:
+                        console.print(
+                            f"[dim]LoRA endpoint:[/] [yellow]ollama[/] "
+                            f"[dim]({OLLAMA_URL})[/]"
+                        )
+                    continue
+                if args == "on":
+                    _LLM_DETECTED = "http://127.0.0.1:8081/v1"
+                    os.environ["JOE_LLM_BASE_URL"] = _LLM_DETECTED
+                    console.print(
+                        f"[green]LoRA on[/] -> {_LLM_DETECTED}. "
+                        "Run [bold]joe-lora-serve[/] in another shell if "
+                        "the server isn't up; ollama will stop while it runs."
+                    )
+                    continue
+                if args == "off":
+                    _LLM_DETECTED = ""
+                    os.environ.pop("JOE_LLM_BASE_URL", None)
+                    console.print("[yellow]LoRA off[/]; using ollama")
+                    continue
+                console.print("[red]/lora on|off|status[/]")
+                continue
             if cmd == "clear":
                 console.clear()
                 state["session"] = f"joe-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -5473,13 +5667,13 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                 c.execute("DELETE FROM turns WHERE session = ?", (state["session"],))
                 c.execute(
                     "INSERT INTO turns (session, ts, role, content) VALUES (?, ?, ?, ?)",
-                    (state["session"], dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat(),
+                    (state["session"], dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(),
                      "system", f"[earlier-history-summary]\n{summary}"),
                 )
                 for r, ct in rows[cut:]:
                     c.execute(
                         "INSERT INTO turns (session, ts, role, content) VALUES (?, ?, ?, ?)",
-                        (state["session"], dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat(), r, ct),
+                        (state["session"], dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(), r, ct),
                     )
                 c.commit(); c.close()
                 panel(
@@ -6034,7 +6228,7 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                         c.execute(
                             "INSERT INTO rules (ts, rule, status)"
                             " VALUES (?, ?, 'active')",
-                            (dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat(),
+                            (dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(),
                              rest[:200]),
                         )
                         c.commit()
@@ -6115,7 +6309,7 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                     safe = json.dumps(steps)  # legal in toml as a json-ish array
                     body = (
                         f'name = "{name}"\n'
-                        f'created = "{dt.datetime.now(dt.UTC).replace(tzinfo=None).isoformat()}"\n'
+                        f'created = "{dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat()}"\n'
                         f'steps = {safe}\n'
                     )
                     p.write_text(body)

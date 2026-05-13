@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""joe-voice: press-to-talk voice loop around joe.
+
+The complement to joe-wake (always-on wake-word daemon). joe-voice is
+the explicit-trigger version: you press Enter, you talk, joe answers,
+you hear the answer, you press Enter again. Useful when you don't want
+a mic permanently hot or when you're somewhere noisy.
+
+Pipeline per round:
+  1. Prompt for Enter.
+  2. joe-listen with VAD (default 12s cap) -> transcription.
+  3. joe -p <transcription>  -> response text.
+  4. joe-speak <response>    -> audio out.
+  5. Loop.
+
+Flags:
+  --once             quit after one round (handy for scripts / hotkeys)
+  --model NAME       joe -p --model NAME override (defaults to JOE_DEFAULT_MODEL)
+  --listen-args "X"  forwarded verbatim to joe-listen (e.g. "--duration 8")
+  --voice NAME       forwarded to joe-speak --voice (macOS) or piper voice
+  --no-speak         skip TTS, just print the response
+  --no-listen        skip STT, just type the prompt (useful for testing)
+
+Stop with Ctrl-C. If joe-listen / joe-speak aren't on PATH, the round
+falls back to typing/printing for that step instead of crashing.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from typing import Optional
+
+
+def _which(name: str) -> Optional[str]:
+    return shutil.which(name)
+
+
+def _capture(cmd: list[str], stdin: Optional[str] = None,
+             timeout: int = 60) -> tuple[int, str, str]:
+    """Run cmd, return (returncode, stdout, stderr). Decoded text."""
+    try:
+        cp = subprocess.run(
+            cmd, input=stdin, capture_output=True, text=True,
+            timeout=timeout,
+        )
+        return cp.returncode, cp.stdout or "", cp.stderr or ""
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{cmd[0]}: timed out after {timeout}s"
+
+
+def listen_round(listen_args: str) -> str:
+    """Capture one voice utterance via joe-listen. Falls back to a typed
+    prompt if joe-listen is missing or the user explicitly requested it."""
+    bin_path = _which("joe-listen")
+    if not bin_path:
+        print("[joe-voice] joe-listen not on PATH; falling back to typed input")
+        return input("> ").strip()
+    extra = listen_args.split() if listen_args else []
+    print("[joe-voice] recording... (speak now, silence ends the take)")
+    rc, out, err = _capture([bin_path, *extra], timeout=120)
+    if rc != 0:
+        print(f"[joe-voice] joe-listen failed (rc={rc}): {err.strip()[:200]}",
+              file=sys.stderr)
+        return ""
+    text = (out or "").strip()
+    if text:
+        print(f"[joe-voice] heard: {text}")
+    return text
+
+
+def ask_joe(text: str, model: Optional[str]) -> str:
+    """Send a single user turn to joe via `joe -p`. Returns the assistant
+    response as a single string."""
+    joe = _which("joe") or "joe"
+    cmd = [joe, "-p"]
+    if model:
+        cmd.extend(["--model", model])
+    cmd.append(text)
+    rc, out, err = _capture(cmd, timeout=600)
+    if rc != 0:
+        return f"(joe failed: {err.strip()[:200]})"
+    return (out or "").strip() or "(empty response)"
+
+
+def speak(text: str, voice: Optional[str], no_speak: bool) -> None:
+    """Send text to joe-speak (or just print if --no-speak / not found)."""
+    if no_speak:
+        print(text)
+        return
+    bin_path = _which("joe-speak")
+    if not bin_path:
+        print("[joe-voice] joe-speak not on PATH; printing instead")
+        print(text)
+        return
+    cmd = [bin_path]
+    if voice:
+        cmd.extend(["--voice", voice])
+    # Pass text via stdin so very long responses don't blow argv limits.
+    try:
+        subprocess.run(cmd, input=text, text=True, timeout=600, check=False)
+    except subprocess.TimeoutExpired:
+        print("[joe-voice] joe-speak timed out", file=sys.stderr)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="joe-voice", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--once", action="store_true",
+                    help="exit after one round")
+    ap.add_argument("--model", default=os.environ.get("JOE_DEFAULT_MODEL"),
+                    help="model passed to joe -p")
+    ap.add_argument("--listen-args", default="",
+                    help='extra args for joe-listen, e.g. "--duration 8"')
+    ap.add_argument("--voice", default=None,
+                    help="voice name passed to joe-speak --voice")
+    ap.add_argument("--no-speak", action="store_true",
+                    help="skip TTS, just print the response")
+    ap.add_argument("--no-listen", action="store_true",
+                    help="skip STT, prompt for typed input each round")
+    args = ap.parse_args()
+
+    print("[joe-voice] press Enter to talk, Ctrl-C / Ctrl-D to exit")
+    if not _which("joe-listen") and not args.no_listen:
+        print("[joe-voice] (no joe-listen on PATH; falling back to typed input)")
+    if not _which("joe-speak") and not args.no_speak:
+        print("[joe-voice] (no joe-speak on PATH; falling back to printed output)")
+
+    while True:
+        try:
+            input("> ready (Enter): ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n[joe-voice] bye")
+            return 0
+        text = "" if args.no_listen else listen_round(args.listen_args)
+        if args.no_listen:
+            try:
+                text = input("> typed: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n[joe-voice] bye"); return 0
+        if not text:
+            print("[joe-voice] (no input captured)")
+            if args.once:
+                return 0
+            continue
+        reply = ask_joe(text, args.model)
+        print(f"[joe-voice] joe: {reply}")
+        speak(reply, args.voice, args.no_speak)
+        if args.once:
+            return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
