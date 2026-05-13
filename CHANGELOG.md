@@ -2,6 +2,17 @@
 
 The headline feature per release. Full git log between tags has more.
 
+## v0.11.12 — docs sync (v0.11.10 + v0.11.11)
+
+- README.md grows new sections for **v0.11.10** (secrets guardrail)
+  and **v0.11.11** (codebase RAG + linter ACI + microagent compat).
+- "what's not in here yet" rewritten with the prioritised 13-item
+  backlog surfaced by the 2026-landscape sweep — OTLP, full LSP loop,
+  `response_schema` on `/plan`, shadow-git checkpoints, OpenHands
+  condenser, `.aiignore`, architect-pair, SWE-bench trajectory export,
+  plus the older HTTP-MCP / undo / speculative / Windows-voice items.
+- JOE.md mirrors the same content under its v0.11.x retrospective.
+
 ## v0.11.11 — landscape-sweep batch: RAG + linter ACI + microagent compat
 
 A deep mine of 2026's OSS coding-agent ecosystem (Goose, OpenHands,

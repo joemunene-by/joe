@@ -831,6 +831,65 @@ The Bash panel title prepends the wrapper label so the user can
 see at a glance: `Bash (macOS Seatbelt)`, `Bash (linux bwrap)`,
 `Bash (linux firejail)`, or just `Bash` (no wrapping).
 
+### v0.11.10 — secrets-pattern guardrail
+
+A model that helpfully writes your live OpenAI key into a file you
+then commit is the actual nightmare on a dev box. v0.11.10 catches
+that at the tool-write boundary by scanning every `<write>` / `<edit>` /
+`<multi_edit>` body for 11 known secret formats and refusing the
+write if any match:
+
+```
+AWS access key            AKIA / ASIA + 16 base32 chars
+AWS secret access key     aws_secret_access_key = 40 base64 chars
+Anthropic API key         sk-ant-<20+>
+OpenAI API key            sk-(proj-)?<20+>  (negative lookahead for sk-ant-)
+GitHub PAT                ghp_<36+>
+GitHub fine-grained       github_pat_<60+>
+Stripe live key           sk_live_<20+> / pk_live_<20+>
+Google API key            AIza<35>
+Slack webhook + token     hooks.slack.com/... and xox[abprs]-...
+JWT                       eyJ<10+>.<10+>.<10+>
+Private key (PEM)         -----BEGIN [RSA|OPENSSH|EC|DSA|PGP] PRIVATE KEY-----
+```
+
+Refusal messages show the label + line:col but redact the matched
+bytes to `<8>...<4>` so the panel doesn't echo the full key into
+terminal scrollback. Inspired by Future AGI's gateway-level guardrail
+action triad (block / warn / log) and adapted to the local-first
+threat model — the dangerous moment is the disk write, not the
+model emission. `JOE_GUARDRAILS=0` disables per session.
+
+### v0.11.11 — codebase RAG + linter ACI + microagent compat
+
+Three near-free wins from a deep mine of 2026's OSS coding-agent
+ecosystem (Goose, OpenHands, SWE-agent, Cody, Continue, gptme, Warp,
+Zed, OpenCode, Cline/Roo, JetBrains hybrid).
+
+**Codebase vector RAG.** `joe-index` has built a vector store over
+the user's active repos since v0.4, but the REPL never auto-injected
+the results. v0.11.11 closes the gap: every turn now queries the
+vector index, filters to chunks under cwd, and prepends a `<repo_rag>`
+block to the system prompt with top-K most-relevant snippets. Same
+contract every modern agent ships (Cursor `@codebase`, Cody agentic
+context, Continue `@codebase`). Silent no-op when the index doesn't
+exist; `JOE_AUTO_RAG=0` disables.
+
+**Linter-feedback ACI on edit.** SWE-agent's published insight:
+tool-ergonomics tweaks dwarf retrieval gains for end-to-end task
+completion. After every successful `<write>` / `<edit>` /
+`<multi_edit>`, joe now auto-runs the per-file linter (ruff /
+eslint / go vet / shellcheck) and appends a `<lint_after_write>`
+block to the tool result so the model self-corrects on the SAME
+turn. 30s per-file timeout, 2000-char output cap, missing linter =
+silent no-op. `JOE_AUTO_LINT=0` disables.
+
+**OpenHands microagent compatibility.** SKILL.md frontmatter now
+also accepts the OpenHands microagent `triggers: [a, b, c]`
+inline-list syntax and folds it into the same `when_to_use` keyword
+match path joe already uses. Any public OpenHands microagent drops
+into `~/.joe-agent/skills/` without translation.
+
 ## tool registry (26 tags)
 
 | tag | what it does | side effects |
@@ -864,18 +923,42 @@ see at a glance: `Bash (macOS Seatbelt)`, `Bash (linux bwrap)`,
 
 ## what's not in here yet
 
-The headline open items shipped through v0.11.8. Future polish:
+Through v0.11.11. The remaining backlog, in rough priority order from
+a 2026-landscape sweep across Goose / OpenHands / SWE-agent / Cody /
+Continue / OpenCode / Cline / Roo / Aider / Warp / Zed / JetBrains:
 
-- HTTP / SSE transport for `joe-mcp` (currently stdio-only; FastMCP
-  supports SSE so this is a small wiring job).
-- A `joe stats --export csv` flag.
-- More piper-tts voices via a per-language `--setup-piper <locale>` flow.
-- `/undo last-N` — atomic rollback of joe's recent writes via the
-  provenance log + git reflog cross-walk.
-- Speculative parallel inference: for high-latency cloud models, fire
-  2-3 variants in parallel and pick the first valid one.
-- Voice on Windows (joe-voice currently macOS-first; pyttsx3 + Sapi5
-  is the obvious port).
+- **OTLP exporter** — wrap each reproducibility passport as an
+  OpenTelemetry span and emit to OTLP/HTTP (Langfuse / Tempo /
+  Honeycomb compatible). Trace-export is 2026 table-stakes.
+- **Full LSP-diagnostic feedback loop** — the v0.11.11 linter ACI
+  is the cheap version; per-language LSP gives type errors + symbol
+  resolution back to the model on the same turn. OpenCode's killer
+  feature.
+- **`response_schema` on `/plan`** — Goose recipe-style JSON-schema
+  validation on plan output with auto-retry up to N on validation
+  fail. Closes the structured-output gap for CI/CD integrations.
+- **Shadow-git per-tool-call checkpoints** — Cline / Roo Code's
+  signature feature. Restore Files / Restore Task / Restore Both,
+  `git worktree`-backed.
+- **OpenHands-style condenser** — augment auto-compact with an LLM
+  summary of the dropped middle (currently we drop, don't summarise).
+- **`.aiignore`** — repo-pinned glob list that gates `read` / `grep` /
+  `glob` / `write` / `edit`. JetBrains / industry adopted.
+- **Architect-pair mode** — route the plan turn to a strong model
+  and the edit turn to a cheap one. `/mode architect` exists; the
+  two-model split doesn't yet.
+- **SWE-bench trajectory.json export** — reformat passports to the
+  (thought, action, observation) JSON format SWE-agent and OpenHands
+  benchmarks expect.
+- **HTTP / SSE transport for `joe-mcp`** (currently stdio-only;
+  FastMCP supports SSE).
+- **`joe stats --export csv`**.
+- **`/undo last-N`** — atomic rollback of joe's recent writes via
+  the provenance log + git reflog cross-walk.
+- **Speculative parallel inference** — fire 2-3 cloud variants
+  concurrently, take the first valid one.
+- **Voice on Windows** (pyttsx3 + Sapi5 port of joe-voice).
+- **More piper-tts voices** via `--setup-piper <locale>`.
 
 PRs welcome.
 

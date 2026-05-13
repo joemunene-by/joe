@@ -884,16 +884,54 @@ What landed after the original v0.8.0 doc snapshot:
   workspace-write` is active so escape-via-subshell is denied at the
   kernel layer. `JOE_OS_SANDBOX=0` opts out; `/sandbox os on|off`
   toggles in REPL.
+- Secrets-pattern guardrail (v0.11.10): `<write>` / `<edit>` /
+  `<multi_edit>` refuse bodies that match 11 known secret formats
+  (AWS keys, OpenAI / Anthropic, GitHub PAT + fine-grained, Stripe
+  live, Google, Slack webhook + token, JWT, PEM private key).
+  Refusal report redacts the matched bytes to `<8>...<4>` so the
+  panel doesn't leak the full secret into terminal scrollback.
+  Inspired by Future AGI's gateway action triad. `JOE_GUARDRAILS=0`
+  bypasses per session.
+- Codebase vector RAG (v0.11.11): the v0.4-era `joe-index` vector
+  store now auto-injects per turn. Every chat loop queries
+  `~/.joe-agent/vector-index.sqlite`, filters to chunks under cwd,
+  prepends a `<repo_rag>` block of top-K most-relevant snippets.
+  Cursor / Cody / Continue `@codebase` parity. `JOE_AUTO_RAG=0`
+  disables.
+- Linter-feedback ACI on edit (v0.11.11): after every successful
+  `<write>` / `<edit>` / `<multi_edit>` joe auto-runs the per-file
+  linter (ruff / eslint / go vet / shellcheck) and appends a
+  `<lint_after_write>` block to the tool result, so the model self-
+  corrects on the SAME turn. SWE-agent + OpenCode's signature
+  feature. `JOE_AUTO_LINT=0` disables.
+- OpenHands microagent compatibility (v0.11.11): SKILL.md frontmatter
+  also accepts `triggers: [a, b, c]` (OpenHands inline-list form),
+  merged into `when_to_use`. Public OpenHands microagents drop in
+  without translation.
 
-The remaining bucket is small. Future polish:
+The remaining backlog — ranked from a 2026-landscape sweep:
 
-- HTTP / SSE transport for `joe-mcp` (FastMCP supports it; a small
-  wiring job).
+- **OTLP exporter** — passports → OpenTelemetry spans (Langfuse /
+  Tempo / Honeycomb).
+- **Full LSP feedback loop** — per-language LSP gives type errors
+  and symbol resolution back to the model (the linter ACI is the
+  cheap version).
+- **`response_schema` on `/plan`** — Goose-style JSON-schema
+  validation with auto-retry on fail.
+- **Shadow-git per-tool-call checkpoints** — Cline / Roo Code's
+  signature, `git worktree`-backed.
+- **OpenHands condenser** — LLM summary of the dropped middle in
+  auto-compact (currently just drops).
+- **`.aiignore`** — glob list that gates read / grep / write / edit.
+- **Architect-pair mode** — strong planner + cheap editor on
+  different models.
+- **SWE-bench trajectory.json export** — passports → (thought,
+  action, observation) JSON.
+- HTTP / SSE transport for `joe-mcp`.
 - `joe stats --export csv`.
-- `/undo last-N` — atomic rollback of joe's recent writes via the
-  provenance log + git reflog.
+- `/undo last-N`.
 - Speculative parallel inference for cloud models.
 - Voice on Windows (pyttsx3 + Sapi5).
 
 `joe --help` and `/help` are the live source of truth; this doc
-captures the model as of v0.11.8.
+captures the model as of v0.11.11.
