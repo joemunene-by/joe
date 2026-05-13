@@ -165,6 +165,106 @@ console = Console()
 
 
 # --------------------------------------------------------------------------
+# Live transcript: tee console output to a file so an external observer
+# (e.g. someone tailing the file over SSH) sees the same rendered REPL.
+# --------------------------------------------------------------------------
+
+
+class _TeeStream:
+    """A file-like object that writes to two underlying streams.
+
+    Used by --transcript so every byte Rich emits to stdout also lands in
+    a transcript file, ANSI escapes and all. The transcript becomes a
+    faithful replay that any consumer (text editor, `tail -F`, asciinema-
+    style player) can render.
+    """
+
+    def __init__(self, primary, mirror) -> None:
+        self._primary = primary
+        self._mirror = mirror
+
+    def write(self, s: str) -> int:
+        self._primary.write(s)
+        try:
+            self._mirror.write(s)
+            self._mirror.flush()
+        except Exception:
+            pass
+        try:
+            return len(s)
+        except Exception:
+            return 0
+
+    def flush(self) -> None:
+        try:
+            self._primary.flush()
+        except Exception:
+            pass
+        try:
+            self._mirror.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        # Pretend to be a TTY so Rich keeps emitting colors. The mirror
+        # file ends up with ANSI escapes; `tail -F` over SSH renders them.
+        try:
+            return self._primary.isatty()
+        except Exception:
+            return False
+
+    def __getattr__(self, name):
+        return getattr(self._primary, name)
+
+
+_transcript_handle = None  # set by enable_transcript(); kept module-level
+                            # so REPL hooks can write user-input lines.
+
+
+def enable_transcript(path: Optional[str] = None) -> Path:
+    """Start tee'ing console output to `path` (default: a timestamped file
+    under ~/.joe-agent/transcripts/). Returns the resolved path. Idempotent
+    only in the sense that calling twice replaces the destination.
+    """
+    global _transcript_handle
+    if path is None:
+        out_dir = STATE_DIR / "transcripts"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        resolved = out_dir / f"repl-{ts}.log"
+    else:
+        resolved = Path(os.path.expanduser(path)).resolve()
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+    # Line-buffered so external tails see updates promptly.
+    handle = open(resolved, "w", buffering=1, encoding="utf-8")
+    _transcript_handle = handle
+    # Rewire Rich's underlying file to our tee. Rich reads self.file at
+    # each write, so setting .file mid-flight works for all later calls.
+    console.file = _TeeStream(sys.stdout, handle)
+    # A header so the consumer knows what they're looking at.
+    handle.write(
+        f"# joe transcript -- started {dt.datetime.now().isoformat()}\n"
+        f"# pid={os.getpid()}  cwd={Path.cwd()}\n"
+        f"# tail -F {resolved}  on a remote host for a live view\n\n"
+    )
+    handle.flush()
+    return resolved
+
+
+def transcript_user_input(text: str) -> None:
+    """Write a user-input line to the transcript file so the observer can
+    see what was typed (the terminal already shows it via prompt_toolkit;
+    Rich never sees those bytes)."""
+    if _transcript_handle is None:
+        return
+    try:
+        _transcript_handle.write(f"\n[USER] {text}\n")
+        _transcript_handle.flush()
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
 # Portable OS helpers: notify, speak, clipboard read/write.
 # joe is Mac-first but everything below has a Linux fallback so the agent
 # core works without code changes when you `joe sync pull` to a Linux box.
@@ -4506,6 +4606,10 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
         if state.get("macro_recording_name") and not user_input.startswith("/macro"):
             state.setdefault("macro_recording_steps", []).append(user_input)
 
+        # Mirror user input into the live transcript (if --transcript is on)
+        # so external observers tailing the file see what was typed.
+        transcript_user_input(user_input)
+
         # Reset the per-turn agent stamp. The @@ dispatch below will set it
         # if the user invoked a persona; otherwise it stays empty.
         _TURN_CTX["agent"] = ""
@@ -6937,7 +7041,22 @@ def main() -> int:
                     help="disable the bash allow-list (use carefully)")
     ap.add_argument("--image", action="append", default=[],
                     help="attach an image file to the prompt (repeatable)")
+    ap.add_argument(
+        "--transcript", nargs="?", const="", default=None,
+        help="mirror every Rich render + user input to a transcript file "
+             "(default: ~/.joe-agent/transcripts/repl-<ts>.log). External "
+             "observers can `tail -F` it over SSH for a live view.",
+    )
     args = ap.parse_args(argv)
+
+    if args.transcript is not None:
+        # nargs='?' + const='' means: present-but-no-value → use default path
+        chosen = args.transcript if args.transcript else None
+        resolved = enable_transcript(chosen)
+        console.print(
+            f"[dim]transcript: mirroring to[/] [bold]{resolved}[/]\n"
+            f"[dim]watch live with:[/] [bold]tail -F {resolved}[/]"
+        )
 
     # Stash --image attachments before the model call.
     for path in args.image:
