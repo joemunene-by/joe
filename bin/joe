@@ -271,6 +271,35 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 # Warn at 80% of num_ctx (joe-gemma's Modelfile sets num_ctx 131072).
 CONTEXT_BUDGET_TOKENS = int(os.environ.get("JOE_NUM_CTX", "131072"))
 CONTEXT_WARN_RATIO = 0.80
+# Per-million-token prices (input, output) for `/cost` estimation. Locals
+# are zero. Override via JOE_PRICES_JSON env (path to a JSON file).
+MODEL_PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
+    # local (ollama / mlx) -- all free
+    "joe-gemma": (0.0, 0.0),
+    "qwen2.5-coder:7b": (0.0, 0.0),
+    "qwen2.5-coder:14b": (0.0, 0.0),
+    "qwen2.5:3b": (0.0, 0.0),
+    "qwen2.5:14b": (0.0, 0.0),
+    "deepseek-r1:14b": (0.0, 0.0),
+    "gemma4:latest": (0.0, 0.0),
+    # cloud reference prices (USD per million tokens, approx Q2 2026)
+    "claude-opus-4-7": (15.00, 75.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-haiku-4-5": (0.80, 4.00),
+    "gpt-5": (10.00, 30.00),
+    "gpt-5-mini": (0.50, 1.50),
+    "o3": (15.00, 60.00),
+    "deepseek-v4-pro:cloud": (1.00, 4.00),
+}
+try:
+    _prices_path = os.environ.get("JOE_PRICES_JSON")
+    if _prices_path and Path(_prices_path).is_file():
+        _custom = json.loads(Path(_prices_path).read_text())
+        for k, v in _custom.items():
+            if isinstance(v, (list, tuple)) and len(v) == 2:
+                MODEL_PRICES_PER_MTOK[k] = (float(v[0]), float(v[1]))
+except Exception:
+    pass
 # Approximate chars-per-token for English; coarse but good enough for a meter.
 CHARS_PER_TOKEN = 4
 # Embedding model used for cross-session memory + chat-history RAG.
@@ -5865,7 +5894,7 @@ SLASH_COMMAND_NAMES = (
     "blame", "passport", "council", "commands", "plugins",
     "diff-model", "diffmodel", "think",
     "output-style", "outputstyle", "style", "statusline",
-    "sandbox", "mode", "skills", "loop", "ai-markers", "aimarkers",
+    "sandbox", "mode", "skills", "loop", "ai-markers", "aimarkers", "swarm",
     "read", "run", "diff", "copy", "history", "undo", "redo",
     "plan", "test", "lint", "build", "explain", "profile",
     "commit", "push", "pr", "issue", "snap",
@@ -7940,12 +7969,25 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                 bar_w = 40
                 fill = int(bar_w * min(1.0, ratio))
                 bar = "█" * fill + "·" * (bar_w - fill)
+                # Cumulative $ estimate. Local models are free; cloud models
+                # priced per million tokens via the model -> price table.
+                price = MODEL_PRICES_PER_MTOK.get(state["model"], (0.0, 0.0))
+                # Coarse split: assume 60% input, 40% output of session tokens.
+                in_tok = tk * 0.6
+                out_tok = tk * 0.4
+                est_cost = (in_tok / 1_000_000 * price[0]
+                            + out_tok / 1_000_000 * price[1])
+                if est_cost > 0:
+                    cost_line = f"\n[bold]estimated cost:[/] ${est_cost:.4f}  (in {price[0]:.2f} / out {price[1]:.2f} per Mtok)"
+                else:
+                    cost_line = "\n[bold]estimated cost:[/] [green]$0 (local)[/]"
                 panel(
-                    "Context budget",
+                    "Context budget + cost",
                     Text.from_markup(
                         f"[{color}]{bar}[/] [bold]{ratio * 100:.1f}%[/]\n"
                         f"~{tk} tokens of {CONTEXT_BUDGET_TOKENS} budget\n"
                         f"({tk * CHARS_PER_TOKEN} chars across session {state['session']!r})"
+                        + cost_line
                     ),
                     style=color,
                     subtitle="run /compact to summarise old turns",
@@ -8169,6 +8211,40 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                 )
                 continue
             if cmd == "doctor":
+                # /doctor --fix runs pip install for missing Python deps.
+                if args.strip() == "--fix":
+                    deps = ["rich", "prompt_toolkit", "fastapi", "uvicorn",
+                            "mcp", "pyautogui", "playwright"]
+                    missing = []
+                    for d in deps:
+                        try:
+                            __import__(d.replace("-", "_"))
+                        except ImportError:
+                            missing.append(d)
+                    if not missing:
+                        console.print(
+                            "[green]all Python deps already installed[/]"
+                        )
+                        continue
+                    console.print(
+                        f"[dim]installing {len(missing)} missing deps via "
+                        f"{sys.executable} -m pip install --user ...[/]"
+                    )
+                    cp = subprocess.run(
+                        [sys.executable, "-m", "pip", "install", "--user",
+                         *missing],
+                        capture_output=True, text=True, timeout=180,
+                    )
+                    if cp.returncode == 0:
+                        console.print(
+                            f"[green]installed:[/] {', '.join(missing)}"
+                        )
+                    else:
+                        console.print(
+                            f"[red]pip install failed (rc={cp.returncode})[/]\n"
+                            f"{cp.stderr[:600]}"
+                        )
+                    continue
                 rows = []
                 def chk(label, ok, detail=""):
                     rows.append((label, ok, detail))
@@ -9047,6 +9123,84 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                         style="cyan",
                         subtitle=str(SKILLS_DIR),
                     )
+                continue
+            if cmd == "swarm":
+                # /swarm <tasks-file>  -- read N lines from the file, run
+                # each as a separate run_turn() in a fresh session concurrently.
+                # Returns a brief result table.
+                if not args:
+                    console.print(
+                        "[red]/swarm <tasks-file>[/]\n"
+                        "Each line of the file becomes one independent agent."
+                    )
+                    continue
+                tf = Path(os.path.expanduser(args.strip()))
+                if not tf.is_file():
+                    console.print(f"[red]/swarm: {tf} not a file[/]")
+                    continue
+                tasks = [
+                    ln.strip()
+                    for ln in tf.read_text().splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")
+                ]
+                if not tasks:
+                    console.print("[red]/swarm: no non-comment lines in file[/]")
+                    continue
+                if len(tasks) > 8:
+                    console.print(
+                        f"[yellow]/swarm:[/] capping at 8 concurrent agents "
+                        f"(file had {len(tasks)})"
+                    )
+                    tasks = tasks[:8]
+                console.print(
+                    f"[bold cyan]/swarm:[/] launching {len(tasks)} parallel agents"
+                )
+
+                results: dict[int, str] = {}
+                errors: dict[int, str] = {}
+
+                def _run_one(idx: int, task: str) -> None:
+                    try:
+                        sub_session = f"swarm-{idx}-{dt.datetime.now().strftime('%H%M%S')}"
+                        out = _ollama_once(state["model"], task, timeout=300)
+                        results[idx] = out
+                    except Exception as e:
+                        errors[idx] = f"{type(e).__name__}: {e}"
+
+                threads = [
+                    threading.Thread(
+                        target=_run_one, args=(i, t), daemon=True,
+                    )
+                    for i, t in enumerate(tasks)
+                ]
+                for t in threads:
+                    t.start()
+                with console.status(
+                    Text.from_markup(
+                        f"[bold]swarm:[/] {len(threads)} agents working..."
+                    ),
+                    spinner="dots",
+                ):
+                    for t in threads:
+                        t.join(timeout=300)
+                lines = []
+                for i, task in enumerate(tasks):
+                    if i in errors:
+                        lines.append(
+                            f"  [red]✗ #{i + 1}[/] {task[:60]}\n"
+                            f"      {errors[i][:120]}"
+                        )
+                    else:
+                        preview = (results.get(i, "") or "")[:120].replace("\n", " ")
+                        lines.append(
+                            f"  [green]✓ #{i + 1}[/] {task[:60]}\n"
+                            f"      [dim]{preview}...[/]"
+                        )
+                panel(
+                    f"/swarm result ({len(results)}/{len(tasks)} succeeded)",
+                    Text.from_markup("\n".join(lines)),
+                    style="bright_cyan",
+                )
                 continue
             if cmd in {"ai-markers", "aimarkers"}:
                 sub = args.strip().lower()
