@@ -162,6 +162,7 @@ DEVELOPER_JOURNAL = STATE_DIR / "journal" / "developer-journal.md"
 MCP_CLIENTS_CONFIG = STATE_DIR / "mcp-clients.json"
 COMMANDS_DIR = STATE_DIR / "commands"
 HOOKS_DIR = STATE_DIR / "hooks"
+PLUGIN_TOOLS_DIR = STATE_DIR / "tools"
 
 # Per-turn context, set by run_turn (and the @@agent dispatch) so tools like
 # write/edit can stamp provenance with the original user message + persona.
@@ -3532,6 +3533,114 @@ def _screencap(out_path: Path) -> tuple[bool, str]:
 
 
 _CUSTOM_COMMANDS: dict[str, dict] = {}
+_PLUGIN_TOOLS: dict[str, "Any"] = {}
+
+
+def load_plugin_tools() -> dict[str, "Any"]:
+    """Discover user-defined tools at ~/.joe-agent/tools/*.py. Each file
+    must export a `register()` function returning {tool_name: handler},
+    where handler accepts (attrs: dict, body: str) and returns a string.
+
+    Plugin tools are added to _KNOWN_TOOL_NAMES + the runtime dispatcher.
+    Re-callable via /plugins reload."""
+    global _PLUGIN_TOOLS
+    out: dict[str, "Any"] = {}
+    if not PLUGIN_TOOLS_DIR.is_dir():
+        _PLUGIN_TOOLS = out
+        return out
+    import importlib.util as _imp
+    for f in sorted(PLUGIN_TOOLS_DIR.glob("*.py")):
+        if f.name.startswith("_"):
+            continue
+        try:
+            spec = _imp.spec_from_file_location(f"joe_plugin_{f.stem}", f)
+            if not spec or not spec.loader:
+                continue
+            mod = _imp.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            console.print(
+                f"[red]plugin load failed:[/] {f.name}: {type(e).__name__}: {e}"
+            )
+            continue
+        if not hasattr(mod, "register"):
+            console.print(
+                f"[yellow]plugin {f.name} has no register() -- skipped[/]"
+            )
+            continue
+        try:
+            registered = mod.register()
+        except Exception as e:
+            console.print(
+                f"[red]plugin register() raised:[/] {f.name}: {e}"
+            )
+            continue
+        if not isinstance(registered, dict):
+            continue
+        for name, handler in registered.items():
+            if not isinstance(name, str) or not callable(handler):
+                continue
+            # Don't let plugins override built-in tools.
+            if name in _KNOWN_TOOL_NAMES:
+                console.print(
+                    f"[yellow]plugin {f.name} tried to override built-in "
+                    f"<{name}> -- ignored[/]"
+                )
+                continue
+            out[name] = handler
+    _PLUGIN_TOOLS = out
+    # Re-derive the tag regex with plugin names included so the parser
+    # actually recognises them.
+    _rebuild_tag_pattern()
+    return out
+
+
+def _rebuild_tag_pattern() -> None:
+    """Regenerate TAG_PAT + OPENER_FALLBACK_PAT after plugins load.
+    Plugin tool names are escaped + alternated into the existing whitelist."""
+    global TAG_PAT, OPENER_FALLBACK_PAT
+    all_names = list(_KNOWN_TOOL_NAMES) + sorted(_PLUGIN_TOOLS.keys())
+    # Filter to identifier-safe names (alnum + underscore).
+    all_names = [n for n in all_names if re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", n)]
+    alt = "|".join(re.escape(n) for n in all_names)
+    TAG_PAT = re.compile(
+        r"<(?P<name>" + alt + r")"
+        r"(?P<attrs>\s+[^>]*?)??\s*"
+        r"(?P<self>/>|>(?P<body>.*?)</(?P=name)>)",
+        re.DOTALL,
+    )
+    OPENER_FALLBACK_PAT = re.compile(
+        r"<(?P<name>" + alt + r")"
+        r"(?P<attrs>\s+[^>]+?)\s*/?>"
+        r"(?!.*</(?P=name)>)",
+        re.DOTALL,
+    )
+
+
+def _load_project_context(cwd: Path) -> str:
+    """If the cwd has AGENTS.md, CLAUDE.md, or .joe/instructions.md, load
+    its content and return a <project_context> XML block to inject into
+    the system prompt. Mirrors the Claude Code / OpenAI Codex convention
+    so existing teams with AGENTS.md repos get instant joe context."""
+    candidates = (
+        cwd / "AGENTS.md",
+        cwd / "CLAUDE.md",
+        cwd / ".joe" / "instructions.md",
+    )
+    blocks = []
+    for c in candidates:
+        if not c.is_file():
+            continue
+        try:
+            text = c.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if len(text) > 12000:
+            text = text[:12000] + "\n[... truncated]"
+        blocks.append(
+            f"<project_context source=\"{c.name}\">\n{text}\n</project_context>"
+        )
+    return "\n\n".join(blocks)
 
 
 def load_custom_commands() -> dict[str, dict]:
@@ -5169,7 +5278,7 @@ SLASH_COMMAND_NAMES = (
     "help", "exit", "quit", "cwd", "cd", "model", "coder", "lora",
     "clear", "save", "load", "voice",
     "sessions", "whoami", "cost", "compact", "yolo", "trust", "doctor",
-    "blame", "passport", "council", "commands",
+    "blame", "passport", "council", "commands", "plugins",
     "read", "run", "diff", "copy", "history", "undo", "redo",
     "plan", "test", "lint", "build", "explain", "profile",
     "commit", "push", "pr", "issue", "snap",
@@ -5924,6 +6033,11 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
     pjb = _projects_block()
     if pjb:
         parts.append(pjb)
+    # AGENTS.md / CLAUDE.md / .joe/instructions.md auto-load -- gives joe
+    # the team's repo-specific instructions every turn without manual /attach.
+    pc = _load_project_context(cwd)
+    if pc:
+        parts.append(pc)
     parts.append(
         "<environment name=\"joe shell\">\n"
         "You are running inside the `joe` interactive shell. You are the\n"
@@ -6248,6 +6362,8 @@ def run_turn(
                     execute_plan(plan, model, coder_model, cwd, session, allow_all_bash)
                     return  # plan owns the rest of the turn
                 result = "plan tag was malformed; emit numbered steps"
+            elif call.name in _PLUGIN_TOOLS:
+                result = _PLUGIN_TOOLS[call.name](call.attrs, call.body)
             else:
                 result = f"unknown tool: {call.name}"
         except ToolError as e:
@@ -6350,6 +6466,13 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
         console.print(
             f"[dim]loaded {len(cmds)} custom command(s): "
             f"{', '.join('/' + n for n in cmds)}[/]"
+        )
+    # Drop-in Python tool plugins at ~/.joe-agent/tools/*.py.
+    plugins = load_plugin_tools()
+    if plugins:
+        console.print(
+            f"[dim]loaded {len(plugins)} plugin tool(s): "
+            f"{', '.join('<' + n + '>' for n in sorted(plugins))}[/]"
         )
     state = {
         "model": model,
@@ -7944,6 +8067,29 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                         console.print(f"[red]could not kill #{rest}[/]")
                     continue
                 cmd_task_show(sub); continue
+            if cmd == "plugins":
+                sub = args.strip()
+                if sub == "reload":
+                    pls = load_plugin_tools()
+                    console.print(
+                        f"[dim]reloaded {len(pls)} plugin tool(s): "
+                        f"{', '.join('<' + n + '>' for n in sorted(pls))}[/]"
+                    )
+                    continue
+                if not _PLUGIN_TOOLS:
+                    console.print(
+                        f"[dim]no plugin tools loaded. drop *.py into "
+                        f"{PLUGIN_TOOLS_DIR} with a register() function.[/]"
+                    )
+                else:
+                    lines = [f"<{n}>" for n in sorted(_PLUGIN_TOOLS)]
+                    panel(
+                        "Plugin tools",
+                        Text.from_markup("\n".join(lines)),
+                        style="cyan",
+                        subtitle=str(PLUGIN_TOOLS_DIR),
+                    )
+                continue
             if cmd == "commands":
                 sub = args.strip()
                 if sub == "reload":
