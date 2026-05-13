@@ -44,8 +44,8 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 try:
-    from fastapi import FastAPI, Header, HTTPException, Request
-    from fastapi.responses import HTMLResponse, StreamingResponse
+    from fastapi import FastAPI, Form, Header, HTTPException, Request
+    from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
     from pydantic import BaseModel
     import uvicorn
 except ImportError as e:
@@ -266,9 +266,125 @@ def ios(req: IOSRequest, authorization: Optional[str] = Header(None)):
 # --------------------------------------------------------------------------
 
 
-def _check_auth_qs(token: Optional[str]) -> None:
-    if not token or token != TOKEN:
+TOKEN_COOKIE = "joe_token"
+COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
+
+
+def _authed(request: Optional[Request], token: Optional[str]) -> bool:
+    """True if the request carries a valid bearer token via query string OR
+    the persistent `joe_token` cookie set after a successful /login."""
+    if token and token == TOKEN:
+        return True
+    if request is not None and request.cookies.get(TOKEN_COOKIE) == TOKEN:
+        return True
+    return False
+
+
+def _check_auth_qs(token: Optional[str], request: Optional[Request] = None) -> None:
+    """Legacy guard for API-style endpoints (SSE, JSON). Still raises 403 on
+    failure. Accepts either ?token= or a valid auth cookie."""
+    if not _authed(request, token):
         raise HTTPException(status_code=403, detail="missing or invalid ?token=")
+
+
+def _set_auth_cookie(response) -> None:
+    response.set_cookie(
+        TOKEN_COOKIE, TOKEN,
+        httponly=True, samesite="lax", max_age=COOKIE_MAX_AGE, path="/",
+    )
+
+
+def _maybe_set_cookie(token: Optional[str], response) -> None:
+    """If the request authed via ?token=, also set the persistent cookie so
+    future page loads don't need the URL param."""
+    if token and token == TOKEN:
+        _set_auth_cookie(response)
+
+
+def _render_login_html(error: Optional[str] = None,
+                       next_path: str = "/dashboard") -> str:
+    err_html = ""
+    if error:
+        err_html = f'<p class="err">{html.escape(error)}</p>'
+    next_path_safe = html.escape(next_path)
+    return f"""<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0e0e10">
+  <title>joe -- sign in</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{ font: 15px/1.5 -apple-system, BlinkMacSystemFont, sans-serif;
+           background: #0e0e10; color: #e8e8e8; margin: 0;
+           min-height: 100dvh; display: flex; align-items: center;
+           justify-content: center; padding: 24px; }}
+    .card {{ background: #161618; border: 1px solid #2a2a30;
+             border-radius: 8px; padding: 24px; width: 100%; max-width: 420px; }}
+    h1 {{ font-size: 22px; margin: 0 0 4px; color: #fff; }}
+    .sub {{ color: #888; font-size: 13px; margin: 0 0 18px; }}
+    label {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+            color: #888; margin-bottom: 4px; display: block; }}
+    input[type="password"], input[type="text"] {{
+      width: 100%; background: #1a1a1f; color: #e8e8e8;
+      border: 1px solid #2a2a30; border-radius: 4px; padding: 10px 12px;
+      font: 14px/1.4 ui-monospace, SFMono-Regular, monospace;
+    }}
+    input:focus {{ outline: 1px solid #7fd17f; }}
+    button {{ background: #2d4a2d; color: #e8e8e8; border: 0;
+             border-radius: 4px; padding: 10px 16px; cursor: pointer;
+             font: 14px/1 -apple-system, sans-serif; width: 100%;
+             margin-top: 12px; }}
+    button:hover {{ background: #3d5a3d; }}
+    code {{ font: 12px/1.4 ui-monospace, monospace; background: #1a1a1f;
+           padding: 1px 5px; border-radius: 3px; color: #f0c674; }}
+    .err {{ color: #d94a4a; font-size: 13px; margin: 0 0 10px; }}
+    .tip {{ color: #666; font-size: 12px; margin: 12px 0 0; }}
+  </style>
+</head><body>
+  <form class="card" action="/login" method="post">
+    <h1>joe</h1>
+    <p class="sub">Paste the joe-http bearer token to sign in.</p>
+    {err_html}
+    <label for="token">token</label>
+    <input type="password" id="token" name="token" autocomplete="off"
+           autofocus placeholder="hex string from ~/.joe-agent/http-token">
+    <input type="hidden" name="next" value="{next_path_safe}">
+    <button type="submit">Sign in</button>
+    <p class="tip">On the Mac running joe-http:
+       <code>cat ~/.joe-agent/http-token</code></p>
+    <p class="tip">Stays signed in for 30 days via an httponly cookie.</p>
+  </form>
+</body></html>"""
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(next: str = "/dashboard") -> HTMLResponse:
+    return HTMLResponse(_render_login_html(next_path=next))
+
+
+@app.post("/login")
+def login_submit(token: str = Form(...), next: str = Form("/dashboard")):
+    if token.strip() != TOKEN:
+        return HTMLResponse(
+            _render_login_html(error="that token does not match.",
+                               next_path=next),
+            status_code=403,
+        )
+    # Only allow same-origin relative redirects so a crafted next= can't
+    # bounce the user to a third-party URL.
+    if not next.startswith("/"):
+        next = "/dashboard"
+    resp = RedirectResponse(next, status_code=303)
+    _set_auth_cookie(resp)
+    return resp
+
+
+@app.post("/logout")
+def logout() -> RedirectResponse:
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie(TOKEN_COOKIE, path="/")
+    return resp
 
 
 def _safe_query(db: Path, sql: str, params: tuple = ()) -> list[tuple]:
@@ -638,9 +754,12 @@ def _esc_js(s: str) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(token: Optional[str] = None) -> HTMLResponse:
-    _check_auth_qs(token)
-    return HTMLResponse(_render_dashboard_html())
+def dashboard(request: Request, token: Optional[str] = None):
+    if not _authed(request, token):
+        return RedirectResponse("/login?next=/dashboard", status_code=303)
+    resp = HTMLResponse(_render_dashboard_html())
+    _maybe_set_cookie(token, resp)
+    return resp
 
 
 def _render_keys_html() -> str:
@@ -732,9 +851,12 @@ it yourself.</p>
 
 
 @app.get("/keys", response_class=HTMLResponse)
-def keys_page(token: Optional[str] = None) -> HTMLResponse:
-    _check_auth_qs(token)
-    return HTMLResponse(_render_keys_html())
+def keys_page(request: Request, token: Optional[str] = None):
+    if not _authed(request, token):
+        return RedirectResponse("/login?next=/keys", status_code=303)
+    resp = HTMLResponse(_render_keys_html())
+    _maybe_set_cookie(token, resp)
+    return resp
 
 
 # --------------------------------------------------------------------------
@@ -904,11 +1026,12 @@ def _stream_ollama(prompt: str, model: str):
 
 @app.get("/chat-stream")
 def chat_stream(
+    request: Request,
     token: Optional[str] = None,
     prompt: Optional[str] = None,
     model: Optional[str] = None,
 ):
-    _check_auth_qs(token)
+    _check_auth_qs(token, request)
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
     use_model = model or os.environ.get("JOE_DEFAULT_MODEL", "joe-gemma")
@@ -1029,8 +1152,8 @@ def _stream_transcript(initial_tail: int = 200) -> Iterator[str]:
 
 
 @app.get("/transcript-stream")
-def transcript_stream(token: Optional[str] = None):
-    _check_auth_qs(token)
+def transcript_stream(request: Request, token: Optional[str] = None):
+    _check_auth_qs(token, request)
     return StreamingResponse(
         _stream_transcript(),
         media_type="text/event-stream",
@@ -1241,9 +1364,12 @@ def _render_mobile_html() -> str:
 
 
 @app.get("/m", response_class=HTMLResponse)
-def mobile_dashboard(token: Optional[str] = None) -> HTMLResponse:
-    _check_auth_qs(token)
-    return HTMLResponse(_render_mobile_html())
+def mobile_dashboard(request: Request, token: Optional[str] = None):
+    if not _authed(request, token):
+        return RedirectResponse("/login?next=/m", status_code=303)
+    resp = HTMLResponse(_render_mobile_html())
+    _maybe_set_cookie(token, resp)
+    return resp
 
 
 # --------------------------------------------------------------------------
