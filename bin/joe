@@ -4521,6 +4521,30 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
         "recognise, or a library you're not sure about, search rather\n"
         "than guess. Quote your source when you cite it.\n"
         "\n"
+        "Scope discipline (rule zero, applies before every other rule):\n"
+        "  - Do EXACTLY what the user asked. No more. After a navigation\n"
+        "    command (<cd>) or an inspection command (<read>, <grep>,\n"
+        "    <glob>, or a read-only <bash>): STOP. Reply with one prose\n"
+        "    sentence confirming what happened, then end the turn.\n"
+        "  - 'Change to X', 'go to X', 'cd to X', 'switch to X' are\n"
+        "    NAVIGATION ONLY. The correct response is ONE <cd> tag,\n"
+        "    then a single sentence. NOT <cd> followed by <read>\n"
+        "    followed by <write>.\n"
+        "  - 'What's in X', 'show me X', 'look at X', 'check X' are\n"
+        "    INSPECTION ONLY. Emit ONE <read>/<grep>/<glob>, then\n"
+        "    summarise in prose. Do not edit anything you read.\n"
+        "  - You may chain tools when the user's sentence genuinely\n"
+        "    requires multiple steps ('fix the bug in foo.py' -> read,\n"
+        "    delegate, write, test). But every tag after the first\n"
+        "    must trace back to a verb the user actually used.\n"
+        "  - If you notice 'this README could be polished' or 'this\n"
+        "    code could be cleaner' but the user didn't ASK, the\n"
+        "    correct action is silence, not <write>. Mention it in\n"
+        "    one prose line as a [followup] and let the user decide.\n"
+        "  - Never substitute facts that look plausible but weren't\n"
+        "    given. If you don't KNOW the right repo URL / framework\n"
+        "    version / file path, don't write it. Ask, or skip.\n"
+        "\n"
         "Code-writing protocol (this is the most important rule in the\n"
         "whole shell, do not skip):\n"
         "  - The moment the user asks for new code in any language,\n"
@@ -4553,9 +4577,14 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
         "         docs / tags update. Don't wait for the user to ask.\n"
         "      5. End with a [followup] list of anything you spotted:\n"
         "         missing tests, edge cases, perf concerns, security.\n"
-        "  - Hard exception: you may write inline (no delegate) ONLY for\n"
-        "    typo / one-line fixes the user pasted at you, OR for pure\n"
-        "    prose changes (README, comments, commit bodies).\n"
+        "  - Hard exception: you may write inline (no delegate) ONLY when\n"
+        "    the user EXPLICITLY asked for that specific change in their\n"
+        "    last message. Examples that qualify: 'fix the typo in line\n"
+        "    42', 'tighten the intro paragraph of README.md', 'add a\n"
+        "    docstring to foo'. Examples that DO NOT qualify: navigating\n"
+        "    somewhere then noticing the README looks rough, or finding\n"
+        "    a typo while reading something for another purpose. In\n"
+        "    those cases mention it in prose as [followup] and stop.\n"
         "  - If you catch yourself starting a <write> with new code\n"
         "    before any <delegate>, STOP and emit <delegate> instead.\n"
         "\n"
@@ -4677,6 +4706,11 @@ def run_turn(
         # blind retry.
         result_is_error = result.startswith("ERROR:") or "Tool error" in result \
             or "Tool crashed" in result or "no such file" in result.lower()
+        # Passive tools (cd / read / grep / glob) complete the user's request
+        # entirely if the request was navigation or inspection. Don't let the
+        # model spiral into 'while I'm here, let me polish the README too'.
+        PASSIVE_TOOLS = {"cd", "read", "grep", "glob"}
+        is_passive = call.name in PASSIVE_TOOLS and not result_is_error
         nudge = (
             "Continue. Either emit another tool tag or answer in plain prose."
         )
@@ -4687,6 +4721,18 @@ def run_turn(
                 "  - or, if you cannot make progress on this step, output "
                 "    exactly STOP: <one-sentence reason>  and stop emitting tags.\n"
                 "Do NOT repeat the same tag with the same args."
+            )
+        elif is_passive:
+            nudge = (
+                f"The <{call.name}> tag succeeded. If the user's original\n"
+                "request was navigation or inspection only ('change to X',\n"
+                "'cd to X', 'show me X', 'what's in X', 'look at X'), the\n"
+                "request is now FULFILLED. Reply with ONE prose sentence\n"
+                "and STOP emitting tags.\n"
+                "Do NOT chain in a <write>, <edit>, or <delegate> 'while\n"
+                "you're here'. If you noticed something worth fixing, list\n"
+                "it as a [followup] line and let the user decide whether\n"
+                "to act on it next turn."
             )
         prompt = (
             response + f"\n\n<tool_result name=\"{call.name}\">\n{result}\n</tool_result>\n"
