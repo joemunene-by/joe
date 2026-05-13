@@ -2908,7 +2908,7 @@ def tool_write(attrs: dict, body: str, confirm: bool = True) -> str:
             style="green",
             subtitle=f"{len(body)} bytes  ·  {len(body.splitlines())} lines",
         )
-    if confirm and not _confirm(f"Apply this write to {path}?"):
+    if confirm and not _confirm(f"Apply this write to {path}?", tool="write"):
         return "user denied write"
     p.write_text(body, encoding="utf-8")
     log_edit(path=str(p), before=existing, after=body, op="write")
@@ -2961,7 +2961,7 @@ def tool_edit(attrs: dict, body: str, confirm: bool = True) -> str:
         f"Edit {path}", Syntax(diff, "diff", theme="ansi_dark"),
         style="yellow", subtitle=f"+{adds} / -{dels}",
     )
-    if confirm and not _confirm(f"Apply this edit to {path}?"):
+    if confirm and not _confirm(f"Apply this edit to {path}?", tool="edit"):
         return "user denied edit"
     p.write_text(new_src, encoding="utf-8")
     log_edit(path=str(p), before=src, after=new_src, op="edit")
@@ -2998,7 +2998,7 @@ def tool_bash(attrs: dict, body: str, allow_all: bool, confirm: bool = True) -> 
         if os.path.basename(first) not in ALLOWED_BASH_PROGRAMS:
             raise ToolError(f"<bash>: {first!r} not in safe allow-list (pass --unsafe-bash to broaden)")
     panel(f"Bash", Syntax(cmd, "bash", theme="ansi_dark"), style="magenta")
-    if confirm and not _confirm("Run this command?"):
+    if confirm and not _confirm("Run this command?", tool="bash"):
         return "user denied bash"
     try:
         cp = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
@@ -3223,9 +3223,10 @@ def _node_runner(repo: Path) -> str:
     return "npm"
 
 
-def _spawn(cmd: str, cwd: Path, timeout: int = 300, confirm: bool = True) -> str:
+def _spawn(cmd: str, cwd: Path, timeout: int = 300, confirm: bool = True,
+           tool: str = "run") -> str:
     panel("Run", Syntax(f"$ {cmd}  (cwd: {cwd})", "bash", theme="ansi_dark"), style="magenta")
-    if confirm and not _confirm("Run it?"):
+    if confirm and not _confirm("Run it?", tool=tool):
         return "user denied run"
     try:
         cp = subprocess.run(cmd, shell=True, cwd=str(cwd),
@@ -3259,7 +3260,7 @@ def tool_test(attrs: dict, body: str, confirm: bool = True) -> str:
         cmd = f"go test {target or './...'}".strip()
     else:
         raise ToolError(f"unknown language: {lang}")
-    return _spawn(cmd, root, timeout=600, confirm=confirm)
+    return _spawn(cmd, root, timeout=600, confirm=confirm, tool="test")
 
 
 def tool_lint(attrs: dict, body: str, confirm: bool = True) -> str:
@@ -3284,7 +3285,7 @@ def tool_lint(attrs: dict, body: str, confirm: bool = True) -> str:
         cmd = "go vet ./..."
     else:
         raise ToolError(f"unknown language: {lang}")
-    return _spawn(cmd, root, timeout=300, confirm=confirm)
+    return _spawn(cmd, root, timeout=300, confirm=confirm, tool="lint")
 
 
 def tool_build(attrs: dict, body: str, confirm: bool = True) -> str:
@@ -3302,7 +3303,7 @@ def tool_build(attrs: dict, body: str, confirm: bool = True) -> str:
         cmd = "go build ./..."
     else:
         raise ToolError(f"unknown language: {lang}")
-    return _spawn(cmd, root, timeout=900, confirm=confirm)
+    return _spawn(cmd, root, timeout=900, confirm=confirm, tool="build")
 
 
 # --- web search + fetch ---
@@ -3775,38 +3776,86 @@ _NEGATIVE = {
     "stop", "cancel", "abort", "skip", "pass",
     "-1", "👎",
 }
+# "Always for this tool, this session" answers. After one of these comes
+# back, _SESSION_TRUST[tool] flips True and future _confirm(question, tool=X)
+# calls skip the prompt entirely.
+_ALWAYS = {
+    "a", "always", "all", "yes always", "always yes",
+    "trust", "trust it", "trusted",
+}
+
+# Per-tool session trust. Written by _confirm() when the user answers 'a'.
+# Cleared by /trust reset or REPL exit. Each tool that calls _confirm
+# passes its name as the `tool=` kwarg.
+_SESSION_TRUST: dict[str, bool] = {}
 
 
-def _confirm(question: str) -> bool:
+def _confirm(question: str, tool: str = "") -> bool:
+    """Ask the user to approve a side-effecting action.
+
+    Returns True on yes / always, False on no / silent. When `tool` is
+    given, the user may answer 'a' (always) to grant blanket approval for
+    every subsequent call of that tool in this session.
+    """
     # JOE_AUTO_YES short-circuits everything (intended for scripts / piped use).
     if os.environ.get("JOE_AUTO_YES", "").strip() in {"1", "true", "yes"}:
         console.print(f"[bold yellow]{question}[/] [dim](JOE_AUTO_YES, auto-y)[/]")
         return True
 
-    def _interpret(ans: str) -> bool:
+    # Per-tool session trust: granted earlier this REPL with 'a'.
+    if tool and _SESSION_TRUST.get(tool):
+        console.print(
+            f"[dim]{question}[/]  [green](auto-approved: {tool!r} trusted this session)[/]"
+        )
+        return True
+
+    def _interpret(ans: str) -> tuple[bool, bool]:
+        """Return (yes, persist). persist=True means 'remember as always'."""
         a = ans.strip().lower()
         if not a:
-            return False  # bare Enter = the default 'N'
+            return False, False  # bare Enter = the default 'N'
+        if a in _ALWAYS:
+            return True, True
         if a in _AFFIRMATIVE:
-            return True
+            return True, False
         if a in _NEGATIVE:
-            return False
-        # Loose match: if the first word is affirmative, take it.
+            return False, False
+        # Loose match: first-word check.
         first = a.split()[0]
-        return first in _AFFIRMATIVE
+        if first in _ALWAYS:
+            return True, True
+        if first in _AFFIRMATIVE:
+            return True, False
+        return False, False
+
+    # The hint shows the always-option only when a tool is named (otherwise
+    # there's nothing to remember it under).
+    hint = "[y/N/a]" if tool else "[y/N]"
 
     # Rich's Prompt.ask returns the default silently when stdin isn't a TTY,
     # which breaks piped tests (`yes y | joe -p ...`). When we detect that,
     # fall back to plain readline so piped input actually feeds the answer.
     if not sys.stdin.isatty():
-        console.print(f"[bold yellow]{question}[/] [y/N]:", end=" ")
+        console.print(f"[bold yellow]{question}[/] {hint}:", end=" ")
         try:
             ans = sys.stdin.readline()
         except (EOFError, KeyboardInterrupt):
             return False
-        return _interpret(ans)
-    ans = Prompt.ask(f"[bold yellow]{question}[/] [y/N]", default="N", show_default=False)
-    return _interpret(ans)
+        yes, persist = _interpret(ans)
+    else:
+        ans = Prompt.ask(
+            f"[bold yellow]{question}[/] {hint}",
+            default="N", show_default=False,
+        )
+        yes, persist = _interpret(ans)
+
+    if yes and persist and tool:
+        _SESSION_TRUST[tool] = True
+        console.print(
+            f"[dim]ok -- {tool!r} trusted for this session. "
+            f"Type [bold]/trust reset[/] to revoke.[/]"
+        )
+    return yes
 
 
 # --------------------------------------------------------------------------
@@ -4024,7 +4073,7 @@ def _ollama_stream_to_console(model: str, prompt: str) -> str:
 SLASH_COMMAND_NAMES = (
     "help", "exit", "quit", "cwd", "cd", "model", "coder", "lora",
     "clear", "save", "load", "voice",
-    "sessions", "whoami", "cost", "compact", "yolo", "doctor",
+    "sessions", "whoami", "cost", "compact", "yolo", "trust", "doctor",
     "read", "run", "diff", "copy", "history", "undo", "redo",
     "plan", "test", "lint", "build", "explain", "profile",
     "commit", "push", "pr", "issue", "snap",
@@ -5795,6 +5844,46 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                 else:
                     os.environ["JOE_AUTO_YES"] = "1"
                     console.print("[bold red]yolo mode: ON[/] (auto-approve all writes/edits/bash)")
+                continue
+            if cmd == "trust":
+                sub = args.strip().lower()
+                known_tools = ("write", "edit", "bash", "run", "test", "lint", "build")
+                if not sub or sub == "status":
+                    if not _SESSION_TRUST:
+                        console.print(
+                            "[dim]no tool trusted this session.[/] "
+                            "Answer [bold]a[/] (always) at a confirm prompt to "
+                            "trust a tool, or [bold]/trust <tool>[/] to grant "
+                            "explicitly."
+                        )
+                    else:
+                        trusted = sorted(t for t, v in _SESSION_TRUST.items() if v)
+                        console.print(
+                            f"[dim]trusted this session:[/] [green]{', '.join(trusted)}[/]"
+                        )
+                    continue
+                if sub == "reset" or sub == "off" or sub == "clear":
+                    _SESSION_TRUST.clear()
+                    console.print("[dim]trust reset; will ask to confirm again[/]")
+                    continue
+                if sub == "all":
+                    for t in known_tools:
+                        _SESSION_TRUST[t] = True
+                    console.print(
+                        f"[yellow]all tools trusted this session:[/] "
+                        f"{', '.join(known_tools)}. [dim]/trust reset to revoke[/]"
+                    )
+                    continue
+                if sub in known_tools:
+                    _SESSION_TRUST[sub] = True
+                    console.print(f"[dim]{sub!r} trusted for this session[/]")
+                    continue
+                console.print(
+                    f"[red]/trust:[/] unknown sub-command {sub!r}. "
+                    f"Use: [bold]/trust[/] (status), [bold]/trust <tool>[/], "
+                    f"[bold]/trust all[/], [bold]/trust reset[/]. "
+                    f"Known tools: {', '.join(known_tools)}."
+                )
                 continue
             if cmd == "doctor":
                 rows = []
