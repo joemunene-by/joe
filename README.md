@@ -388,6 +388,201 @@ additions worth the indirection:
 
 Sample ghostloop runner at `examples/ghostloop-uses-joe.py`.
 
+## the v0.9.x engineer-grade pack
+
+Six rounds shipped that push joe past "chat REPL with tools" into "real
+terminal coding agent that an Anthropic engineer would scroll up over."
+
+### v0.9.5 — per-tool session trust
+
+Claude-Code-style permission prompts. Every confirm now accepts a third
+answer:
+
+```
+Apply this write to ./README.md? [y/N/a]:
+  y -- yes, this call only
+  N -- no (default)
+  a -- always (this tool, this session)
+```
+
+Trust is scoped per-tool, so `a` to a write doesn't trust bash. `/trust`
+shows + resets state; `/trust all` grants session-wide consent (close to
+`/yolo` but revocable). Synonyms for `a`: `always`, `trust`, `all`.
+
+### v0.9.6 — reproducibility passport + /council + /blame
+
+**Passport** — every model call stamps a sha256 of `(model + prompt +
+cwd + sorted active lessons + LoRA endpoint)` into
+`~/.joe-agent/passports.sqlite`.
+
+```
+/passport list                   # newest 20 (hash, ts, model, preview)
+/passport show <hash-prefix>     # full input space + response
+/passport replay <hash>          # re-run the exact prompt bit-for-bit
+```
+
+The hash is the natural identity for "this exact input space." Anthropic
+engineers know determinism is hard; having a passport for every turn is
+the difference between toy and tool.
+
+**`/council`** — concurrent multi-model arbitration. Fires the same
+prompt at `joe-gemma + deepseek-r1:14b + qwen2.5:14b` in parallel threads
+(override via `$JOE_COUNCIL='m1,m2,m3'`), shows them side-by-side in
+Rich Columns with per-model latency, then asks a fourth judge model
+(`$JOE_COUNCIL_JUDGE`) which one is best. Winner logged to evals.sqlite.
+
+**`/blame <file>:<line>`** — git-blame for AI provenance. Surfaces the
+prompt, agent, model, session, line range, and ±deltas that wrote that
+line. The capture has always happened; v0.9.6 surfaced it one slash away.
+
+Plus tool-emission repair hints (parser failures get specific feedback
+fed back — "your `<write>` opened at char 42 but never closed"), AST
+validation on Python writes (broken syntax blocked before disk hit), and
+a "Scope discipline" system-prompt section that stops joe from polishing
+files it just `<cd>`'d into.
+
+### v0.9.7 — agentic PC control + custom commands + hooks
+
+joe sees and acts on the host machine. Seven new XML tools:
+
+```xml
+<screen />                          <!-- captures display, attaches as
+                                         image to next turn; joe-gemma
+                                         is gemma3 vision-capable -->
+<click x="500" y="300" button="left" clicks="1" />
+<type>literal text at focus</type>
+<key>cmd+s</key>                    <!-- hotkey or single key -->
+<open>app-or-url</open>             <!-- launches via open/xdg-open/start -->
+<clipboard op="get" />              <!-- read system clipboard -->
+<clipboard op="set">text</clipboard>
+```
+
+Each gated by `/trust click`, `/trust type`, etc. Screenshots via
+`screencapture` (macOS) / `gnome-screenshot` / `scrot`. Mouse + keyboard
+via pyautogui (optional dep). Clipboard via pbpaste/pbcopy / xclip /
+wl-paste.
+
+**Custom slash commands** — drop a TOML file at
+`~/.joe-agent/commands/<name>.toml`:
+
+```toml
+description = "Senior security review"
+template = """
+Review {{args}} in {{cwd}} as of {{date}}.
+Focus on: thread safety, SQL injection, auth bypass, secrets in git.
+Be specific.
+"""
+model = "joe-gemma"               # optional override
+allowed_tools = ["read", "grep"]  # optional restriction
+```
+
+Type `/review src/auth.py` and joe renders the template + runs a turn.
+Substitutions: `{{args}}`, `{{cwd}}`, `{{date}}`. `/commands` lists them;
+`/commands reload` re-reads from disk.
+
+**Lifecycle hooks** — shell scripts in `~/.joe-agent/hooks/<event>.sh`
+fire on:
+
+```
+user_prompt   non-zero EXIT cancels the turn
+pre_tool      non-zero EXIT BLOCKS the tool + feeds stderr back to model
+post_tool     non-blocking; receives result via env
+stop          after turn completes
+```
+
+Hooks receive `JOE_HOOK_EVENT`, `JOE_HOOK_TOOL`, `JOE_HOOK_TOOL_ARGS`,
+`JOE_HOOK_TOOL_BODY`, `JOE_HOOK_TOOL_RESULT`, `JOE_HOOK_USER_MSG`,
+`JOE_HOOK_RESPONSE`, `JOE_HOOK_CWD`, `JOE_HOOK_SESSION`, `JOE_HOOK_MODEL`
+via env. Mirrors Claude Code's hook surface so admin policies port
+straight over.
+
+### v0.9.8 — eval diff + auto-eval on swap
+
+```
+joe eval diff <model-a> <model-b>   # per-case head-to-head: wins /
+                                    # losses / ties + score deltas
+joe eval cases                      # list the current eval set
+```
+
+Auto-eval kicks in a daemon thread when the REPL's model changes (via
+`/model <name>`). Runs the eval set against the new model, compares to
+the previous model's most recent run, fires a desktop notification if
+avg-similarity drops by >0.02.
+
+### v0.9.9 — `<parallel>` + deterministic-tool cache
+
+```xml
+<parallel>
+  <read path="src/a.py" />
+  <read path="src/b.py" />
+  <grep pattern="def login" path="." />
+</parallel>
+```
+
+Fans the children out concurrently via ThreadPoolExecutor (max 8
+workers). Children restricted to side-effect-free tags: `<read>`,
+`<grep>`, `<glob>`, `<web_fetch>`. Single-child short-circuits to direct
+dispatch (no thread overhead).
+
+Plus a per-session result cache for those same four tools keyed by
+`(tool, attrs, body prefix, cwd)`. Repeated reads of the same file or
+greps for the same pattern return instantly with a `[cache hit]` marker.
+
+### v0.9.10 — Playwright `<browser>`
+
+Real headless Chromium driven by a persistent Playwright session per
+REPL:
+
+```xml
+<browser action="open" url="https://github.com/joemunene-by" />
+<browser action="click" selector="a[href='/joemunene-by/joe']" />
+<browser action="extract" selector=".repository-content" />
+<browser action="screenshot" path="/tmp/joe-repo.png" />
+<browser action="close" />
+```
+
+Other actions: `type`, `wait`, `title`, `url`, `back`. Cookies + login
+persist across actions in one REPL. Headed via `JOE_BROWSER_HEADED=1`.
+Optional dep — refuses with an install hint if Playwright isn't present:
+
+```sh
+pip install --user playwright && playwright install chromium
+```
+
+Combined with `<screen>` + `<click>` from v0.9.7, joe drives both a
+headless browser (websites + scraping + automation) AND the user's actual
+desktop (window automation). That's the full Anthropic-Computer-Use
+surface, on local hardware, with /trust-gated consent.
+
+## tool registry (22 tags)
+
+| tag | what it does | side effects |
+|---|---|---|
+| `<read>` | read file or dir listing | none (cached) |
+| `<write>` | write file (Python AST-validated) | disk write |
+| `<edit>` | regex find-and-replace in file | disk write |
+| `<bash>` | shell command (allow-list unless `--unsafe-bash`) | varies |
+| `<cd>` | persistent cwd change (accepts project aliases) | session state |
+| `<grep>` | recursive text search | none (cached) |
+| `<glob>` | filename pattern search | none (cached) |
+| `<delegate>` | spawn coder model (qwen2.5-coder:7b/14b) | model call |
+| `<test>` | auto-detect + run pytest/cargo/npm test | execution |
+| `<lint>` | auto-detect + run ruff/clippy/eslint/tsc | execution |
+| `<build>` | auto-detect + run build command | execution |
+| `<web_search>` | DuckDuckGo HTML search | network (cached) |
+| `<web_fetch>` | fetch + HTML→text | network (cached) |
+| `<plan>` | multi-step plan with approval | model orchestration |
+| `<image>` | attach image to next turn | session state |
+| `<mcp>` | call a connected MCP server | external |
+| `<screen>` | capture screen, attach to next turn | display flash |
+| `<click>` | mouse click at (x, y) | input device |
+| `<type>` | typewrite at focus | input device |
+| `<key>` | hotkey / single key | input device |
+| `<open>` | launch app or URL | desktop launch |
+| `<clipboard>` | get/set system clipboard | clipboard |
+| `<parallel>` | fan-out N side-effect-free tools | concurrency |
+| `<browser>` | Playwright Chromium driver | browser session |
+
 ## what's not in here yet
 
 The headline open items are shipped. Future polish:
@@ -395,6 +590,11 @@ The headline open items are shipped. Future polish:
 - HTTP transport for MCP clients (currently stdio-only).
 - A `joe stats --export csv` flag.
 - More piper-tts voices via a per-language `--setup-piper <locale>` flow.
+- Treesitter-aware `<edit>` (Python writes are AST-validated; other
+  languages get text-only).
+- Plugin-driven tool registration (the 22 tools are hard-coded; a
+  drop-in `~/.joe-agent/tools/*.py` loader would mirror MCP's role for
+  external services but for pure-Python local tools).
 
 PRs welcome.
 
