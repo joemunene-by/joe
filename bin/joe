@@ -2907,11 +2907,26 @@ def tool_cd(attrs: dict, body: str) -> str:
     )
 
 
+# Patterns that match essentially every line. Cheap O(1) check used to
+# block <grep pattern=".*"> and friends, which dump tens of thousands of
+# rows and crash the model's context window.
+_CATCHALL_GREP_PATTERNS = {".*", ".+", "^", "$", "^$", ".", "[^]", ""}
+
+
 def tool_grep(attrs: dict, body: str) -> str:
     pat = attrs.get("pattern") or body.strip()
     where = attrs.get("path", ".")
     if not pat:
         raise ToolError("<grep> requires pattern=\"...\" or body")
+    if pat.strip() in _CATCHALL_GREP_PATTERNS:
+        raise ToolError(
+            f"<grep pattern={pat!r}>: that pattern matches every line. "
+            "If you want a directory listing, use <bash>ls</bash> or "
+            "<glob pattern=\"*.py\" />. If you want to find a specific "
+            "thing, narrow the pattern to a literal token or a tight "
+            "regex. Catch-all greps dump tens of thousands of rows and "
+            "drown the context."
+        )
     p = _resolve_path(where)
     try:
         cp = subprocess.run(
@@ -4544,6 +4559,14 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
         "  - Never substitute facts that look plausible but weren't\n"
         "    given. If you don't KNOW the right repo URL / framework\n"
         "    version / file path, don't write it. Ask, or skip.\n"
+        "  - Tool discipline: never emit <grep pattern=\".*\" />,\n"
+        "    <grep pattern=\".+\" />, or any other catch-all. Those\n"
+        "    dump thousands of lines, drown your context, and tell\n"
+        "    the user nothing. If you want to see what's in a\n"
+        "    directory, use <bash>ls</bash> or <glob pattern=\"*.py\" />.\n"
+        "    If you want to find a specific thing, search for a\n"
+        "    LITERAL token or a tight regex (e.g. 'TODO',\n"
+        "    'def parse_', 'class.*Widget').\n"
         "\n"
         "Code-writing protocol (this is the most important rule in the\n"
         "whole shell, do not skip):\n"
