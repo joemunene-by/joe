@@ -143,6 +143,9 @@ SNAPS_DIR.mkdir(parents=True, exist_ok=True)
 JOURNAL_DIR = STATE_DIR / "journal"
 JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
 HISTORY_INDEX_DB = STATE_DIR / "history-index.sqlite"
+# v0.11.11: codebase vector index, built by `joe-index build`. Read by
+# the REPL each turn to auto-inject relevant code chunks.
+VECTOR_INDEX_DB = STATE_DIR / "vector-index.sqlite"
 AGENTS_DIR = STATE_DIR / "agents"
 AGENTS_DIR.mkdir(parents=True, exist_ok=True)
 EXPORTS_DIR = STATE_DIR / "exports"
@@ -3151,6 +3154,94 @@ def history_block(picks: list[dict]) -> str:
 
 
 # --------------------------------------------------------------------------
+# v0.11.11: codebase RAG. joe-index builds a vector store over every
+# source file under the user's active repos. This block queries it per
+# turn and injects the top-K chunks under the current cwd as context.
+# Same primitive every modern agent ships (Cursor "@codebase", Cody,
+# Continue's @codebase, OpenHands code retrieval) -- joe had the index
+# already from v0.4-era joe-index, just never auto-injected it into the
+# chat loop.
+# --------------------------------------------------------------------------
+
+
+_AUTO_REPO_RAG: bool = os.environ.get(
+    "JOE_AUTO_RAG", "1"
+).strip().lower() not in {"0", "off", "false", "no", ""}
+
+
+def repo_rag_query(user_msg: str, cwd: Path, k: int = 4) -> list[dict]:
+    """Return top-k code chunks from the vector index matching user_msg.
+
+    Filters to chunks under `cwd` so other indexed repos don't bleed in.
+    Empty list when:
+      - the user_msg is too short to be meaningful (< 12 chars after strip)
+      - the vector-index.sqlite doesn't exist yet (run `joe-index build`)
+      - the embedding endpoint is unreachable
+      - no chunks indexed under cwd
+
+    The contract mirrors history_recall: best-effort, never raises.
+    """
+    if not _AUTO_REPO_RAG:
+        return []
+    if not VECTOR_INDEX_DB.exists():
+        return []
+    if len(user_msg.strip()) < 12:
+        return []
+    qv = _embed(user_msg)
+    if not qv:
+        return []
+    try:
+        c = sqlite3.connect(str(VECTOR_INDEX_DB))
+        rows = c.execute(
+            "SELECT repo, path, line_start, line_end, text, embedding"
+            " FROM chunks WHERE repo = ?",
+            (str(cwd),),
+        ).fetchall()
+        c.close()
+    except sqlite3.Error:
+        return []
+    if not rows:
+        # Index exists but cwd isn't indexed; nothing to inject.
+        return []
+    scored: list[tuple[float, str, int, int, str]] = []
+    for _repo, path, ls, le, text, emb_blob in rows:
+        vec = _unpack_vec(emb_blob)
+        score = _cosine(qv, vec)
+        scored.append((score, path, ls, le, text))
+    scored.sort(reverse=True)
+    return [
+        {"score": s, "path": p, "line_start": ls, "line_end": le, "text": t}
+        for s, p, ls, le, t in scored[:k]
+    ]
+
+
+def repo_rag_block(hits: list[dict]) -> str:
+    """Render hits as a `<repo_rag>` block. Empty string when no hits.
+
+    Each hit is a `<file path="..." lines="A-B" score="0.xx">` element
+    containing the snippet text (truncated to 1200 chars to keep the
+    block compact). The note in the wrapper tag tells the model the
+    chunks are similarity-retrieved and may be stale -- mirrors the
+    history_block convention so the model treats both the same way."""
+    if not hits:
+        return ""
+    parts: list[str] = [
+        "<repo_rag note=\"retrieved from the codebase by similarity; "
+        "verify with read/grep before relying on the line numbers\">",
+    ]
+    for h in hits:
+        snippet = h["text"][:1200]
+        if len(h["text"]) > 1200:
+            snippet += "\n... [chunk truncated]"
+        parts.append(
+            f'<file path="{h["path"]}" lines="{h["line_start"]}-{h["line_end"]}"'
+            f' score="{h["score"]:.2f}">\n{snippet}\n</file>'
+        )
+    parts.append("</repo_rag>")
+    return "\n".join(parts)
+
+
+# --------------------------------------------------------------------------
 # Token budget helpers
 # --------------------------------------------------------------------------
 
@@ -3518,6 +3609,85 @@ def _validate_source(path: Path, content: str) -> Optional[str]:
     return _validate_treesitter(path, content)
 
 
+# v0.11.11: linter-feedback ACI on edit. SWE-agent's central insight is
+# that the model self-corrects far better when it sees the linter's
+# diagnostics on the SAME turn as the write. joe already has the lint
+# tool; this just calls it after a successful write/edit and surfaces
+# the output back to the model. Cheap, high-leverage, idiomatic of the
+# 2026 ACI pattern.
+_AUTO_LINT_AFTER_EDIT: bool = os.environ.get(
+    "JOE_AUTO_LINT", "1"
+).strip().lower() not in {"0", "off", "false", "no", ""}
+
+
+def _post_edit_lint(path: Path) -> Optional[str]:
+    """Run the project's per-file linter on `path` and return any
+    diagnostics as a short string, or None when clean / unsupported /
+    linter absent. Best-effort: never raises."""
+    if not _AUTO_LINT_AFTER_EDIT:
+        return None
+    if not path.exists():
+        return None
+    ext = path.suffix.lower()
+    if ext == ".py":
+        if not shutil.which("ruff"):
+            return None
+        cmd = ["ruff", "check", "--no-fix", str(path)]
+    elif ext in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+        # Prefer a local eslint over a global one. npx --no-install
+        # avoids accidental downloads.
+        if shutil.which("eslint"):
+            cmd = ["eslint", str(path)]
+        elif shutil.which("npx"):
+            cmd = ["npx", "--no-install", "eslint", str(path)]
+        else:
+            return None
+    elif ext == ".go":
+        if not shutil.which("go"):
+            return None
+        # `go vet` works on a single file via its package.
+        cmd = ["go", "vet", str(path)]
+    elif ext == ".sh" or ext == ".bash":
+        if not shutil.which("shellcheck"):
+            return None
+        cmd = ["shellcheck", "-f", "tty", str(path)]
+    else:
+        return None
+    try:
+        cp = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30,
+            cwd=str(path.parent),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if cp.returncode == 0:
+        return None
+    output = (cp.stdout or "").strip()
+    if cp.stderr:
+        output = (output + "\n" + cp.stderr.strip()) if output else cp.stderr.strip()
+    if not output:
+        return None
+    # Cap so a flood of diagnostics doesn't blow the budget.
+    if len(output) > 2000:
+        output = output[:2000] + "\n... [lint output truncated]"
+    return output
+
+
+def _annotate_with_lint(base_msg: str, path: Path) -> str:
+    """Append a `<lint_after_write>` block to a tool's success message
+    when the linter has diagnostics. The model sees these on the SAME
+    turn as the write and can self-correct without a separate prompt."""
+    diagnostics = _post_edit_lint(path)
+    if not diagnostics:
+        return base_msg
+    block = (
+        f"\n\n<lint_after_write path=\"{path}\">\n"
+        f"{diagnostics}\n"
+        f"</lint_after_write>"
+    )
+    return base_msg + block
+
+
 # v0.11.10: secrets guardrails. Refuses to write a file when its body
 # matches a known secret pattern (AWS key, OpenAI key, GitHub token,
 # Slack webhook, SSH private key, generic ".env"-style assignments to
@@ -3748,7 +3918,9 @@ def tool_write(attrs: dict, body: str, confirm: bool = True) -> str:
     msg = f"wrote {len(body)} bytes to {path}"
     if stranger_warning:
         msg += "\n" + stranger_warning
-    return msg
+    # v0.11.11: linter-feedback ACI — run the linter on `p` and append
+    # diagnostics so the model sees them on this turn.
+    return _annotate_with_lint(msg, p)
 
 
 def tool_edit(attrs: dict, body: str, confirm: bool = True) -> str:
@@ -3803,7 +3975,8 @@ def tool_edit(attrs: dict, body: str, confirm: bool = True) -> str:
         line_start=ls, line_end=le, adds=adds, dels=dels,
     )
     _maybe_auto_test(p)
-    return f"edited {path}"
+    # v0.11.11: linter-feedback ACI.
+    return _annotate_with_lint(f"edited {path}", p)
 
 
 def tool_multi_edit(attrs: dict, body: str, confirm: bool = True) -> str:
@@ -3877,7 +4050,10 @@ def tool_multi_edit(attrs: dict, body: str, confirm: bool = True) -> str:
         p, "multi_edit", src, cur,
         line_start=None, line_end=None, adds=adds, dels=dels,
     )
-    return f"applied {len(pairs)} edits to {path} (+{adds}/-{dels})"
+    # v0.11.11: linter-feedback ACI.
+    return _annotate_with_lint(
+        f"applied {len(pairs)} edits to {path} (+{adds}/-{dels})", p,
+    )
 
 
 def tool_notebook_edit(attrs: dict, body: str, confirm: bool = True) -> str:
@@ -4357,7 +4533,13 @@ def install_skill_from_git(git_url: str) -> tuple[bool, str]:
 
 def _parse_skill_md(path: Path) -> Optional[dict]:
     """Parse SKILL.md: --- frontmatter --- + body. Returns dict with
-    keys name, description, when_to_use, allowed_tools (optional), body."""
+    keys name, description, when_to_use, allowed_tools (optional), body.
+
+    v0.11.11: also accepts OpenHands microagent ``triggers: [a, b, c]``
+    inline-list syntax and folds it into ``when_to_use`` for the same
+    keyword-matching behaviour. Skills shared in the OpenHands microagent
+    ecosystem drop into ``~/.joe-agent/skills/`` without translation.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -4377,6 +4559,18 @@ def _parse_skill_md(path: Path) -> Optional[dict]:
         meta[k.strip()] = v.strip()
     if "name" not in meta:
         meta["name"] = path.parent.name
+    # OpenHands-style ``triggers: [a, b]`` -> merge into when_to_use.
+    raw_triggers = meta.get("triggers", "")
+    if raw_triggers:
+        # Strip surrounding [ ] if present (inline-list form). For the
+        # block-list form (one bullet per line), we can't easily parse
+        # without YAML, but inline covers the OpenHands repo conventions.
+        triggers_flat = raw_triggers.strip().lstrip("[").rstrip("]")
+        existing = meta.get("when_to_use", "")
+        if existing:
+            meta["when_to_use"] = existing + ", " + triggers_flat
+        else:
+            meta["when_to_use"] = triggers_flat
     meta["body"] = body
     return meta
 
@@ -7252,6 +7446,13 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
     rmap = _build_repo_map(cwd)
     if rmap:
         parts.append(f"<repo_map>\n{rmap}\n</repo_map>")
+    # v0.11.11: codebase RAG. If joe-index has built a vector store for
+    # this cwd, query it with the user message and inject the top-K
+    # semantically-similar code chunks. Auto-disabled when the index
+    # doesn't exist (no penalty for fresh repos) or when JOE_AUTO_RAG=0.
+    rag_hits = repo_rag_query(user_msg, cwd)
+    if rag_hits:
+        parts.append(repo_rag_block(rag_hits))
     parts.append(
         "<environment name=\"joe shell\">\n"
         "You are running inside the `joe` interactive shell. You are the\n"

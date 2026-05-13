@@ -2,6 +2,34 @@
 
 The headline feature per release. Full git log between tags has more.
 
+## v0.11.11 — landscape-sweep batch: RAG + linter ACI + microagent compat
+
+A deep mine of 2026's OSS coding-agent ecosystem (Goose, OpenHands,
+SWE-agent, Open Interpreter, Cody, gptme, Continue, Warp, Zed, OpenCode,
+JetBrains, Cline/Roo checkpoints) surfaced three near-free wins. All
+three ship here.
+
+- **Codebase vector RAG** auto-injects top-K chunks from the `joe-index`
+  vector store under cwd into every turn's system prompt. The
+  infrastructure existed since the v0.4-era `joe-index` binary; this
+  wires it into the chat loop the same way Cursor's `@codebase`,
+  Cody's agentic context, and Continue's `@codebase` do. New
+  `repo_rag_query` + `repo_rag_block` helpers in `bin/joe`. Gated on
+  `JOE_AUTO_RAG=1` (default), silent no-op when no index exists.
+- **Linter-feedback ACI on edit** — SWE-agent's central insight: the
+  model self-corrects far better when it sees lint diagnostics on the
+  SAME turn as the edit. `tool_write` / `tool_edit` / `tool_multi_edit`
+  now run the per-file linter (ruff / eslint / go vet / shellcheck)
+  after a successful write and append a `<lint_after_write>` block to
+  the tool result. `JOE_AUTO_LINT=0` to disable.
+- **OpenHands microagent compatibility** — SKILL.md frontmatter now
+  parses `triggers: [a, b, c]` (OpenHands inline-list form) and folds
+  it into `when_to_use`. OpenHands microagents shared publicly drop
+  into `~/.joe-agent/skills/` without translation.
+
+15 new tests in `tests/test_v0_11_11_features.py`. 296 / 299 passing
+across the full suite.
+
 ## v0.11.10 — secrets-pattern guardrail
 
 - New `_scan_secrets()` scanner refuses `<write>` / `<edit>` /
