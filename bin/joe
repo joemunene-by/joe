@@ -3852,6 +3852,10 @@ def tool_open(attrs: dict, body: str, confirm: bool = True) -> str:
 
 _BROWSER_CTX: dict = {"playwright": None, "browser": None, "page": None}
 
+# Set at the top of each stream call so the trailing turn-meter line can
+# compute elapsed without threading state through every helper.
+_turn_start_ts: float = 0.0
+
 
 def _ensure_browser() -> "Any":
     """Lazy-init a single persistent Playwright browser + page for the
@@ -5153,6 +5157,114 @@ def _council(prompt: str, default_model: str) -> None:
         pass
 
 
+def _diff_model(prompt: str, model_a: str, model_b: str) -> None:
+    """Cheaper 2-model side-by-side: same prompt, two responses, no judge.
+    Use when you want a quick A/B without spending tokens on a judge call."""
+    console.print(
+        f"[dim]/diff-model:[/] firing prompt at {model_a} vs {model_b}"
+    )
+    results = {model_a: "", model_b: ""}
+    timings = {model_a: 0.0, model_b: 0.0}
+    errors = {model_a: "", model_b: ""}
+
+    def _ask(m: str) -> None:
+        s = time.time()
+        try:
+            results[m] = _ollama_once(m, prompt, timeout=300)
+        except Exception as e:
+            errors[m] = f"{type(e).__name__}: {e}"
+        timings[m] = time.time() - s
+
+    threads = [threading.Thread(target=_ask, args=(m,), daemon=True)
+               for m in (model_a, model_b)]
+    for t in threads:
+        t.start()
+    with console.status(
+        Text.from_markup(f"[bold cyan]/diff-model[/] waiting on 2 models..."),
+        spinner="dots",
+    ):
+        for t in threads:
+            t.join(timeout=300)
+
+    from rich.columns import Columns
+    panels = []
+    for m in (model_a, model_b):
+        if errors.get(m):
+            body = Text.from_markup(f"[red]{errors[m]}[/]")
+            sub = f"failed in {timings[m]:.1f}s"
+        else:
+            text = (results.get(m, "") or "").strip()
+            body = Text(text[:2400] + ("..." if len(text) > 2400 else ""))
+            sub = f"{timings[m]:.1f}s · {len(text)} chars"
+        panels.append(Panel(body, title=f"[cyan]{m}[/]", title_align="left",
+                             subtitle=sub, border_style="cyan",
+                             width=max(48, min(100, 110)), padding=(0, 1)))
+    console.print(Columns(panels, equal=True, expand=False))
+
+
+# Reasoning-trace capture: when a model emits <think>...</think> blocks
+# (DeepSeek-R1, Gemma3-thinking, etc.), strip them from the user-visible
+# response BUT persist the trace into a separate sqlite so you can audit
+# how the model arrived at its answer later.
+THINK_DB = STATE_DIR / "think.sqlite"
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _thinkdb() -> sqlite3.Connection:
+    c = sqlite3.connect(str(THINK_DB))
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS think ("
+        " hash TEXT,"          # passport hash if available; else session+ts
+        " ts TEXT NOT NULL,"
+        " model TEXT NOT NULL,"
+        " trace TEXT NOT NULL)"
+    )
+    c.execute("CREATE INDEX IF NOT EXISTS idx_think_hash ON think(hash)")
+    return c
+
+
+def capture_reasoning_trace(model: str, response: str,
+                            passport_hash: str = "") -> str:
+    """Strip <think>...</think> from the response, persist the inner
+    traces to think.sqlite, and return the response with thinks removed.
+    No-op when the model doesn't emit think blocks."""
+    matches = _THINK_RE.findall(response)
+    if not matches:
+        return response
+    try:
+        c = _thinkdb()
+        ts = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat()
+        h = passport_hash or _TURN_CTX.get("session", "")
+        for m in matches:
+            c.execute(
+                "INSERT INTO think (hash, ts, model, trace) VALUES (?, ?, ?, ?)",
+                (h, ts, model, m.strip()[:100000]),
+            )
+        c.commit(); c.close()
+    except Exception:
+        pass
+    return _THINK_RE.sub("", response)
+
+
+def show_reasoning_trace(hash_prefix: str) -> Optional[list[str]]:
+    """Look up reasoning traces by hash prefix or session id."""
+    if not hash_prefix or len(hash_prefix) < 4:
+        return None
+    try:
+        c = _thinkdb()
+        rows = c.execute(
+            "SELECT ts, model, trace FROM think WHERE hash LIKE ?"
+            " ORDER BY ts ASC LIMIT 20",
+            (hash_prefix + "%",),
+        ).fetchall()
+        c.close()
+    except Exception:
+        return None
+    if not rows:
+        return None
+    return [f"[{ts[:19]}] {model}\n{trace}" for ts, model, trace in rows]
+
+
 def _mlx_server_stream_to_console(model: str, prompt: str, base: str) -> str:
     """Stream tokens to console from mlx_lm.server's OpenAI-style SSE."""
     body = {
@@ -5219,6 +5331,8 @@ def _ollama_stream_to_console(model: str, prompt: str) -> str:
     first non-empty token arrives, then it's replaced by a streaming label
     and the tokens print as they come. Returns the full text.
     """
+    global _turn_start_ts
+    _turn_start_ts = time.time()
     base = _detect_llm()
     if base:
         return _mlx_server_stream_to_console(model, prompt, base)
@@ -5265,7 +5379,22 @@ def _ollama_stream_to_console(model: str, prompt: str) -> str:
     if buf:
         console.print()  # final newline after streaming
     response = "".join(buf)
-    passport_record(model, prompt, response, mode="stream")
+    # Inline turn meter: tokens in/out + elapsed. Helps engineers see
+    # the latency profile without leaving the REPL.
+    try:
+        elapsed = time.time() - _turn_start_ts
+        tokens_in = estimate_tokens(prompt)
+        tokens_out = estimate_tokens(response)
+        console.print(
+            f"[dim]  └ {tokens_in:>5} tok in · {tokens_out:>5} tok out · "
+            f"{elapsed:.1f}s · {tokens_out / max(elapsed, 0.01):.0f} tok/s[/]"
+        )
+    except Exception:
+        pass
+    h = passport_record(model, prompt, response, mode="stream")
+    # Strip + persist <think>...</think> blocks before returning so they
+    # don't pollute downstream tool-call parsing.
+    response = capture_reasoning_trace(model, response, passport_hash=h)
     return response
 
 
@@ -5279,6 +5408,7 @@ SLASH_COMMAND_NAMES = (
     "clear", "save", "load", "voice",
     "sessions", "whoami", "cost", "compact", "yolo", "trust", "doctor",
     "blame", "passport", "council", "commands", "plugins",
+    "diff-model", "diffmodel", "think",
     "read", "run", "diff", "copy", "history", "undo", "redo",
     "plan", "test", "lint", "build", "explain", "profile",
     "commit", "push", "pr", "issue", "snap",
@@ -7272,6 +7402,42 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                     )
                     continue
                 _council(args.strip(), default_model=state["model"])
+                continue
+            if cmd in {"diff-model", "diffmodel"}:
+                # /diff-model <model-a> <model-b> <prompt>
+                # Quick 2-model A/B without judge spend.
+                parts = args.strip().split(None, 2)
+                if len(parts) < 3:
+                    console.print(
+                        "[red]/diff-model <model-a> <model-b> <prompt>[/]"
+                    )
+                    continue
+                _diff_model(parts[2], parts[0], parts[1])
+                continue
+            if cmd == "think":
+                sub = args.strip().split(None, 1)
+                if not sub or sub[0] == "show" and len(sub) < 2:
+                    console.print("[red]/think show <hash-or-session-prefix>[/]")
+                    continue
+                if sub[0] == "show":
+                    traces = show_reasoning_trace(sub[1])
+                    if not traces:
+                        console.print(
+                            f"[red]no reasoning traces match {sub[1]!r}[/] "
+                            "(need >= 4-char prefix; only thinking models "
+                            "emit traces)"
+                        )
+                        continue
+                    body = "\n\n---\n\n".join(traces[:5])
+                    if len(traces) > 5:
+                        body += f"\n\n[dim]+{len(traces) - 5} more traces hidden[/]"
+                    panel(
+                        f"reasoning traces (hash~{sub[1]})",
+                        Text(body),
+                        style="bright_blue",
+                    )
+                    continue
+                console.print("[red]/think show <prefix>[/]")
                 continue
             if cmd == "yolo":
                 cur = os.environ.get("JOE_AUTO_YES", "").strip() in {"1", "true", "yes"}
