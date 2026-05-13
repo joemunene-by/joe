@@ -166,6 +166,57 @@ PLUGIN_TOOLS_DIR = STATE_DIR / "tools"
 OUTPUT_STYLES_DIR = STATE_DIR / "output-styles"
 STATUSLINE_FILE = STATE_DIR / "statusline"
 
+# Sandbox modes (Codex-inspired). Determines which tools the dispatcher
+# will actually invoke. "full" = everything, "workspace-write" = read +
+# write inside cwd only, "read-only" = no side-effecting tools.
+_SANDBOX_MODE: str = os.environ.get("JOE_SANDBOX", "full").strip().lower() or "full"
+
+_SANDBOX_LEVELS = {
+    "read-only": frozenset({
+        "read", "grep", "glob", "web_search", "web_fetch", "cd",
+        "parallel", "screen", "clipboard",
+    }),
+    "workspace-write": frozenset({
+        "read", "grep", "glob", "web_search", "web_fetch", "cd",
+        "parallel", "screen", "clipboard",
+        # writes are allowed but restricted to cwd-or-descendant paths
+        # at the tool layer.
+        "write", "edit", "multi_edit", "notebook_edit",
+        "test", "lint", "build",
+    }),
+    "full": frozenset(),  # empty = all allowed
+}
+
+
+def _sandbox_allows(tool_name: str) -> bool:
+    if _SANDBOX_MODE == "full":
+        return True
+    allowed = _SANDBOX_LEVELS.get(_SANDBOX_MODE)
+    if allowed is None:  # unknown mode = treat as full to be safe
+        return True
+    return tool_name in allowed
+
+
+def _sandbox_check_path(tool_name: str, path_str: str) -> None:
+    """In workspace-write mode, refuse writes outside cwd. Raises ToolError
+    when the path escapes the workspace."""
+    if _SANDBOX_MODE != "workspace-write":
+        return
+    if tool_name not in {"write", "edit", "multi_edit", "notebook_edit"}:
+        return
+    try:
+        p = Path(os.path.expanduser(path_str)).resolve()
+        cwd = Path.cwd().resolve()
+    except Exception:
+        return  # don't block on path resolution failure
+    try:
+        p.relative_to(cwd)
+    except ValueError:
+        raise ToolError(
+            f"sandbox=workspace-write refuses {tool_name} outside cwd: "
+            f"{p}  (not under {cwd}). /sandbox full to allow."
+        )
+
 # Built-in output-style presets that overlay the system prompt. Mirrors
 # Claude Code's /output-style with a set of personality + verbosity
 # defaults users can switch on the fly.
@@ -5645,6 +5696,7 @@ SLASH_COMMAND_NAMES = (
     "blame", "passport", "council", "commands", "plugins",
     "diff-model", "diffmodel", "think",
     "output-style", "outputstyle", "style", "statusline",
+    "sandbox", "mode",
     "read", "run", "diff", "copy", "history", "undo", "redo",
     "plan", "test", "lint", "build", "explain", "profile",
     "commit", "push", "pr", "issue", "snap",
@@ -6360,6 +6412,45 @@ def cmd_watch(args: argparse.Namespace) -> int:
     return 0
 
 
+# Cursor/Continue.dev-style @-mention parser: user types "@src/auth.py
+# what's wrong here?" and joe injects the file content automatically.
+# Token format: @ followed by a non-whitespace, non-@ run that contains
+# at least one path separator OR exists in the cwd.
+_AT_MENTION_RE = re.compile(r"(?<!\w)@([^\s@]+)")
+
+
+def _expand_at_mentions(user_msg: str) -> str:
+    """Find every @path token in the user message, resolve to a real file,
+    and prepend a <file path="..."> block per match. Tokens that don't
+    resolve are left untouched (the model sees the raw @path)."""
+    matches = list(_AT_MENTION_RE.finditer(user_msg))
+    if not matches:
+        return user_msg
+    seen: set[str] = set()
+    blocks: list[str] = []
+    for m in matches:
+        candidate = m.group(1).rstrip(",.!?;:)")
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        p = Path(os.path.expanduser(candidate))
+        if not p.is_absolute():
+            p = (Path.cwd() / candidate).resolve()
+        if not p.is_file():
+            continue
+        try:
+            content = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if len(content) > 30000:
+            content = content[:30000] + "\n[... truncated ...]"
+        rel = candidate
+        blocks.append(f"<file path=\"{rel}\">\n{content}\n</file>")
+    if not blocks:
+        return user_msg
+    return "\n\n".join(blocks) + "\n\n" + user_msg
+
+
 def _shell_history_block(n: int = 10) -> str:
     """Return the last `n` lines of zsh history as a <recent_shell> block."""
     if os.environ.get("JOE_SHELL_HISTORY", "").strip() not in {"1", "true", "yes"}:
@@ -6613,6 +6704,10 @@ def run_turn(
 ) -> None:
     # Stamp this turn's context for the provenance/lessons subsystems.
     # @@agent dispatch sets `_TURN_CTX["agent"]` before us; preserve it here.
+    # Expand @-mentions in the user message before the model sees it.
+    # Cursor/Continue.dev style: "@src/auth.py what's wrong?" -> the file
+    # content gets prepended as a <file> block automatically.
+    user_msg = _expand_at_mentions(user_msg)
     _TURN_CTX.update(
         user_msg=user_msg[:4000],
         session=session or "",
@@ -6670,6 +6765,32 @@ def run_turn(
             same_call_count = 0
             last_call_signature = sig
 
+        # Sandbox check: refuse tools not allowed at the current level.
+        if not _sandbox_allows(call.name):
+            result = (
+                f"sandbox={_SANDBOX_MODE} blocked <{call.name}>. "
+                f"Use /sandbox full (or restart with --sandbox full) to allow."
+            )
+            console.print(f"[yellow]{result}[/]")
+            prompt = (
+                response
+                + f"\n\n<tool_result name=\"{call.name}\">\n{result}\n</tool_result>\n"
+                + "Pick a tool the current sandbox allows, or output STOP."
+            )
+            continue
+        # Workspace-write sandbox: refuse writes outside cwd.
+        if _SANDBOX_MODE == "workspace-write":
+            try:
+                _sandbox_check_path(call.name, call.attrs.get("path", ""))
+            except ToolError as e:
+                result = f"ERROR: {e}"
+                console.print(f"[yellow]sandbox blocked: {e}[/]")
+                prompt = (
+                    response
+                    + f"\n\n<tool_result name=\"{call.name}\">\n{result}\n</tool_result>\n"
+                    + "Re-emit with a path inside the cwd, or output STOP."
+                )
+                continue
         # Pre-tool hook: if the user has a ~/.joe-agent/hooks/pre_tool.sh
         # and it exits non-zero, BLOCK the tool call and feed the hook's
         # stderr back to the model as the tool result.
@@ -8504,6 +8625,27 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                         console.print(f"[red]could not kill #{rest}[/]")
                     continue
                 cmd_task_show(sub); continue
+            if cmd == "sandbox":
+                global _SANDBOX_MODE
+                sub = args.strip().lower()
+                if not sub:
+                    console.print(
+                        f"[dim]sandbox:[/] [bold]{_SANDBOX_MODE}[/]\n"
+                        "  read-only        only read/grep/glob/web_*/cd/parallel/screen/clipboard\n"
+                        "  workspace-write  above + write/edit + test/lint/build (writes scoped to cwd)\n"
+                        "  full             everything (default)\n"
+                        "  /sandbox <mode> to switch"
+                    )
+                    continue
+                if sub not in _SANDBOX_LEVELS:
+                    console.print(
+                        f"[red]unknown sandbox {sub!r}[/]; valid: "
+                        f"{', '.join(_SANDBOX_LEVELS.keys())}"
+                    )
+                    continue
+                _SANDBOX_MODE = sub
+                console.print(f"[green]sandbox:[/] {sub}")
+                continue
             if cmd in {"output-style", "outputstyle", "style"}:
                 global _ACTIVE_OUTPUT_STYLE
                 sub = args.strip()
