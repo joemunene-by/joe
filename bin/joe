@@ -1958,8 +1958,144 @@ def cmd_eval(args: list[str], default_model: str) -> int:
               style="cyan",
               subtitle="positive deltas = improvement vs previous run")
         return 0
+    if sub == "diff":
+        # joe eval diff <model-a> <model-b>  -- per-case head-to-head.
+        if len(args) < 3:
+            console.print("[red]usage: joe eval diff <model-a> <model-b>[/]"); return 1
+        a, b = args[1], args[2]
+        c = _evaldb()
+        # Latest run timestamp per (model). Per-case scores come from results.
+        rows_a = c.execute(
+            "SELECT eval_id, score, answer FROM results WHERE model = ?"
+            " AND ts = (SELECT MAX(ts) FROM results WHERE model = ?)",
+            (a, a),
+        ).fetchall()
+        rows_b = c.execute(
+            "SELECT eval_id, score, answer FROM results WHERE model = ?"
+            " AND ts = (SELECT MAX(ts) FROM results WHERE model = ?)",
+            (b, b),
+        ).fetchall()
+        cases = c.execute("SELECT id, user_msg FROM eval_set").fetchall()
+        c.close()
+        if not rows_a or not rows_b:
+            console.print(
+                f"[red]no eval runs found for {a!r} or {b!r}[/] "
+                f"-- run [bold]joe eval run {a}[/] and [bold]joe eval run {b}[/] first"
+            )
+            return 1
+        scores_a = {eid: s for eid, s, _ in rows_a}
+        scores_b = {eid: s for eid, s, _ in rows_b}
+        user_msg = {eid: um for eid, um in cases}
+        lines = []
+        wins_a = wins_b = ties = 0
+        for eid in sorted(set(scores_a) | set(scores_b)):
+            sa = scores_a.get(eid, 0.0)
+            sb = scores_b.get(eid, 0.0)
+            diff = sa - sb
+            if abs(diff) < 0.01:
+                ties += 1
+                sym = "="
+                color = "dim"
+            elif diff > 0:
+                wins_a += 1
+                sym = "A>B"
+                color = "green"
+            else:
+                wins_b += 1
+                sym = "B>A"
+                color = "red"
+            um_short = (user_msg.get(eid) or "")[:60].replace("\n", " ")
+            lines.append(
+                f"  [{color}]{sym:5}[/]  "
+                f"A={sa:.3f}  B={sb:.3f}  Δ={diff:+.3f}  "
+                f"[dim]{um_short}[/]"
+            )
+        header = (
+            f"[bold]A:[/] [cyan]{a}[/]   [bold]B:[/] [cyan]{b}[/]\n"
+            f"[bold]wins:[/]  A={wins_a}  B={wins_b}  ties={ties}\n"
+        )
+        panel(
+            f"eval diff: {a} vs {b}",
+            Text.from_markup(header + "\n".join(lines)),
+            style="bright_blue",
+        )
+        return 0
+    if sub == "cases":
+        c = _evaldb()
+        rows = c.execute(
+            "SELECT id, substr(user_msg, 1, 100), substr(gold_asst, 1, 60)"
+            " FROM eval_set ORDER BY id ASC LIMIT 40"
+        ).fetchall()
+        c.close()
+        if not rows:
+            console.print(
+                "[dim](eval set is empty; "
+                "[bold]joe eval build[/] from sessions, or "
+                "[bold]joe eval add[/] cases manually)[/]"
+            )
+            return 0
+        lines = []
+        for eid, um, gold in rows:
+            lines.append(
+                f"  [bold]#{eid:<3}[/]  {um}  [dim]-> {gold}...[/]"
+            )
+        panel("Eval cases", Text.from_markup("\n".join(lines)),
+              style="cyan", subtitle=f"{len(rows)} shown")
+        return 0
     console.print(f"[red]unknown eval sub: {sub}[/]")
     return 1
+
+
+def _auto_eval_baseline(model: str) -> Optional[float]:
+    """Latest avg-similarity score for `model` across all cases, or None
+    when there's no prior run to compare against."""
+    try:
+        c = _evaldb()
+        row = c.execute(
+            "SELECT AVG(score) FROM results WHERE model = ?"
+            " AND ts = (SELECT MAX(ts) FROM results WHERE model = ?)",
+            (model, model),
+        ).fetchone()
+        c.close()
+    except Exception:
+        return None
+    if not row or row[0] is None:
+        return None
+    return float(row[0])
+
+
+def _auto_eval_in_background(new_model: str, prev_model: str) -> None:
+    """When the user swaps models (via /lora or /model), kick a quick
+    eval in a daemon thread and warn on regression. Best-effort; never
+    blocks REPL input."""
+    def worker() -> None:
+        try:
+            c = _evaldb()
+            n_cases = c.execute("SELECT COUNT(*) FROM eval_set").fetchone()[0]
+            c.close()
+        except Exception:
+            n_cases = 0
+        if n_cases < 3:
+            return  # not enough cases to be meaningful
+        try:
+            cmd_eval(["run", new_model], default_model=new_model)
+        except Exception:
+            return
+        new_score = _auto_eval_baseline(new_model)
+        prev_score = _auto_eval_baseline(prev_model)
+        if new_score is None or prev_score is None:
+            return
+        delta = new_score - prev_score
+        if delta < -0.02:
+            try:
+                os_notify(
+                    "joe eval regression",
+                    f"{new_model} scored {new_score:.3f} vs {prev_model} {prev_score:.3f} "
+                    f"({delta:+.3f}). consider /model {prev_model}."
+                )
+            except Exception:
+                pass
+    threading.Thread(target=worker, daemon=True).start()
 
 
 # --------------------------------------------------------------------------
@@ -6112,7 +6248,10 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                 continue
             if cmd == "model":
                 if args:
+                    old_model = state["model"]
                     state["model"] = args
+                    if old_model != args:
+                        _auto_eval_in_background(args, old_model)
                 console.print(f"[dim]model: {state['model']}[/]")
                 continue
             if cmd == "coder":
