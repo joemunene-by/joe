@@ -156,6 +156,14 @@ ALLOWED_BASH_PROGRAMS = {
     "tsc", "next", "eslint", "biome", "tauri",
 }
 
+# A <cd> tool tag writes here so the new cwd survives across the run_turn
+# boundary; the REPL loop flushes it back into state["cwd"] at the top of
+# every iteration.
+_PENDING_CWD: Optional[Path] = None
+
+# Cache for _project_aliases(); populated lazily on first read.
+_PROJECT_ALIASES_CACHE: Optional[dict[str, Path]] = None
+
 
 # --------------------------------------------------------------------------
 # Rich console + helpers
@@ -2826,11 +2834,20 @@ def tool_bash(attrs: dict, body: str, allow_all: bool, confirm: bool = True) -> 
     cmd = body.strip()
     if not cmd:
         raise ToolError("<bash> body is empty")
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        parts = []
+    first = parts[0] if parts else ""
+    if os.path.basename(first) == "cd":
+        target = parts[1] if len(parts) > 1 else "~"
+        raise ToolError(
+            f"<bash>cd</bash> has no lasting effect (each <bash> runs in its "
+            f"own subshell). Use <cd path=\"{target}\" /> instead -- it "
+            f"changes joe's working directory for all future tools in this "
+            f"session."
+        )
     if not allow_all:
-        try:
-            first = shlex.split(cmd)[0]
-        except ValueError:
-            first = ""
         if os.path.basename(first) not in ALLOWED_BASH_PROGRAMS:
             raise ToolError(f"<bash>: {first!r} not in safe allow-list (pass --unsafe-bash to broaden)")
     panel(f"Bash", Syntax(cmd, "bash", theme="ansi_dark"), style="magenta")
@@ -2848,6 +2865,46 @@ def tool_bash(attrs: dict, body: str, allow_all: bool, confirm: bool = True) -> 
     panel("Bash output", Syntax(out, "text", theme="ansi_dark"),
           style="dim", subtitle=f"exit {cp.returncode}")
     return out
+
+
+def tool_cd(attrs: dict, body: str) -> str:
+    """Change joe's working directory for all future tools this session.
+
+    Persists across run_turn() boundaries via the module-level _PENDING_CWD,
+    which the REPL flushes back into state['cwd'] at the top of every loop.
+    Accepts an absolute path, a ~-rooted path, a relative path against the
+    current cwd, OR a project short name resolved via _project_aliases().
+    """
+    global _PENDING_CWD
+    raw = (attrs.get("path") or body or "").strip().strip('"').strip("'")
+    if not raw:
+        raise ToolError("<cd /> requires path=\"...\"")
+    cand = Path(os.path.expanduser(raw))
+    if not cand.is_absolute():
+        cand = Path.cwd() / cand
+    cand = cand.resolve()
+    if cand.is_dir():
+        os.chdir(cand)
+        _PENDING_CWD = cand
+        short = str(cand).replace(str(HOME), "~")
+        panel(f"cd  {short}", Text(short, style="bold green"), style="cyan")
+        return f"cwd -> {cand}"
+    alias = _resolve_project_alias(raw)
+    if alias is not None:
+        os.chdir(alias)
+        _PENDING_CWD = alias
+        short = str(alias).replace(str(HOME), "~")
+        panel(
+            f"cd  {short}  (matched {raw!r})",
+            Text(short, style="bold green"),
+            style="cyan",
+        )
+        return f"cwd -> {alias}"
+    known = ", ".join(sorted(_project_aliases().keys())[:20])
+    raise ToolError(
+        f"<cd>: no such directory or project alias: {raw!r}. "
+        f"Known projects: {known}"
+    )
 
 
 def tool_grep(attrs: dict, body: str) -> str:
@@ -3817,12 +3874,97 @@ def _active_repos() -> list[Path]:
     return out
 
 
+def _project_aliases() -> dict[str, Path]:
+    """Return a name -> path map for every known project on this machine.
+
+    Sources:
+      1. _active_repos() (git/hg repos pinned via repos.txt or auto-scanned)
+      2. Any direct subdir of ~/Desktop, ~/Projects, ~/Code, ~/src whose
+         contents contain a known project marker (package.json,
+         pyproject.toml, Cargo.toml, go.mod, build.gradle, Gemfile,
+         Makefile). Hidden dirs are skipped.
+
+    Cached on first call. Reset by setting _PROJECT_ALIASES_CACHE = None.
+    """
+    global _PROJECT_ALIASES_CACHE
+    if _PROJECT_ALIASES_CACHE is not None:
+        return _PROJECT_ALIASES_CACHE
+    out: dict[str, Path] = {}
+    for p in _active_repos():
+        out.setdefault(p.name, p)
+    markers = {
+        ".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod",
+        "build.gradle", "Gemfile", "Makefile",
+    }
+    seen_paths: set[Path] = set(out.values())
+    for root in (HOME / "Desktop", HOME / "Projects", HOME / "Code",
+                 HOME / "src", HOME):
+        if not root.is_dir():
+            continue
+        try:
+            children = sorted(root.iterdir())
+        except OSError:
+            continue
+        for p in children:
+            if not p.is_dir() or p.name.startswith("."):
+                continue
+            if p in seen_paths:
+                continue
+            try:
+                names = {c.name for c in p.iterdir()}
+            except OSError:
+                continue
+            if markers & names:
+                out.setdefault(p.name, p)
+                seen_paths.add(p)
+            if len(out) >= 60:
+                break
+    _PROJECT_ALIASES_CACHE = out
+    return out
+
+
+def _resolve_project_alias(name: str) -> Optional[Path]:
+    """Match `name` against the project index. Order: exact, then
+    case-insensitive exact, then case-insensitive substring match. Returns
+    the first hit or None."""
+    idx = _project_aliases()
+    if name in idx:
+        return idx[name]
+    nl = name.lower()
+    for k, p in idx.items():
+        if k.lower() == nl:
+            return p
+    for k, p in idx.items():
+        if nl in k.lower():
+            return p
+    return None
+
+
+def _projects_block() -> str:
+    """Render <available_projects> for injection into the system prompt."""
+    idx = _project_aliases()
+    if not idx:
+        return ""
+    items = list(idx.items())[:25]
+    lines = ["<available_projects>"]
+    lines.append("Existing project directories on this machine. When the user")
+    lines.append("refers to a project by short name ('the CRM', 'go to ghostloop'),")
+    lines.append("match it against THIS list and use <cd path=\"<full path>\" />.")
+    lines.append("Do NOT guess or substitute a different project's name.")
+    for k, p in items:
+        short = str(p).replace(str(HOME), "~")
+        lines.append(f"  {k} -> {short}")
+    lines.append("</available_projects>")
+    return "\n".join(lines)
+
+
 def slash_help() -> None:
     body = (
         "[bold cyan]session[/]\n"
         "[bold]/help[/]                this message\n"
         "[bold]/exit[/], [bold]/quit[/]         leave the REPL\n"
-        "[bold]/cwd[/] [path]          show or change working directory\n"
+        "[bold]/cwd[/], [bold]/cd[/] [path]    show or change cwd; [path] may be a\n"
+        "                              project short name (e.g. /cd CRM)\n"
         "[bold]/model[/] [name]        show or change orchestrator model\n"
         "[bold]/coder[/] [name]        show or change code-delegate model\n"
         "[bold]/clear[/]               wipe the screen + reset conversation\n"
@@ -3896,6 +4038,7 @@ def slash_tools() -> None:
         "[bold]<write path=\"...\">content</write>[/]\n"
         "[bold]<edit path=\"...\"><old>X</old><new>Y</new></edit>[/]\n"
         "[bold]<bash>cmd</bash>[/]\n"
+        "[bold]<cd path=\"...\" />[/]                  change cwd; persists across turns\n"
         "[bold]<grep pattern=\"...\" path=\"...\" />[/]\n"
         "[bold]<glob pattern=\"...\" />[/]\n"
         "[bold]<delegate model=\"qwen2.5-coder:14b\">spec</delegate>[/]\n"
@@ -4334,6 +4477,9 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
     profile_block = _profile_block(profile)
     if profile_block:
         parts.append(profile_block)
+    pjb = _projects_block()
+    if pjb:
+        parts.append(pjb)
     parts.append(
         "<environment name=\"joe shell\">\n"
         "You are running inside the `joe` interactive shell. You are the\n"
@@ -4347,6 +4493,10 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
         "  <write path=\"...\">content</write>\n"
         "  <edit path=\"...\"><old>X</old><new>Y</new></edit>\n"
         "  <bash>command</bash>\n"
+        "  <cd path=\"...\" />          change joe's cwd; persists across\n"
+        "                                turns. Accepts a project short\n"
+        "                                name from <available_projects>.\n"
+        "                                Use THIS, NOT <bash>cd</bash>.\n"
         "  <grep pattern=\"...\" path=\"...\" />\n"
         "  <glob pattern=\"...\" />\n"
         "  <delegate model=\"qwen2.5-coder:7b\">spec</delegate>   (simple tasks)\n"
@@ -4480,6 +4630,8 @@ def run_turn(
                 result = tool_edit(call.attrs, call.body)
             elif call.name == "bash":
                 result = tool_bash(call.attrs, call.body, allow_all=allow_all_bash)
+            elif call.name == "cd":
+                result = tool_cd(call.attrs, call.body)
             elif call.name == "grep":
                 result = tool_grep(call.attrs, call.body)
             elif call.name == "glob":
@@ -4568,6 +4720,7 @@ def run_turn(
 
 
 def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[str]) -> int:
+    global _PENDING_CWD  # written by tool_cd(); flushed into state below
     cwd = Path.cwd()
     banner(model, cwd)
     # Best-effort: spin up any configured external MCP clients. Failures
@@ -4583,6 +4736,11 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
     }
 
     while True:
+        # If a prior turn emitted a <cd> tag, propagate the new cwd into
+        # state before we render the status line or accept input.
+        if _PENDING_CWD is not None:
+            state["cwd"] = _PENDING_CWD
+            _PENDING_CWD = None
         # Macro replay: if a /macro run is in progress, feed the next step
         # as if the user typed it, rather than prompting.
         if state.get("macro_queue"):
@@ -4751,14 +4909,26 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                 slash_help(); continue
             if cmd == "tools":
                 slash_tools(); continue
-            if cmd == "cwd":
+            if cmd in {"cwd", "cd"}:
                 if args:
-                    new = Path(os.path.expanduser(args)).resolve()
-                    if new.is_dir():
-                        os.chdir(new); state["cwd"] = new
-                        console.print(f"[dim]cwd -> {new}[/]")
+                    raw = args.strip()
+                    cand = Path(os.path.expanduser(raw))
+                    if not cand.is_absolute():
+                        cand = state["cwd"] / cand
+                    cand = cand.resolve()
+                    if cand.is_dir():
+                        os.chdir(cand); state["cwd"] = cand
+                        console.print(f"[dim]cwd -> {cand}[/]")
                     else:
-                        console.print(f"[red]not a directory:[/] {new}")
+                        # Try project alias (e.g. /cd CRM).
+                        alias = _resolve_project_alias(raw)
+                        if alias is not None:
+                            os.chdir(alias); state["cwd"] = alias
+                            console.print(
+                                f"[dim]cwd -> {alias}  (matched {raw!r})[/]"
+                            )
+                        else:
+                            console.print(f"[red]not a directory:[/] {cand}")
                 else:
                     console.print(f"[dim]cwd: {state['cwd']}[/]")
                 continue
