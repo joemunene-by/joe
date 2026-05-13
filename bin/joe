@@ -5973,6 +5973,61 @@ def _get_input(cwd_short: str) -> str:
     return Prompt.ask(f"\n[bold cyan]joe[/] [dim]({cwd_short})[/]").strip()
 
 
+def _auto_compact(state: dict) -> None:
+    """Auto-summarise the oldest half of the session. Fires when
+    session_token_estimate crosses 85% of CONTEXT_BUDGET_TOKENS. Best-
+    effort: silently no-ops if the summariser fails so the REPL keeps
+    moving."""
+    try:
+        c = _db()
+        rows = c.execute(
+            "SELECT role, content FROM turns WHERE session = ?"
+            " ORDER BY ts ASC",
+            (state["session"],),
+        ).fetchall()
+        c.close()
+    except Exception:
+        return
+    if len(rows) < 6:
+        return
+    cut = len(rows) // 2
+    older = rows[:cut]
+    older_text = "\n\n".join(f"{r.upper()}: {ct}" for r, ct in older)
+    if len(older_text) > 16000:
+        older_text = older_text[:16000] + "\n[...]"
+    spec = (
+        "Summarise this conversation history into a compact note that "
+        "preserves: (1) decisions made, (2) files touched + why, "
+        "(3) open questions, (4) the user's stated preferences. Be "
+        "terse. No prose padding.\n\n"
+        f"<history>\n{older_text}\n</history>"
+    )
+    try:
+        summary = _ollama_once(state["model"], spec, timeout=120).strip()
+    except Exception:
+        return
+    if not summary:
+        return
+    try:
+        c = _db()
+        c.execute("DELETE FROM turns WHERE session = ?", (state["session"],))
+        ts = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat()
+        c.execute(
+            "INSERT INTO turns (session, ts, role, content) VALUES (?,?,?,?)",
+            (state["session"], ts, "system",
+             f"[auto-compact summary of {cut} turns]\n{summary}"),
+        )
+        # Re-insert recent half verbatim.
+        for r, ct in rows[cut:]:
+            c.execute(
+                "INSERT INTO turns (session, ts, role, content) VALUES (?,?,?,?)",
+                (state["session"], ts, r, ct),
+            )
+        c.commit(); c.close()
+    except Exception:
+        return
+
+
 def _print_status_line(state: dict) -> None:
     """One-line status above each prompt: session, model, repo, ctx, tasks.
 
@@ -7329,6 +7384,23 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
         if _PENDING_CWD is not None:
             state["cwd"] = _PENDING_CWD
             _PENDING_CWD = None
+        # Auto-compact: when the session's token estimate crosses 85% of
+        # the budget, summarise the oldest half automatically. Addresses
+        # the "token efficiency" complaint -- joe shouldn't blow up mid-
+        # conversation because the user forgot to /compact.
+        try:
+            tk_now = session_token_estimate(state["session"])
+            if tk_now > 0 and (tk_now / CONTEXT_BUDGET_TOKENS) >= 0.85:
+                if not state.get("_warned_compact"):
+                    console.print(
+                        f"[yellow]auto-compact triggered: session at "
+                        f"{tk_now / CONTEXT_BUDGET_TOKENS * 100:.0f}% of "
+                        f"context budget; summarising oldest half...[/]"
+                    )
+                    _auto_compact(state)
+                    state["_warned_compact"] = True
+        except Exception:
+            pass
         # Macro replay: if a /macro run is in progress, feed the next step
         # as if the user typed it, rather than prompting.
         if state.get("macro_queue"):
