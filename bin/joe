@@ -149,6 +149,7 @@ EXPORTS_DIR = STATE_DIR / "exports"
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
 INPUT_HISTORY_FILE = STATE_DIR / "input-history"
 PROVENANCE_DB = STATE_DIR / "provenance.sqlite"
+PASSPORTS_DB = STATE_DIR / "passports.sqlite"
 LESSONS_DB = STATE_DIR / "lessons.sqlite"
 PROMPT_SUPPLEMENT = STATE_DIR / "prompt-supplement.md"
 MACROS_DIR = STATE_DIR / "macros"
@@ -922,6 +923,142 @@ def lessons_active_rules() -> list[str]:
         return [r[0] for r in rows]
     except Exception:
         return []
+
+
+# --------------------------------------------------------------------------
+# Reproducibility passport
+# --------------------------------------------------------------------------
+# Every model call stamps a row with sha256(prompt + model + system + cwd
+# + active lessons + lora endpoint). `/passport list` shows the recent N;
+# `/passport show <hash>` dumps the full input space; `joe replay <hash>`
+# re-runs the exact prompt against the same model.
+#
+# The point: bit-for-bit auditable provenance. "Why did joe do X?" → look
+# up the passport, re-run, watch it happen again deterministically (within
+# the model's own seed bound).
+
+
+def _passdb() -> sqlite3.Connection:
+    c = sqlite3.connect(str(PASSPORTS_DB))
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS passports ("
+        " hash TEXT PRIMARY KEY,"
+        " ts TEXT NOT NULL,"
+        " model TEXT NOT NULL,"
+        " prompt TEXT NOT NULL,"
+        " response TEXT,"
+        " session TEXT,"
+        " agent TEXT,"
+        " cwd TEXT,"
+        " endpoint TEXT,"
+        " lessons_hash TEXT,"
+        " lora_endpoint TEXT,"
+        " mode TEXT)"   # 'stream' or 'once'
+    )
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pass_ts ON passports(ts)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pass_model ON passports(model)")
+    return c
+
+
+def _passport_hash(model: str, prompt: str, cwd: str,
+                   lessons: list[str], lora_endpoint: str) -> str:
+    """Stable sha256 over the inputs that, together with the model weights,
+    determine the response. We hash:
+      - model name (joe-gemma:v20260512, etc.)
+      - exact prompt bytes
+      - cwd at the time of the call
+      - sorted+joined active lesson rules
+      - lora endpoint URL if any (None == ollama)
+    Anything that changes any of these CAN change the response, so the
+    hash is the natural identity. Note: model weights themselves are NOT
+    hashed (would need to checksum the GGUF blob); we treat the model tag
+    as a sufficient handle since ollama tags are immutable per build.
+    """
+    h = hashlib.sha256()
+    h.update(b"model:");    h.update(model.encode("utf-8"))
+    h.update(b"\0prompt:"); h.update(prompt.encode("utf-8"))
+    h.update(b"\0cwd:");    h.update(cwd.encode("utf-8"))
+    h.update(b"\0lessons:")
+    for rule in sorted(lessons or []):
+        h.update(rule.encode("utf-8")); h.update(b"\n")
+    h.update(b"\0lora:");   h.update((lora_endpoint or "").encode("utf-8"))
+    return h.hexdigest()[:16]  # 64-bit prefix; collisions astronomically unlikely
+
+
+def passport_record(model: str, prompt: str, response: str, mode: str) -> str:
+    """Stamp a passport. Returns the hash. Never raises — best-effort like
+    provenance_record so an audit DB failure can't block a turn."""
+    try:
+        lessons = lessons_active_rules()
+        cwd = str(Path.cwd())
+        lora = _LLM_DETECTED if _LLM_DETECTED is not None else ""
+        h = _passport_hash(model, prompt, cwd, lessons, lora)
+        lessons_h = hashlib.sha256(
+            "\n".join(sorted(lessons)).encode("utf-8")
+        ).hexdigest()[:12] if lessons else ""
+        c = _passdb()
+        c.execute(
+            "INSERT OR REPLACE INTO passports (hash, ts, model, prompt,"
+            " response, session, agent, cwd, endpoint, lessons_hash,"
+            " lora_endpoint, mode)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (h,
+             dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(),
+             model, prompt[:200000], response[:200000],
+             _TURN_CTX.get("session", ""),
+             _TURN_CTX.get("agent", ""),
+             cwd,
+             OLLAMA_URL if not lora else lora,
+             lessons_h, lora or "", mode),
+        )
+        c.commit(); c.close()
+        return h
+    except Exception:
+        return ""
+
+
+def passport_get(prefix: str) -> Optional[dict]:
+    """Return a passport row by hash prefix (≥4 chars). None if no match
+    or ambiguous."""
+    if not prefix or len(prefix) < 4:
+        return None
+    try:
+        c = _passdb()
+        rows = c.execute(
+            "SELECT hash, ts, model, prompt, response, session, agent,"
+            " cwd, endpoint, lessons_hash, lora_endpoint, mode"
+            " FROM passports WHERE hash LIKE ? LIMIT 2",
+            (prefix + "%",),
+        ).fetchall()
+        c.close()
+    except Exception:
+        return None
+    if len(rows) != 1:
+        return None
+    r = rows[0]
+    return {
+        "hash": r[0], "ts": r[1], "model": r[2], "prompt": r[3],
+        "response": r[4], "session": r[5], "agent": r[6], "cwd": r[7],
+        "endpoint": r[8], "lessons_hash": r[9], "lora_endpoint": r[10],
+        "mode": r[11],
+    }
+
+
+def passport_list(n: int = 20) -> list[dict]:
+    try:
+        c = _passdb()
+        rows = c.execute(
+            "SELECT hash, ts, model, substr(prompt, 1, 80), session"
+            " FROM passports ORDER BY ts DESC LIMIT ?", (n,),
+        ).fetchall()
+        c.close()
+    except Exception:
+        return []
+    return [
+        {"hash": r[0], "ts": r[1], "model": r[2],
+         "prompt_preview": r[3], "session": r[4]}
+        for r in rows
+    ]
 
 
 def lessons_block() -> str:
@@ -2771,6 +2908,70 @@ OPENER_FALLBACK_PAT = re.compile(
 )
 
 
+# Recognised tool names; used both by the parser and by diagnose_tool_emission
+# for repair hints when the model emits something almost-right.
+_KNOWN_TOOL_NAMES = (
+    "read", "write", "edit", "bash", "cd", "grep", "glob", "delegate",
+    "test", "lint", "build", "web_search", "web_fetch", "plan", "image", "mcp",
+)
+
+
+def diagnose_tool_emission(text: str) -> Optional[str]:
+    """When extract_first_tool_call returns None, scan for almost-tags and
+    return a precise repair hint for the model. Empty when nothing looks
+    tool-shaped.
+
+    Detects:
+      - unclosed openers ('<write path="x">' with no '</write>')
+      - missing-path attribute on write/edit
+      - bare opener with NO attrs at all (no way to extract intent)
+      - typo'd tag names (e.g. <writes>, <reading>)
+      - markdown code-fenced tags (model wraps the tag in ```xml ... ```)
+    """
+    # Look for any `<word ...>` that opens but is missing its close.
+    m = re.search(r"<([a-z_][a-z_0-9]*)\b", text, re.IGNORECASE)
+    if not m:
+        return None
+    name = m.group(1).lower()
+    # Markdown fences: model wrapped tag in ``` ... ``` which breaks attr parsing
+    # in some lexers but our regex actually handles it. Surface anyway.
+    if "```" in text and name in _KNOWN_TOOL_NAMES:
+        return (
+            f"tool-emission hint: your <{name}> tag is wrapped in a markdown "
+            f"code fence (```...```). Emit the tag at the top level of your "
+            f"response, no fences around it."
+        )
+    # Typo: close enough to a known name but not exact.
+    if name not in _KNOWN_TOOL_NAMES:
+        from difflib import get_close_matches
+        close = get_close_matches(name, _KNOWN_TOOL_NAMES, n=1, cutoff=0.6)
+        if close:
+            return (
+                f"tool-emission hint: you opened <{name}> but no such tool exists. "
+                f"Did you mean <{close[0]}>? Known tools: {', '.join(_KNOWN_TOOL_NAMES)}."
+            )
+        return None
+    # Known tag opener seen but no close. Where does it start?
+    pos = m.start()
+    # Did we see an attempted close anywhere later?
+    close_pat = re.compile(r"</" + re.escape(name) + r"\s*>", re.IGNORECASE)
+    if not close_pat.search(text):
+        return (
+            f"tool-emission hint: you opened <{name}> at char {pos} but never "
+            f"closed it. Either add </{name}> after the body, or emit a "
+            f"self-closing <{name} attr=\"...\" />. The shell can't dispatch "
+            f"an unterminated tag."
+        )
+    # If a close exists somewhere but the regex still failed, the body or
+    # attrs probably contain a literal `>`. Suggest CDATA-style escaping.
+    return (
+        f"tool-emission hint: <{name}> ... </{name}> looks present but did "
+        f"not parse. Likely cause: a stray '>' inside an attribute value or "
+        f"unescaped XML in the body. Keep attribute values simple "
+        f"(no '>' inside double quotes) and the body plain text."
+    )
+
+
 def extract_first_tool_call(text: str) -> Optional[ToolCall]:
     m = TAG_PAT.search(text)
     if m:
@@ -2801,6 +3002,37 @@ class ToolError(RuntimeError):
 
 def _resolve_path(p: str) -> Path:
     return Path(os.path.expanduser(p)).resolve()
+
+
+def _validate_python_syntax(path: Path, content: str) -> Optional[str]:
+    """If `path` looks like a Python file, parse the content and return an
+    error string on SyntaxError, else None. Stdlib-only first step toward
+    full tree-sitter AST-aware editing — catches the dumbest class of bug
+    (unclosed brackets, bad indents, mid-keyword breaks) before write.
+    """
+    if path.suffix != ".py":
+        return None
+    import ast
+    try:
+        ast.parse(content)
+        return None
+    except SyntaxError as e:
+        # e.lineno / e.offset are 1-indexed and may be None on weird inputs.
+        line = e.lineno or 0
+        col = e.offset or 0
+        msg = e.msg or "syntax error"
+        # Include the offending line so the model sees what broke.
+        offending = ""
+        try:
+            offending = content.splitlines()[max(0, line - 1)]
+        except Exception:
+            pass
+        return (
+            f"Python syntax error at line {line}, col {col}: {msg}\n"
+            f"  {offending}\n"
+            f"  {' ' * max(0, col - 1)}^\n"
+            f"Fix the syntax and re-emit <write>. The file was NOT written."
+        )
 
 
 def tool_read(attrs: dict, body: str) -> str:
@@ -2908,6 +3140,10 @@ def tool_write(attrs: dict, body: str, confirm: bool = True) -> str:
             style="green",
             subtitle=f"{len(body)} bytes  ·  {len(body.splitlines())} lines",
         )
+    # Block invalid Python syntax before the write hits disk + provenance.
+    syntax_error = _validate_python_syntax(p, body)
+    if syntax_error:
+        raise ToolError(syntax_error)
     if confirm and not _confirm(f"Apply this write to {path}?", tool="write"):
         return "user denied write"
     p.write_text(body, encoding="utf-8")
@@ -2961,6 +3197,10 @@ def tool_edit(attrs: dict, body: str, confirm: bool = True) -> str:
         f"Edit {path}", Syntax(diff, "diff", theme="ansi_dark"),
         style="yellow", subtitle=f"+{adds} / -{dels}",
     )
+    # Block invalid Python syntax in the resulting file before write.
+    syntax_error = _validate_python_syntax(p, new_src)
+    if syntax_error:
+        raise ToolError(syntax_error)
     if confirm and not _confirm(f"Apply this edit to {path}?", tool="edit"):
         return "user denied edit"
     p.write_text(new_src, encoding="utf-8")
@@ -3937,7 +4177,9 @@ def _mlx_server_once(model: str, prompt: str, base: str, timeout: int) -> str:
 def _ollama_once(model: str, prompt: str, timeout: int = 600) -> str:
     base = _detect_llm()
     if base:
-        return _mlx_server_once(model, prompt, base, timeout)
+        response = _mlx_server_once(model, prompt, base, timeout)
+        passport_record(model, prompt, response, mode="once")
+        return response
     body = {"model": model, "prompt": prompt, "stream": False, "think": False}
     images = _drain_image_base64()
     if images:
@@ -3948,7 +4190,120 @@ def _ollama_once(model: str, prompt: str, timeout: int = 600) -> str:
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())["response"]
+        response = json.loads(r.read())["response"]
+    passport_record(model, prompt, response, mode="once")
+    return response
+
+
+_COUNCIL_DEFAULT_MODELS = (
+    "joe-gemma", "deepseek-r1:14b", "qwen2.5:14b",
+)
+_COUNCIL_JUDGE_MODEL = os.environ.get("JOE_COUNCIL_JUDGE", "joe-gemma")
+
+
+def _council(prompt: str, default_model: str) -> None:
+    """Fan the same prompt out to multiple models concurrently, render the
+    answers side-by-side, then ask a judge model which one is best.
+
+    Models can be overridden via $JOE_COUNCIL ("model1,model2,model3").
+    Judge is $JOE_COUNCIL_JUDGE, defaults to joe-gemma.
+    """
+    raw = os.environ.get("JOE_COUNCIL", "").strip()
+    models = [m.strip() for m in raw.split(",") if m.strip()] if raw else list(_COUNCIL_DEFAULT_MODELS)
+    # Ensure the user's current model is in the council so they always see
+    # what their default would have said.
+    if default_model and default_model not in models:
+        models.insert(0, default_model)
+    models = models[:4]  # cap at 4 for readability
+
+    console.print(
+        f"[dim]/council:[/] firing prompt at {len(models)} models concurrently: "
+        f"{', '.join(models)}"
+    )
+
+    results: dict[str, str] = {}
+    errors: dict[str, str] = {}
+    timings: dict[str, float] = {}
+
+    def _ask(m: str) -> None:
+        start = time.time()
+        try:
+            results[m] = _ollama_once(m, prompt, timeout=300)
+        except Exception as e:
+            errors[m] = f"{type(e).__name__}: {e}"
+        timings[m] = time.time() - start
+
+    threads = [threading.Thread(target=_ask, args=(m,), daemon=True) for m in models]
+    for t in threads:
+        t.start()
+    # Live spinner while we wait. Poll thread state every 0.2s.
+    with console.status(
+        Text.from_markup(f"[bold cyan]/council[/] waiting on {len(threads)} models..."),
+        spinner="dots",
+    ):
+        for t in threads:
+            t.join(timeout=300)
+
+    # Render each result as its own panel, then arrange side-by-side via Columns.
+    from rich.columns import Columns
+    panels = []
+    for m in models:
+        if m in errors:
+            body = Text.from_markup(f"[red]{errors[m]}[/]")
+            subtitle = f"failed in {timings.get(m, 0):.1f}s"
+        else:
+            text = (results.get(m, "") or "").strip()
+            body = Text(text[:2400] + ("..." if len(text) > 2400 else ""))
+            subtitle = f"{timings.get(m, 0):.1f}s · {len(text)} chars"
+        panels.append(Panel(body, title=f"[cyan]{m}[/]", title_align="left",
+                             subtitle=subtitle, border_style="cyan",
+                             width=max(48, min(100, 110)), padding=(0, 1)))
+    console.print(Columns(panels, equal=True, expand=False))
+
+    # Judge: ask a model to pick a winner. Skip if all responses failed.
+    answered = [m for m in models if m in results]
+    if len(answered) < 2:
+        console.print("[dim](skipping judge: fewer than 2 successful answers)[/]")
+        return
+    judge_prompt = (
+        "You are the judge. Pick the single best answer to this user prompt. "
+        "Reply with the model name ONLY, no explanation, no extra text.\n\n"
+        f"User prompt:\n{prompt}\n\n"
+        + "\n\n".join(
+            f"--- {m} ---\n{(results[m] or '').strip()[:1500]}"
+            for m in answered
+        )
+        + "\n\nWinner (just the model name):"
+    )
+    try:
+        verdict = _ollama_once(_COUNCIL_JUDGE_MODEL, judge_prompt, timeout=120).strip()
+    except Exception as e:
+        console.print(f"[red]judge failed:[/] {e}")
+        return
+    # Match the verdict against any model name we saw. Loose contains check
+    # so the judge can be verbose.
+    winner = next((m for m in answered if m in verdict), answered[0])
+    console.print(
+        f"[bold green]judge ({_COUNCIL_JUDGE_MODEL}):[/] picks "
+        f"[bold cyan]{winner}[/]  [dim](raw: {verdict[:80]})[/]"
+    )
+    # Log the preference into evals.sqlite for later analysis.
+    try:
+        c = sqlite3.connect(str(EVALS_DB))
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS council ("
+            " ts TEXT, prompt TEXT, winner TEXT, models TEXT)"
+        )
+        c.execute(
+            "INSERT INTO council (ts, prompt, winner, models) VALUES (?, ?, ?, ?)",
+            (
+                dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(),
+                prompt[:8000], winner, ",".join(models),
+            ),
+        )
+        c.commit(); c.close()
+    except Exception:
+        pass
 
 
 def _mlx_server_stream_to_console(model: str, prompt: str, base: str) -> str:
@@ -4062,7 +4417,9 @@ def _ollama_stream_to_console(model: str, prompt: str) -> str:
         resp.close()
     if buf:
         console.print()  # final newline after streaming
-    return "".join(buf)
+    response = "".join(buf)
+    passport_record(model, prompt, response, mode="stream")
+    return response
 
 
 # --------------------------------------------------------------------------
@@ -4074,6 +4431,7 @@ SLASH_COMMAND_NAMES = (
     "help", "exit", "quit", "cwd", "cd", "model", "coder", "lora",
     "clear", "save", "load", "voice",
     "sessions", "whoami", "cost", "compact", "yolo", "trust", "doctor",
+    "blame", "passport", "council",
     "read", "run", "diff", "copy", "history", "undo", "redo",
     "plan", "test", "lint", "build", "explain", "profile",
     "commit", "push", "pr", "issue", "snap",
@@ -4989,6 +5347,20 @@ def run_turn(
 
         call = extract_first_tool_call(response)
         if not call:
+            # Distinguish "clean prose response" (no tool intended) from
+            # "tried to emit a tool tag but botched it". The former is the
+            # natural turn-end; the latter deserves a repair hint so the
+            # next turn produces valid output.
+            hint = diagnose_tool_emission(response)
+            if hint:
+                console.print(f"[yellow]{hint}[/]")
+                prompt = (
+                    response
+                    + f"\n\n<tool_result name=\"parse_error\">\n{hint}\n</tool_result>\n"
+                    + "Re-emit your intended tool tag with the correction above. "
+                    + "If you didn't mean to call a tool, just answer in plain prose."
+                )
+                continue
             break  # no tool call: the model is done
 
         # Detect a stuck loop: same tool + same args twice in a row.
@@ -5835,6 +6207,94 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                     style="green",
                     subtitle=f"session now: 1 summary + {len(rows) - cut} recent turns",
                 )
+                continue
+            if cmd == "blame":
+                if not args:
+                    console.print(
+                        "[red]/blame <path>[:line][/] -- ask 'which prompt "
+                        "wrote this code?'"
+                    )
+                    continue
+                cmd_blame(args.strip())
+                continue
+            if cmd == "passport":
+                sub = args.strip()
+                if not sub or sub == "list":
+                    rows = passport_list(20)
+                    if not rows:
+                        console.print(
+                            "[dim](no passports yet; every model call records one)[/]"
+                        )
+                        continue
+                    lines = []
+                    for r in rows:
+                        lines.append(
+                            f"[bold]{r['hash']}[/] {r['ts'][:19]}  "
+                            f"[cyan]{r['model']}[/]  [dim]{r['prompt_preview']}...[/]"
+                        )
+                    panel(
+                        "passports (latest 20)",
+                        Text.from_markup("\n".join(lines)),
+                        style="bright_blue",
+                        subtitle="/passport show <hash> · joe passport replay <hash>",
+                    )
+                    continue
+                if sub.startswith("show "):
+                    h = sub[len("show "):].strip()
+                    rec = passport_get(h)
+                    if not rec:
+                        console.print(
+                            f"[red]no passport matches {h!r}[/] "
+                            f"(need >= 4-char hex prefix)"
+                        )
+                        continue
+                    body = Text.from_markup(
+                        f"[bold]hash:[/]    [yellow]{rec['hash']}[/]\n"
+                        f"[bold]ts:[/]      {rec['ts']}\n"
+                        f"[bold]model:[/]   [cyan]{rec['model']}[/]\n"
+                        f"[bold]mode:[/]    {rec['mode']}\n"
+                        f"[bold]session:[/] {rec['session']}\n"
+                        f"[bold]agent:[/]   {rec['agent'] or '(none)'}\n"
+                        f"[bold]cwd:[/]     {rec['cwd']}\n"
+                        f"[bold]endpoint:[/] {rec['endpoint']}\n"
+                        f"[bold]lessons hash:[/] {rec['lessons_hash'] or '(none)'}\n"
+                        f"[bold]lora:[/]    {rec['lora_endpoint'] or '(ollama)'}\n\n"
+                        f"[dim]prompt (first 1200 chars):[/]\n"
+                        f"{rec['prompt'][:1200]}\n\n"
+                        f"[dim]response (first 1200 chars):[/]\n"
+                        f"{rec['response'][:1200]}"
+                    )
+                    panel(f"passport {rec['hash']}", body, style="bright_blue")
+                    continue
+                if sub.startswith("replay "):
+                    h = sub[len("replay "):].strip()
+                    rec = passport_get(h)
+                    if not rec:
+                        console.print(f"[red]no passport matches {h!r}[/]"); continue
+                    console.print(
+                        f"[dim]replaying passport {rec['hash']} against "
+                        f"[cyan]{rec['model']}[/dim]"
+                    )
+                    out = _ollama_once(rec["model"], rec["prompt"])
+                    panel(
+                        f"replay {rec['hash']}",
+                        Text(out),
+                        style="green",
+                        subtitle=f"compare to original response above",
+                    )
+                    continue
+                console.print(
+                    "[red]/passport[/] [list | show <hash> | replay <hash>]"
+                )
+                continue
+            if cmd == "council":
+                if not args:
+                    console.print(
+                        "[red]/council <prompt>[/] -- ask the same thing of "
+                        "three models concurrently, side-by-side"
+                    )
+                    continue
+                _council(args.strip(), default_model=state["model"])
                 continue
             if cmd == "yolo":
                 cur = os.environ.get("JOE_AUTO_YES", "").strip() in {"1", "true", "yes"}
