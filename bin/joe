@@ -165,6 +165,7 @@ HOOKS_DIR = STATE_DIR / "hooks"
 PLUGIN_TOOLS_DIR = STATE_DIR / "tools"
 OUTPUT_STYLES_DIR = STATE_DIR / "output-styles"
 STATUSLINE_FILE = STATE_DIR / "statusline"
+SKILLS_DIR = STATE_DIR / "skills"
 
 # Sandbox modes (Codex-inspired). Determines which tools the dispatcher
 # will actually invoke. "full" = everything, "workspace-write" = read +
@@ -3903,6 +3904,105 @@ def _rebuild_tag_pattern() -> None:
     )
 
 
+# --- Skills (Claude Code-style SKILL.md packages) ---
+# A skill is a directory at ~/.joe-agent/skills/<name>/ containing a
+# SKILL.md with YAML-ish frontmatter:
+#
+#     ---
+#     name: pr-review
+#     description: Senior code review with security focus
+#     when_to_use: User asks for code review, asks to "review", "audit",
+#         "check for bugs", "look for vulnerabilities"
+#     allowed_tools: read, grep, glob, parallel
+#     ---
+#     <body of skill instructions...>
+#
+# joe scans the skills list at REPL start; for each turn, if the user
+# message keywords match a skill's `when_to_use`, the skill body is
+# injected as <skill_available name="X">...</skill_available> so the
+# model can opt-in. Skills do NOT execute autonomously -- they're
+# capability augmentations the model picks up on its own.
+
+
+def _parse_skill_md(path: Path) -> Optional[dict]:
+    """Parse SKILL.md: --- frontmatter --- + body. Returns dict with
+    keys name, description, when_to_use, allowed_tools (optional), body."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 4)
+    if end == -1:
+        return None
+    front = text[3:end].strip()
+    body = text[end + 4:].strip()
+    meta: dict[str, str] = {}
+    for line in front.splitlines():
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        meta[k.strip()] = v.strip()
+    if "name" not in meta:
+        meta["name"] = path.parent.name
+    meta["body"] = body
+    return meta
+
+
+def load_skills() -> dict[str, dict]:
+    """Discover all skills at ~/.joe-agent/skills/<name>/SKILL.md."""
+    out: dict[str, dict] = {}
+    if not SKILLS_DIR.is_dir():
+        return out
+    for d in sorted(SKILLS_DIR.iterdir()):
+        skill_file = d / "SKILL.md"
+        if not skill_file.is_file():
+            continue
+        meta = _parse_skill_md(skill_file)
+        if meta:
+            out[meta["name"]] = meta
+    return out
+
+
+_LOADED_SKILLS: dict[str, dict] = {}
+
+
+def _relevant_skills(user_msg: str) -> list[dict]:
+    """Match user_msg against each skill's when_to_use trigger list.
+    Returns ordered list of skills whose triggers appear in the message
+    (case-insensitive substring match)."""
+    if not _LOADED_SKILLS:
+        return []
+    msg_lower = user_msg.lower()
+    matches = []
+    for skill in _LOADED_SKILLS.values():
+        triggers = skill.get("when_to_use", "")
+        # Triggers are comma- or comma-and-quote separated. Try several.
+        words = re.split(r'[,;"\']+', triggers.lower())
+        words = [w.strip() for w in words if len(w.strip()) > 3]
+        if any(w in msg_lower for w in words):
+            matches.append(skill)
+    return matches
+
+
+def _skills_block(user_msg: str) -> str:
+    """Build the <skills_available> block for the system prompt, listing
+    only skills whose triggers match the current user message."""
+    matched = _relevant_skills(user_msg)
+    if not matched:
+        return ""
+    blocks = []
+    for s in matched[:4]:  # cap to keep budget sane
+        body = (s.get("body") or "")[:3000]
+        blocks.append(
+            f"<skill_available name=\"{s['name']}\" description=\"{s.get('description', '')}\">\n"
+            f"{body}\n"
+            f"</skill_available>"
+        )
+    return "\n\n".join(blocks)
+
+
 def _load_project_context(cwd: Path) -> str:
     """If the cwd has AGENTS.md, CLAUDE.md, or .joe/instructions.md, load
     its content and return a <project_context> XML block to inject into
@@ -5696,7 +5796,7 @@ SLASH_COMMAND_NAMES = (
     "blame", "passport", "council", "commands", "plugins",
     "diff-model", "diffmodel", "think",
     "output-style", "outputstyle", "style", "statusline",
-    "sandbox", "mode",
+    "sandbox", "mode", "skills", "loop",
     "read", "run", "diff", "copy", "history", "undo", "redo",
     "plan", "test", "lint", "build", "explain", "profile",
     "commit", "push", "pr", "issue", "snap",
@@ -6621,6 +6721,11 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
     pc = _load_project_context(cwd)
     if pc:
         parts.append(pc)
+    # Skills auto-injection: scan loaded skills whose triggers match the
+    # user message and inject as <skill_available> blocks. Claude-Code-style.
+    sb = _skills_block(user_msg)
+    if sb:
+        parts.append(sb)
     # Output-style overlay: /output-style swaps personality presets.
     style_text = _load_output_style(_ACTIVE_OUTPUT_STYLE)
     if style_text:
@@ -7083,7 +7188,7 @@ def run_turn(
 
 def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[str]) -> int:
     global _PENDING_CWD  # written by tool_cd(); flushed into state below
-    global _LLM_DETECTED, _ACTIVE_OUTPUT_STYLE, _SANDBOX_MODE
+    global _LLM_DETECTED, _ACTIVE_OUTPUT_STYLE, _SANDBOX_MODE, _LOADED_SKILLS
     cwd = Path.cwd()
     banner(model, cwd)
     # Best-effort: spin up any configured external MCP clients. Failures
@@ -7102,6 +7207,14 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
         console.print(
             f"[dim]loaded {len(plugins)} plugin tool(s): "
             f"{', '.join('<' + n + '>' for n in sorted(plugins))}[/]"
+        )
+    # Skills: Claude-Code-style SKILL.md packages, auto-injected when
+    # the user message matches a skill's when_to_use triggers.
+    _LOADED_SKILLS = load_skills()
+    if _LOADED_SKILLS:
+        console.print(
+            f"[dim]loaded {len(_LOADED_SKILLS)} skill(s): "
+            f"{', '.join(sorted(_LOADED_SKILLS))}[/]"
         )
     state = {
         "model": model,
@@ -8830,6 +8943,94 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                     continue
                 STATUSLINE_FILE.write_text(sub)
                 console.print(f"[green]statusline:[/] {sub}")
+                continue
+            if cmd == "skills":
+                sub = args.strip()
+                if sub == "reload":
+                    _LOADED_SKILLS = load_skills()
+                    console.print(f"[dim]reloaded {len(_LOADED_SKILLS)} skills[/]")
+                    continue
+                if not _LOADED_SKILLS:
+                    console.print(
+                        f"[dim]no skills loaded. drop dirs into {SKILLS_DIR} "
+                        f"each with a SKILL.md (frontmatter: name, description, "
+                        f"when_to_use, allowed_tools).[/]"
+                    )
+                else:
+                    lines = []
+                    for n in sorted(_LOADED_SKILLS):
+                        s = _LOADED_SKILLS[n]
+                        lines.append(
+                            f"  [bold]{n}[/]  [dim]{s.get('description', '')[:60]}[/]\n"
+                            f"      when: {s.get('when_to_use', '')[:80]}"
+                        )
+                    panel(
+                        "Skills (auto-invoked when user message matches when_to_use)",
+                        Text.from_markup("\n".join(lines)),
+                        style="cyan",
+                        subtitle=str(SKILLS_DIR),
+                    )
+                continue
+            if cmd == "loop":
+                # /loop N <prompt> -- run the prompt N times sequentially.
+                # /loop until <condition> <prompt> -- run until condition appears
+                # in the response (case-insensitive substring).
+                if not args:
+                    console.print(
+                        "[red]/loop <N> <prompt>[/] or "
+                        "[red]/loop until <condition> <prompt>[/]"
+                    )
+                    continue
+                first, _, rest = args.partition(" ")
+                if first == "until":
+                    cond, _, loop_prompt = rest.partition(" ")
+                    if not loop_prompt:
+                        console.print("[red]/loop until <condition> <prompt>[/]")
+                        continue
+                    max_iters = 12
+                    for i in range(1, max_iters + 1):
+                        console.rule(f"[bold cyan]/loop iter {i}/{max_iters}[/]")
+                        run_turn(
+                            model=state["model"], coder_model=state["coder"],
+                            user_msg=loop_prompt, cwd=state["cwd"],
+                            session=state["session"],
+                            allow_all_bash=allow_all_bash,
+                            max_turns=MAX_AUTO_TURNS,
+                        )
+                        # Re-fetch the last assistant turn from the session DB.
+                        try:
+                            c = _db()
+                            last = c.execute(
+                                "SELECT content FROM turns WHERE session=? AND role='assistant' "
+                                "ORDER BY ts DESC LIMIT 1",
+                                (state["session"],),
+                            ).fetchone()
+                            c.close()
+                        except Exception:
+                            last = None
+                        if last and cond.lower() in (last[0] or "").lower():
+                            console.print(
+                                f"[green]/loop:[/] condition {cond!r} matched, stopping"
+                            )
+                            break
+                    continue
+                if not first.isdigit():
+                    console.print("[red]/loop N <prompt>[/] -- first arg must be int")
+                    continue
+                n = int(first)
+                loop_prompt = rest
+                if not loop_prompt:
+                    console.print("[red]/loop N <prompt>[/] -- prompt required")
+                    continue
+                for i in range(1, n + 1):
+                    console.rule(f"[bold cyan]/loop iter {i}/{n}[/]")
+                    run_turn(
+                        model=state["model"], coder_model=state["coder"],
+                        user_msg=loop_prompt, cwd=state["cwd"],
+                        session=state["session"],
+                        allow_all_bash=allow_all_bash,
+                        max_turns=MAX_AUTO_TURNS,
+                    )
                 continue
             if cmd == "plugins":
                 sub = args.strip()
