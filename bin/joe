@@ -3021,7 +3021,7 @@ class ToolCall:
 TAG_PAT = re.compile(
     r"<(?P<name>read|write|edit|bash|cd|grep|glob|delegate|"
     r"test|lint|build|web_search|web_fetch|plan|image|mcp|"
-    r"screen|click|type|key|open|clipboard|parallel)"
+    r"screen|click|type|key|open|clipboard|parallel|browser)"
     # attrs: greedy any-char-but-> with a tail-trim of optional `/` so we still
     # detect self-closing tags. Previous version excluded `/` which broke
     # paths like `/tmp/foo`.
@@ -3041,7 +3041,7 @@ RUN_LEGACY_PAT = re.compile(r"^RUN:\s*(.+?)\s*$", re.MULTILINE)
 OPENER_FALLBACK_PAT = re.compile(
     r"<(?P<name>read|write|edit|bash|cd|grep|glob|delegate|"
     r"test|lint|build|web_search|web_fetch|plan|image|mcp|"
-    r"screen|click|type|key|open|clipboard|parallel)"
+    r"screen|click|type|key|open|clipboard|parallel|browser)"
     r"(?P<attrs>\s+[^>]+?)\s*/?>"
     r"(?!.*</(?P=name)>)",  # only if there's no matching close downstream
     re.DOTALL,
@@ -3053,7 +3053,7 @@ OPENER_FALLBACK_PAT = re.compile(
 _KNOWN_TOOL_NAMES = (
     "read", "write", "edit", "bash", "cd", "grep", "glob", "delegate",
     "test", "lint", "build", "web_search", "web_fetch", "plan", "image", "mcp",
-    "screen", "click", "type", "key", "open", "clipboard", "parallel",
+    "screen", "click", "type", "key", "open", "clipboard", "parallel", "browser",
 )
 
 # Tools whose results are side-effect-free given the same inputs + cwd
@@ -3739,6 +3739,151 @@ def tool_open(attrs: dict, body: str, confirm: bool = True) -> str:
     except Exception as e:
         raise ToolError(f"<open>: {type(e).__name__}: {e}")
     return f"opened {target}"
+
+
+_BROWSER_CTX: dict = {"playwright": None, "browser": None, "page": None}
+
+
+def _ensure_browser() -> "Any":
+    """Lazy-init a single persistent Playwright browser + page for the
+    session. Reuses across <browser> calls so the model can navigate +
+    interact without spawning a fresh browser per action. Refuses with
+    an install hint if Playwright isn't available."""
+    if _BROWSER_CTX["page"] is not None:
+        return _BROWSER_CTX["page"]
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise ToolError(
+            "<browser>: Playwright not installed. Install with:\n"
+            "  pip install --user playwright && playwright install chromium\n"
+            "(uses ~300MB for the Chromium binary; first launch is slow.)"
+        )
+    pw = sync_playwright().start()
+    headed = os.environ.get("JOE_BROWSER_HEADED", "").strip() in {"1", "true", "yes"}
+    try:
+        browser = pw.chromium.launch(headless=not headed)
+    except Exception as e:
+        pw.stop()
+        raise ToolError(
+            f"<browser>: chromium launch failed: {e}. "
+            f"Run `playwright install chromium` to fetch the binary."
+        )
+    page = browser.new_page()
+    _BROWSER_CTX["playwright"] = pw
+    _BROWSER_CTX["browser"] = browser
+    _BROWSER_CTX["page"] = page
+    return page
+
+
+def _shutdown_browser() -> None:
+    page = _BROWSER_CTX.get("page")
+    if page is None:
+        return
+    try:
+        _BROWSER_CTX["browser"].close()
+        _BROWSER_CTX["playwright"].stop()
+    except Exception:
+        pass
+    _BROWSER_CTX["page"] = None
+    _BROWSER_CTX["browser"] = None
+    _BROWSER_CTX["playwright"] = None
+
+
+def tool_browser(attrs: dict, body: str, confirm: bool = True) -> str:
+    """Headless / headed Playwright browser. Actions:
+
+      <browser action="open" url="..." />
+      <browser action="click" selector="..." />
+      <browser action="type" selector="...">text to type</browser>
+      <browser action="wait" selector="..." timeout="10000" />
+      <browser action="screenshot" path="/tmp/x.png" />
+      <browser action="extract" selector="..." />     # text content
+      <browser action="title" />                       # current page title
+      <browser action="url" />                         # current url
+      <browser action="back" />
+      <browser action="close" />                       # tear down session
+
+    All actions in one REPL share one browser session (so cookies + login
+    persist). Gated by /trust browser so a single 'a' answer unlocks
+    blanket consent for the session.
+    """
+    action = (attrs.get("action") or "").lower()
+    if not action:
+        raise ToolError(
+            "<browser action=\"...\" />: action required "
+            "(open|click|type|wait|screenshot|extract|title|url|back|close)"
+        )
+    if action == "close":
+        _shutdown_browser()
+        return "browser closed"
+    if confirm and not _confirm(
+        f"<browser action=\"{action}\"> on {attrs.get('url') or attrs.get('selector') or '(current page)'}?",
+        tool="browser",
+    ):
+        return "user denied browser action"
+    page = _ensure_browser()
+    try:
+        if action == "open":
+            url = attrs.get("url") or body.strip()
+            if not url:
+                raise ToolError("<browser action=\"open\">: url required")
+            page.goto(url, timeout=20000)
+            return f"opened {url} -> title={page.title()!r}"
+        if action == "click":
+            sel = attrs.get("selector")
+            if not sel:
+                raise ToolError("<browser action=\"click\">: selector required")
+            page.click(sel, timeout=10000)
+            return f"clicked {sel!r}"
+        if action == "type":
+            sel = attrs.get("selector")
+            if not sel:
+                raise ToolError("<browser action=\"type\">: selector required")
+            text = body
+            if not text:
+                raise ToolError("<browser action=\"type\">: body (text) required")
+            page.fill(sel, text, timeout=10000)
+            return f"typed {len(text)} chars into {sel!r}"
+        if action == "wait":
+            sel = attrs.get("selector")
+            timeout = int(attrs.get("timeout", "10000"))
+            if not sel:
+                raise ToolError("<browser action=\"wait\">: selector required")
+            page.wait_for_selector(sel, timeout=timeout)
+            return f"waited for {sel!r}"
+        if action == "screenshot":
+            path_attr = attrs.get("path", "")
+            target = Path(path_attr) if path_attr else (
+                STATE_DIR / "screenshots" /
+                f"browser-{dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.png"
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(target), full_page=True)
+            _pending_images.append(str(target))
+            return f"screenshot saved to {target}; attached to next turn"
+        if action == "extract":
+            sel = attrs.get("selector", "body")
+            try:
+                el = page.locator(sel).first
+                content = el.inner_text(timeout=10000)
+            except Exception as e:
+                return f"extract failed: {type(e).__name__}: {e}"
+            if len(content) > 6000:
+                content = content[:6000] + "\n[... truncated ...]"
+            return content
+        if action == "title":
+            return page.title()
+        if action == "url":
+            return page.url
+        if action == "back":
+            page.go_back(timeout=10000)
+            return f"back -> {page.url}"
+        raise ToolError(f"<browser>: unknown action {action!r}")
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(f"<browser action=\"{action}\">: {type(e).__name__}: {e}")
 
 
 def tool_clipboard(attrs: dict, body: str, confirm: bool = True) -> str:
@@ -5828,6 +5973,19 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
         "  <clipboard op=\"get\" />          read system clipboard\n"
         "  <clipboard op=\"set\">text</clipboard>   write system clipboard\n"
         "\n"
+        "Browser automation (Playwright; install with `pip install playwright`\n"
+        "+ `playwright install chromium`):\n"
+        "  <browser action=\"open\" url=\"...\" />\n"
+        "  <browser action=\"click\" selector=\"...\" />\n"
+        "  <browser action=\"type\" selector=\"...\">text</browser>\n"
+        "  <browser action=\"wait\" selector=\"...\" timeout=\"10000\" />\n"
+        "  <browser action=\"screenshot\" path=\"/tmp/x.png\" />\n"
+        "  <browser action=\"extract\" selector=\"body\" />\n"
+        "  <browser action=\"title\" />   <browser action=\"url\" />\n"
+        "  <browser action=\"back\" />   <browser action=\"close\" />\n"
+        "Single persistent session per REPL; cookies + login persist\n"
+        "across actions. Run headed via JOE_BROWSER_HEADED=1.\n"
+        "\n"
         "Plan mode: if the task touches multiple files or has independent\n"
         "phases, emit a <plan> tag with one step per numbered line. The\n"
         "shell will display the plan, ask the user to approve, then drive\n"
@@ -6080,6 +6238,8 @@ def run_turn(
                 result = tool_clipboard(call.attrs, call.body)
             elif call.name == "parallel":
                 result = tool_parallel(call.attrs, call.body)
+            elif call.name == "browser":
+                result = tool_browser(call.attrs, call.body)
             elif call.name == "plan":
                 # Don't execute inline; hand back to the user so they can
                 # approve. The model will see this as "plan acknowledged".
