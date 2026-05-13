@@ -1055,6 +1055,16 @@ _SPINNER_CHARS = set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 # Pure "thinking" status lines (Rich rewrites these dozens of times per
 # token). Without the regex, the tail fills with hundreds of dupes.
 _THINKING_RE = re.compile(r"^\s*[\w-]+ is thinking\.\.\.\s*$")
+# Top border with embedded title:    ╭─ Grep '.*' in . ───────╮
+# Bottom border with embedded subtitle: ╰── +24/-24 (2346 -> 2387 bytes) ──╯
+# Capture group is just the title text.
+_PANEL_TITLE_TOP_RE = re.compile(r"^\s*[╭┌][─━═]+\s+(\S.*?\S)\s+[─━═]+[╮┐]\s*$")
+_PANEL_TITLE_BOT_RE = re.compile(r"^\s*[╰└][─━═]+\s+(\S.*?\S)\s+[─━═]+[╯┘]\s*$")
+# Pure rule lines: no text, just border characters. Dropped entirely.
+_PANEL_RULE_RE = re.compile(r"^\s*[╭╰├╮╯┤┌┐└┘─━═]+\s*$")
+# An interior row of a Rich panel: text surrounded by │ on both sides with
+# right-padding to box width. Capture group is the actual content.
+_BOX_INNER_RE = re.compile(r"^\s*[│|┃]\s?(.*?)\s*[│|┃]\s*$")
 
 
 def _strip_ansi(text: str) -> str:
@@ -1063,6 +1073,25 @@ def _strip_ansi(text: str) -> str:
     # \r without \n is a Rich redraw -- collapse to nothing.
     text = text.replace("\r", "")
     return text
+
+
+def _unwrap_panel(line: str) -> Optional[str]:
+    """Strip Rich panel decoration. Returns None for pure-border lines
+    (drop), or a tagged context line for title/subtitle borders, or the
+    inner content for │…│ rows. Anything that isn't part of a panel
+    passes through unchanged."""
+    m = _PANEL_TITLE_TOP_RE.match(line)
+    if m:
+        return f"--- {m.group(1)} ---"
+    m = _PANEL_TITLE_BOT_RE.match(line)
+    if m:
+        return f"--- {m.group(1)} ---"
+    if _PANEL_RULE_RE.match(line):
+        return None
+    m = _BOX_INNER_RE.match(line)
+    if m:
+        return m.group(1).rstrip()
+    return line
 
 
 def _interesting(line: str) -> bool:
@@ -1100,10 +1129,13 @@ def _stream_transcript(initial_tail: int = 200) -> Iterator[str]:
         last_emitted = ""
         for ln in lines[-initial_tail:]:
             clean = _strip_ansi(ln.rstrip("\n"))
-            if not _interesting(clean) or clean == last_emitted:
+            unwrapped = _unwrap_panel(clean)
+            if unwrapped is None or not _interesting(unwrapped):
                 continue
-            yield f"data: {json.dumps(clean)}\n\n"
-            last_emitted = clean
+            if unwrapped == last_emitted:
+                continue
+            yield f"data: {json.dumps(unwrapped)}\n\n"
+            last_emitted = unwrapped
     except OSError:
         pass
 
@@ -1137,10 +1169,13 @@ def _stream_transcript(initial_tail: int = 200) -> Iterator[str]:
                 last_size = cur_size
                 for ln in chunk.splitlines():
                     clean = _strip_ansi(ln)
-                    if not _interesting(clean) or clean == last_emitted:
+                    unwrapped = _unwrap_panel(clean)
+                    if unwrapped is None or not _interesting(unwrapped):
                         continue
-                    yield f"data: {json.dumps(clean)}\n\n"
-                    last_emitted = clean
+                    if unwrapped == last_emitted:
+                        continue
+                    yield f"data: {json.dumps(unwrapped)}\n\n"
+                    last_emitted = unwrapped
             except OSError:
                 continue
             idle_ticks = 0
