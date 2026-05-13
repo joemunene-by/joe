@@ -990,6 +990,10 @@ def openai_models(authorization: Optional[str] = Header(None)) -> dict:
 
 def _stream_ollama(prompt: str, model: str):
     """Generator yielding SSE-formatted token events from ollama."""
+    # First line tells the browser NOT to auto-reconnect for ~1 day after
+    # a clean close. Without this, EventSource fires 'done' AND THEN
+    # reconnects 3s later, re-issuing the same prompt indefinitely.
+    yield "retry: 86400000\n\n"
     body = json.dumps({"model": model, "prompt": prompt,
                        "stream": True, "think": False}).encode()
     req = urllib.request.Request(
@@ -1115,6 +1119,10 @@ def _stream_transcript(initial_tail: int = 200) -> Iterator[str]:
     """Yield SSE events for new lines as they're appended to the newest
     transcript. Sends `initial_tail` historical lines on connect so the
     client doesn't see a blank pane while waiting for the next print."""
+    # Big reconnect delay so a clean stream end doesn't trigger an
+    # infinite reconnect loop. The client's own setTimeout-based
+    # reconnect (for connection-loss recovery) still works.
+    yield "retry: 86400000\n\n"
     path = _latest_transcript()
     if path is None:
         yield f"event: error\ndata: {json.dumps('no transcript files yet')}\n\n"
