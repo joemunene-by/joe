@@ -2,6 +2,21 @@
 
 The headline feature per release. Full git log between tags has more.
 
+## v0.11.8 — OS-level <bash> sandbox
+
+- When joe's tool-layer sandbox is `read-only` or `workspace-write`,
+  every `<bash>` command is now wrapped in an OS-native jail so escape
+  via subshells / `eval` / nested commands is blocked at the kernel,
+  not just at the Python tool dispatcher.
+- macOS: `sandbox-exec` with a Seatbelt (SBPL) profile that denies
+  `file-write*` and re-allows only `/tmp`, `/dev/null`, and (in
+  workspace-write) the cwd.
+- Linux: `bwrap` (from `bubblewrap`) preferred — `--ro-bind /`,
+  tmpfs `/tmp`, cwd re-bound rw in workspace-write. Falls back to
+  `firejail --read-only=/` when bwrap is absent.
+- `JOE_OS_SANDBOX=0` env or `/sandbox os off` opts out. The
+  `/sandbox` status panel prints which jail is active.
+
 ## v0.11.7 — tree-sitter edit validation
 
 - Non-Python writes / edits now route through `tree-sitter-languages`

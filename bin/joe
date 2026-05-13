@@ -218,6 +218,97 @@ def _sandbox_check_path(tool_name: str, path_str: str) -> None:
             f"{p}  (not under {cwd}). /sandbox full to allow."
         )
 
+
+# v0.11.8: OS-level sandbox for <bash>. The Python-layer sandbox above only
+# gates the tool-write surface; a determined model can still smuggle a write
+# through `bash> echo foo > ../escape`. When _OS_SANDBOX_ENABLED is on AND
+# we're not in "full" mode, joe wraps each <bash> in an OS-native jail:
+#
+#   macOS  -> sandbox-exec with an SBPL profile (Seatbelt)
+#   Linux  -> bwrap (preferred, from `bubblewrap`) or firejail fallback
+#   other  -> silent passthrough (existing Python-level checks still apply)
+#
+# Set JOE_OS_SANDBOX=0 to disable. The wrapper logs which jail was used so
+# the user can confirm coverage.
+_OS_SANDBOX_ENABLED: bool = os.environ.get(
+    "JOE_OS_SANDBOX", "1"
+).strip().lower() not in {"0", "off", "false", "no", ""}
+
+
+def _macos_seatbelt_profile(mode: str, cwd: Path) -> str:
+    """Build a Seatbelt (SBPL) profile string for sandbox-exec.
+
+    mode in {"read-only", "workspace-write"}. ("full" never calls this.)
+    Strategy: allow everything by default, then deny file-write* and re-allow
+    only the locations the mode permits. Standard Apple-shipped wedge.
+    """
+    cwd_q = str(cwd).replace("\\", "\\\\").replace('"', '\\"')
+    base = "(version 1)\n(allow default)\n(deny file-write*)\n"
+    common_writes = (
+        '(allow file-write* (subpath "/dev/null"))\n'
+        '(allow file-write* (subpath "/private/tmp"))\n'
+        '(allow file-write* (subpath "/tmp"))\n'
+        '(allow file-write* (subpath "/var/folders"))\n'
+        '(allow file-write-data (literal "/dev/stdout"))\n'
+        '(allow file-write-data (literal "/dev/stderr"))\n'
+    )
+    if mode == "read-only":
+        return base + common_writes
+    # workspace-write: also allow writes under cwd
+    return base + common_writes + f'(allow file-write* (subpath "{cwd_q}"))\n'
+
+
+def _linux_bwrap_argv(mode: str, cwd: Path, cmd: str) -> list[str]:
+    """bwrap (bubblewrap) argv: root as read-only bind, tmpfs /tmp, cwd
+    re-bound read+write only in workspace-write mode."""
+    argv = [
+        "bwrap",
+        "--ro-bind", "/", "/",
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        "--share-net",
+        "--die-with-parent",
+        "--chdir", str(cwd),
+    ]
+    if mode == "workspace-write":
+        argv += ["--bind", str(cwd), str(cwd)]
+    argv += ["sh", "-c", cmd]
+    return argv
+
+
+def _firejail_argv(mode: str, cwd: Path, cmd: str) -> list[str]:
+    """firejail fallback when bwrap is absent. --read-only=/ then re-allow
+    cwd under workspace-write."""
+    argv = ["firejail", "--quiet", "--noprofile", "--read-only=/"]
+    if mode == "workspace-write":
+        argv += [f"--read-write={cwd}"]
+    argv += ["sh", "-c", cmd]
+    return argv
+
+
+def _os_sandbox_wrap_argv(cmd: str) -> tuple[Optional[list[str]], str]:
+    """Resolve the bash invocation to a wrapper argv when OS-level sandbox
+    applies. Returns (argv, label). When (None, "") the caller should run
+    the command via the original shell=True path with no jail."""
+    if not _OS_SANDBOX_ENABLED:
+        return None, ""
+    if _SANDBOX_MODE in {"full", ""}:
+        return None, ""
+    if _SANDBOX_MODE not in {"read-only", "workspace-write"}:
+        return None, ""
+    cwd = Path.cwd().resolve()
+    if sys.platform == "darwin" and shutil.which("sandbox-exec"):
+        profile = _macos_seatbelt_profile(_SANDBOX_MODE, cwd)
+        return ["sandbox-exec", "-p", profile, "sh", "-c", cmd], "macOS Seatbelt"
+    if sys.platform.startswith("linux"):
+        if shutil.which("bwrap"):
+            return _linux_bwrap_argv(_SANDBOX_MODE, cwd, cmd), "linux bwrap"
+        if shutil.which("firejail"):
+            return _firejail_argv(_SANDBOX_MODE, cwd, cmd), "linux firejail"
+    return None, ""
+
+
 # Built-in output-style presets that overlay the system prompt. Mirrors
 # Claude Code's /output-style with a set of personality + verbosity
 # defaults users can switch on the fly.
@@ -3793,11 +3884,23 @@ def tool_bash(attrs: dict, body: str, allow_all: bool, confirm: bool = True) -> 
     if not allow_all:
         if os.path.basename(first) not in ALLOWED_BASH_PROGRAMS:
             raise ToolError(f"<bash>: {first!r} not in safe allow-list (pass --unsafe-bash to broaden)")
-    panel(f"Bash", Syntax(cmd, "bash", theme="ansi_dark"), style="magenta")
+    # v0.11.8: OS-level sandbox wrapping. If joe sandbox is read-only or
+    # workspace-write AND the OS jail is available, run the command inside
+    # the jail so escape-via-subshell is denied at the kernel layer.
+    sb_argv, sb_label = _os_sandbox_wrap_argv(cmd)
+    panel_title = f"Bash ({sb_label})" if sb_label else "Bash"
+    panel(panel_title, Syntax(cmd, "bash", theme="ansi_dark"), style="magenta")
     if confirm and not _confirm("Run this command?", tool="bash"):
         return "user denied bash"
     try:
-        cp = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+        if sb_argv is not None:
+            cp = subprocess.run(
+                sb_argv, capture_output=True, text=True, timeout=120,
+            )
+        else:
+            cp = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=120,
+            )
     except subprocess.TimeoutExpired:
         return "TIMEOUT (120s)"
     out = (cp.stdout or "") + (("\n[stderr]\n" + cp.stderr) if cp.stderr else "")
@@ -7493,6 +7596,7 @@ def run_turn(
 def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[str]) -> int:
     global _PENDING_CWD  # written by tool_cd(); flushed into state below
     global _LLM_DETECTED, _ACTIVE_OUTPUT_STYLE, _SANDBOX_MODE, _LOADED_SKILLS
+    global _OS_SANDBOX_ENABLED  # /sandbox os on|off toggle
     cwd = Path.cwd()
     banner(model, cwd)
     # Best-effort: spin up any configured external MCP clients. Failures
@@ -9248,18 +9352,54 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
             if cmd == "sandbox":
                 sub = args.strip().lower()
                 if not sub:
+                    # Probe the OS-level wrapper status so the user knows
+                    # whether <bash> is double-walled or just Python-walled.
+                    if sys.platform == "darwin":
+                        jail = "macOS Seatbelt" if shutil.which("sandbox-exec") else "none (sandbox-exec missing)"
+                    elif sys.platform.startswith("linux"):
+                        if shutil.which("bwrap"):
+                            jail = "linux bwrap"
+                        elif shutil.which("firejail"):
+                            jail = "linux firejail"
+                        else:
+                            jail = "none (install bubblewrap or firejail)"
+                    else:
+                        jail = "none (platform unsupported)"
+                    os_state = "on" if _OS_SANDBOX_ENABLED else "off"
+                    active_now = (
+                        _OS_SANDBOX_ENABLED and _SANDBOX_MODE in {"read-only", "workspace-write"}
+                        and "none" not in jail
+                    )
+                    active_lbl = "[green]ACTIVE[/]" if active_now else "[dim]not active[/]"
                     console.print(
                         f"[dim]sandbox:[/] [bold]{_SANDBOX_MODE}[/]\n"
+                        f"[dim]OS jail:[/] {jail}  (toggle [bold]{os_state}[/]; {active_lbl})\n\n"
                         "  read-only        only read/grep/glob/web_*/cd/parallel/screen/clipboard\n"
                         "  workspace-write  above + write/edit + test/lint/build (writes scoped to cwd)\n"
                         "  full             everything (default)\n"
-                        "  /sandbox <mode> to switch"
+                        "  /sandbox <mode>      switch tool-layer mode\n"
+                        "  /sandbox os on|off   toggle OS-level <bash> jail"
                     )
+                    continue
+                if sub.startswith("os"):
+                    # /sandbox os | /sandbox os on | /sandbox os off
+                    rest = sub[2:].strip()
+                    if rest in {"", "toggle"}:
+                        _OS_SANDBOX_ENABLED = not _OS_SANDBOX_ENABLED
+                    elif rest in {"on", "1", "true", "yes", "enable"}:
+                        _OS_SANDBOX_ENABLED = True
+                    elif rest in {"off", "0", "false", "no", "disable"}:
+                        _OS_SANDBOX_ENABLED = False
+                    else:
+                        console.print(f"[red]usage:[/] /sandbox os [on|off]")
+                        continue
+                    state = "on" if _OS_SANDBOX_ENABLED else "off"
+                    console.print(f"[green]OS sandbox:[/] {state}")
                     continue
                 if sub not in _SANDBOX_LEVELS:
                     console.print(
                         f"[red]unknown sandbox {sub!r}[/]; valid: "
-                        f"{', '.join(_SANDBOX_LEVELS.keys())}"
+                        f"{', '.join(_SANDBOX_LEVELS.keys())}, or `os on|off`"
                     )
                     continue
                 _SANDBOX_MODE = sub
