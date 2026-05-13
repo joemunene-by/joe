@@ -163,6 +163,49 @@ MCP_CLIENTS_CONFIG = STATE_DIR / "mcp-clients.json"
 COMMANDS_DIR = STATE_DIR / "commands"
 HOOKS_DIR = STATE_DIR / "hooks"
 PLUGIN_TOOLS_DIR = STATE_DIR / "tools"
+OUTPUT_STYLES_DIR = STATE_DIR / "output-styles"
+STATUSLINE_FILE = STATE_DIR / "statusline"
+
+# Built-in output-style presets that overlay the system prompt. Mirrors
+# Claude Code's /output-style with a set of personality + verbosity
+# defaults users can switch on the fly.
+_OUTPUT_STYLES = {
+    "default": "",  # no overlay
+    "concise": (
+        "Answer in the fewest words that fully address the question. Drop "
+        "throat-clearing, preambles, and 'great question!' style filler. "
+        "Bullet points are fine; prose is fine; just be terse."
+    ),
+    "explanatory": (
+        "Before each code change, briefly explain WHY in one sentence. "
+        "After each tool call, add a short 'why this matters' line. Aim "
+        "to teach the reader, not just deliver the result."
+    ),
+    "learning": (
+        "Treat the user as a junior who wants to grow. After answering, "
+        "ALWAYS include a [followup] bullet pointing out an aspect they "
+        "could research next or a pattern worth recognising. Quote names "
+        "of relevant concepts so they can Google them."
+    ),
+    "security": (
+        "Apply a paranoid threat-modelling lens to every code change. "
+        "Before any <write>, check for: SQL injection, XSS, command "
+        "injection, path traversal, secrets in git, auth bypass, race "
+        "conditions, missing input validation. Refuse if you spot a "
+        "high-severity issue and instead emit a [security] note."
+    ),
+    "review": (
+        "Treat every read as a code review. Pull-quote specific lines you "
+        "find suspect ([style], [bug], [perf], [security]). Don't make "
+        "assumptions about author intent -- ask the user."
+    ),
+    "ship-it": (
+        "Optimise for landing code. Minimal explanation, fastest "
+        "test-driven loop. After each <write> or <edit>, immediately "
+        "<test> the change. Don't ask permission for typo fixes or "
+        "trivial style polish."
+    ),
+}
 
 # Per-turn context, set by run_turn (and the @@agent dispatch) so tools like
 # write/edit can stamp provenance with the original user message + persona.
@@ -3020,9 +3063,9 @@ class ToolCall:
 #   self-closing:  <tool_name attr="val" />
 #   block:         <tool_name attr="val">body</tool_name>
 TAG_PAT = re.compile(
-    r"<(?P<name>read|write|edit|bash|cd|grep|glob|delegate|"
+    r"<(?P<name>read|write|edit|multi_edit|bash|cd|grep|glob|delegate|"
     r"test|lint|build|web_search|web_fetch|plan|image|mcp|"
-    r"screen|click|type|key|open|clipboard|parallel|browser)"
+    r"screen|click|type|key|open|clipboard|parallel|browser|notebook_edit)"
     # attrs: greedy any-char-but-> with a tail-trim of optional `/` so we still
     # detect self-closing tags. Previous version excluded `/` which broke
     # paths like `/tmp/foo`.
@@ -3040,9 +3083,9 @@ RUN_LEGACY_PAT = re.compile(r"^RUN:\s*(.+?)\s*$", re.MULTILINE)
 # IF the tag carries attributes, so we don't false-positive on prose that
 # happens to mention the tag name.
 OPENER_FALLBACK_PAT = re.compile(
-    r"<(?P<name>read|write|edit|bash|cd|grep|glob|delegate|"
+    r"<(?P<name>read|write|edit|multi_edit|bash|cd|grep|glob|delegate|"
     r"test|lint|build|web_search|web_fetch|plan|image|mcp|"
-    r"screen|click|type|key|open|clipboard|parallel|browser)"
+    r"screen|click|type|key|open|clipboard|parallel|browser|notebook_edit)"
     r"(?P<attrs>\s+[^>]+?)\s*/?>"
     r"(?!.*</(?P=name)>)",  # only if there's no matching close downstream
     re.DOTALL,
@@ -3052,9 +3095,10 @@ OPENER_FALLBACK_PAT = re.compile(
 # Recognised tool names; used both by the parser and by diagnose_tool_emission
 # for repair hints when the model emits something almost-right.
 _KNOWN_TOOL_NAMES = (
-    "read", "write", "edit", "bash", "cd", "grep", "glob", "delegate",
+    "read", "write", "edit", "multi_edit", "bash", "cd", "grep", "glob", "delegate",
     "test", "lint", "build", "web_search", "web_fetch", "plan", "image", "mcp",
     "screen", "click", "type", "key", "open", "clipboard", "parallel", "browser",
+    "notebook_edit",
 )
 
 # Tools whose results are side-effect-free given the same inputs + cwd
@@ -3391,6 +3435,168 @@ def tool_edit(attrs: dict, body: str, confirm: bool = True) -> str:
     return f"edited {path}"
 
 
+def tool_multi_edit(attrs: dict, body: str, confirm: bool = True) -> str:
+    """Apply N sequential <old>/<new> edits to one file in a single
+    tool call. All must succeed (each old-string must appear exactly
+    once at its turn). Atomic: on any failure, NO edits land.
+
+    Body format (one or more):
+        <e><old>...</old><new>...</new></e>
+        <e><old>...</old><new>...</new></e>
+
+    Mirrors Claude Code's MultiEdit. Win over N sequential <edit>s:
+    one diff preview, one confirm, atomic apply.
+    """
+    path = attrs.get("path")
+    if not path:
+        raise ToolError("<multi_edit> requires path=\"...\"")
+    p = _resolve_path(path)
+    if not p.exists():
+        raise ToolError(f"{path}: no such file")
+    pairs = re.findall(
+        r"<e>\s*<old>\s*(.*?)\s*</old>\s*<new>\s*(.*?)\s*</new>\s*</e>",
+        body, re.DOTALL,
+    )
+    if not pairs:
+        raise ToolError(
+            "<multi_edit> body must contain one or more "
+            "<e><old>...</old><new>...</new></e> entries"
+        )
+    src = p.read_text(encoding="utf-8", errors="replace")
+    cur = src
+    for i, (old, new) in enumerate(pairs, 1):
+        n = cur.count(old)
+        if n == 0:
+            raise ToolError(
+                f"<multi_edit> edit #{i}: old-string not found "
+                f"(after applying {i - 1} prior edits)"
+            )
+        if n > 1:
+            raise ToolError(
+                f"<multi_edit> edit #{i}: old-string appears {n} times; "
+                f"make it unique (e.g. add more context lines)"
+            )
+        cur = cur.replace(old, new, 1)
+    diff_lines = list(difflib.unified_diff(
+        src.splitlines(), cur.splitlines(),
+        fromfile=f"a/{path}", tofile=f"b/{path}", lineterm="",
+    ))
+    diff = "\n".join(diff_lines)
+    adds = sum(1 for ln in diff_lines if ln.startswith("+") and not ln.startswith("+++"))
+    dels = sum(1 for ln in diff_lines if ln.startswith("-") and not ln.startswith("---"))
+    panel(
+        f"Multi-edit {path}  ({len(pairs)} edits)",
+        Syntax(diff, "diff", theme="ansi_dark"),
+        style="yellow", subtitle=f"+{adds} / -{dels}",
+    )
+    syntax_err = _validate_python_syntax(p, cur)
+    if syntax_err:
+        raise ToolError(syntax_err)
+    if confirm and not _confirm(
+        f"Apply {len(pairs)} edits to {path}?", tool="edit",
+    ):
+        return "user denied multi_edit"
+    p.write_text(cur, encoding="utf-8")
+    log_edit(path=str(p), before=src, after=cur, op="multi_edit")
+    provenance_record(
+        p, "multi_edit", src, cur,
+        line_start=None, line_end=None, adds=adds, dels=dels,
+    )
+    return f"applied {len(pairs)} edits to {path} (+{adds}/-{dels})"
+
+
+def tool_notebook_edit(attrs: dict, body: str, confirm: bool = True) -> str:
+    """Edit a Jupyter notebook cell. Supports:
+
+      <notebook_edit path="foo.ipynb" cell="3" op="replace">new source</notebook_edit>
+      <notebook_edit path="foo.ipynb" cell="3" op="append">extra lines</notebook_edit>
+      <notebook_edit path="foo.ipynb" op="insert" cell_type="code" after="2">source</notebook_edit>
+      <notebook_edit path="foo.ipynb" cell="3" op="delete" />
+
+    Cell indices are 0-based. Outputs are cleared on edit to avoid
+    stale state confusion.
+    """
+    path = attrs.get("path")
+    if not path:
+        raise ToolError("<notebook_edit> requires path=\"...\"")
+    p = _resolve_path(path)
+    if not p.is_file():
+        raise ToolError(f"{path}: no such notebook")
+    if not str(path).endswith(".ipynb"):
+        raise ToolError(f"<notebook_edit>: {path} is not a .ipynb file")
+    op = (attrs.get("op", "replace") or "replace").lower()
+    src = p.read_text(encoding="utf-8")
+    try:
+        nb = json.loads(src)
+    except json.JSONDecodeError as e:
+        raise ToolError(f"<notebook_edit>: notebook JSON parse failed: {e}")
+    cells = nb.get("cells", [])
+    if op in {"replace", "append", "delete"}:
+        idx_raw = attrs.get("cell")
+        if idx_raw is None:
+            raise ToolError(f"<notebook_edit op={op!r}>: cell index required")
+        try:
+            idx = int(idx_raw)
+        except ValueError:
+            raise ToolError(f"<notebook_edit>: cell={idx_raw!r} not an int")
+        if not 0 <= idx < len(cells):
+            raise ToolError(
+                f"<notebook_edit>: cell {idx} out of range (0..{len(cells) - 1})"
+            )
+    if op == "replace":
+        cells[idx]["source"] = body.splitlines(keepends=True)
+        cells[idx]["outputs"] = []
+        cells[idx]["execution_count"] = None
+        msg = f"replaced cell {idx} in {path} with {len(body)} chars"
+    elif op == "append":
+        old_src = "".join(cells[idx].get("source", []))
+        new_src = old_src + body
+        cells[idx]["source"] = new_src.splitlines(keepends=True)
+        cells[idx]["outputs"] = []
+        cells[idx]["execution_count"] = None
+        msg = f"appended {len(body)} chars to cell {idx} in {path}"
+    elif op == "delete":
+        deleted = cells.pop(idx)
+        msg = f"deleted cell {idx} ({deleted.get('cell_type', '?')}) from {path}"
+    elif op == "insert":
+        ct = attrs.get("cell_type", "code")
+        after = int(attrs.get("after", "-1"))
+        new_cell = {
+            "cell_type": ct,
+            "metadata": {},
+            "source": body.splitlines(keepends=True),
+        }
+        if ct == "code":
+            new_cell["outputs"] = []
+            new_cell["execution_count"] = None
+        insert_at = after + 1 if after >= -1 else 0
+        cells.insert(insert_at, new_cell)
+        msg = f"inserted {ct} cell at index {insert_at} in {path}"
+    else:
+        raise ToolError(
+            f"<notebook_edit op={op!r}>: unknown op (replace|append|insert|delete)"
+        )
+    nb["cells"] = cells
+    new_src = json.dumps(nb, indent=1) + "\n"
+    panel(
+        f"Notebook edit {path}  (op={op})",
+        Text(msg), style="yellow",
+    )
+    if confirm and not _confirm(
+        f"Apply notebook edit to {path}?", tool="edit",
+    ):
+        return "user denied notebook_edit"
+    p.write_text(new_src, encoding="utf-8")
+    log_edit(path=str(p), before=src, after=new_src, op="notebook_edit")
+    provenance_record(
+        p, "notebook_edit", src, new_src,
+        line_start=None, line_end=None,
+        adds=len(new_src.splitlines()) - len(src.splitlines()),
+        dels=0,
+    )
+    return msg
+
+
 def tool_bash(attrs: dict, body: str, allow_all: bool, confirm: bool = True) -> str:
     cmd = body.strip()
     if not cmd:
@@ -3534,6 +3740,35 @@ def _screencap(out_path: Path) -> tuple[bool, str]:
 
 _CUSTOM_COMMANDS: dict[str, dict] = {}
 _PLUGIN_TOOLS: dict[str, "Any"] = {}
+# Active output-style name (one of _OUTPUT_STYLES or a user-defined .md
+# file in OUTPUT_STYLES_DIR). Empty = default (no overlay).
+_ACTIVE_OUTPUT_STYLE: str = ""
+
+
+def _load_output_style(name: str) -> str:
+    """Return the text overlay for an output style. Built-ins win; user
+    .md files in ~/.joe-agent/output-styles/ are loaded by file stem."""
+    if not name or name == "default":
+        return ""
+    if name in _OUTPUT_STYLES:
+        return _OUTPUT_STYLES[name]
+    custom = OUTPUT_STYLES_DIR / f"{name}.md"
+    if custom.is_file():
+        try:
+            return custom.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+    return ""
+
+
+def list_output_styles() -> list[str]:
+    """All known style names: built-ins first, then user customs."""
+    names = list(_OUTPUT_STYLES.keys())
+    if OUTPUT_STYLES_DIR.is_dir():
+        for f in sorted(OUTPUT_STYLES_DIR.glob("*.md")):
+            if f.stem not in names:
+                names.append(f.stem)
+    return names
 
 
 def load_plugin_tools() -> dict[str, "Any"]:
@@ -5409,6 +5644,7 @@ SLASH_COMMAND_NAMES = (
     "sessions", "whoami", "cost", "compact", "yolo", "trust", "doctor",
     "blame", "passport", "council", "commands", "plugins",
     "diff-model", "diffmodel", "think",
+    "output-style", "outputstyle", "style", "statusline",
     "read", "run", "diff", "copy", "history", "undo", "redo",
     "plan", "test", "lint", "build", "explain", "profile",
     "commit", "push", "pr", "issue", "snap",
@@ -5488,12 +5724,16 @@ def _get_input(cwd_short: str) -> str:
 
 
 def _print_status_line(state: dict) -> None:
-    """One-line status above each prompt: session, model, repo, ctx, tasks."""
+    """One-line status above each prompt: session, model, repo, ctx, tasks.
+
+    Users can override the format by writing a custom string to
+    ~/.joe-agent/statusline. Placeholders: {session} {model} {cwd}
+    {ctx_tok} {flags} {style} {trust}.
+    """
     short_cwd = str(state["cwd"]).replace(str(HOME), "~")
     tk = session_token_estimate(state["session"])
     ratio = tk / CONTEXT_BUDGET_TOKENS
     ctx_color = "green" if ratio < 0.5 else "yellow" if ratio < 0.85 else "red"
-    # Background task count.
     running = sum(1 for d in task_list() if d.get("status") == "running")
     yolo = os.environ.get("JOE_AUTO_YES", "").strip() in {"1", "true", "yes"}
     flags = []
@@ -5503,7 +5743,28 @@ def _print_status_line(state: dict) -> None:
         flags.append("[red bold]yolo[/]")
     if running:
         flags.append(f"tasks:{running}")
+    if _ACTIVE_OUTPUT_STYLE:
+        flags.append(f"style:{_ACTIVE_OUTPUT_STYLE}")
+    if _SESSION_TRUST:
+        flags.append(f"trust:{len(_SESSION_TRUST)}")
     flag_str = ("  " + "  ".join(flags)) if flags else ""
+    # User-defined custom format wins. Rich-markup safe.
+    if STATUSLINE_FILE.is_file():
+        try:
+            fmt = STATUSLINE_FILE.read_text().strip()
+            bar = fmt.format(
+                session=state["session"],
+                model=state["model"],
+                cwd=short_cwd,
+                ctx_tok=f"~{tk}",
+                flags=flag_str.strip(),
+                style=_ACTIVE_OUTPUT_STYLE or "default",
+                trust=len(_SESSION_TRUST),
+            )
+            console.rule(Text.from_markup(bar), style="dim", align="left")
+            return
+        except Exception:
+            pass
     bar = (
         f"[dim]{state['session']}[/]  "
         f"[cyan]{state['model']}[/]  "
@@ -6168,6 +6429,12 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
     pc = _load_project_context(cwd)
     if pc:
         parts.append(pc)
+    # Output-style overlay: /output-style swaps personality presets.
+    style_text = _load_output_style(_ACTIVE_OUTPUT_STYLE)
+    if style_text:
+        parts.append(
+            f"<output_style name=\"{_ACTIVE_OUTPUT_STYLE}\">\n{style_text}\n</output_style>"
+        )
     parts.append(
         "<environment name=\"joe shell\">\n"
         "You are running inside the `joe` interactive shell. You are the\n"
@@ -6435,6 +6702,10 @@ def run_turn(
                 result = tool_write(call.attrs, call.body)
             elif call.name == "edit":
                 result = tool_edit(call.attrs, call.body)
+            elif call.name == "multi_edit":
+                result = tool_multi_edit(call.attrs, call.body)
+            elif call.name == "notebook_edit":
+                result = tool_notebook_edit(call.attrs, call.body)
             elif call.name == "bash":
                 result = tool_bash(call.attrs, call.body, allow_all=allow_all_bash)
             elif call.name == "cd":
@@ -8233,6 +8504,54 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                         console.print(f"[red]could not kill #{rest}[/]")
                     continue
                 cmd_task_show(sub); continue
+            if cmd in {"output-style", "outputstyle", "style"}:
+                global _ACTIVE_OUTPUT_STYLE
+                sub = args.strip()
+                if not sub or sub == "list":
+                    names = list_output_styles()
+                    current = _ACTIVE_OUTPUT_STYLE or "default"
+                    lines = []
+                    for n in names:
+                        marker = "[bold green]*[/]" if n == current else " "
+                        desc = (_OUTPUT_STYLES.get(n) or "")[:60]
+                        if not desc and n != "default":
+                            desc = "(user custom)"
+                        lines.append(f"  {marker} [bold]{n}[/]  [dim]{desc}...[/]")
+                    panel("Output styles", Text.from_markup("\n".join(lines)),
+                          style="cyan",
+                          subtitle=f"active: {current}; /output-style <name> to switch")
+                    continue
+                if sub == "off" or sub == "reset" or sub == "default":
+                    _ACTIVE_OUTPUT_STYLE = ""
+                    console.print("[dim]output style: default (no overlay)[/]")
+                    continue
+                # Validate
+                if sub not in _OUTPUT_STYLES and not (OUTPUT_STYLES_DIR / f"{sub}.md").is_file():
+                    console.print(
+                        f"[red]unknown style {sub!r}[/]; known: "
+                        f"{', '.join(list_output_styles())}"
+                    )
+                    continue
+                _ACTIVE_OUTPUT_STYLE = sub
+                console.print(f"[green]output style:[/] {sub}")
+                continue
+            if cmd == "statusline":
+                # /statusline                show current
+                # /statusline reset          back to default
+                # /statusline <fmt>          set a custom format string
+                #   supported placeholders: {model} {cwd} {session} {ctx_tok}
+                sub = args.strip()
+                if not sub:
+                    cur = STATUSLINE_FILE.read_text() if STATUSLINE_FILE.is_file() else "(default)"
+                    console.print(f"[dim]statusline:[/] {cur}")
+                    continue
+                if sub == "reset":
+                    STATUSLINE_FILE.unlink(missing_ok=True)
+                    console.print("[dim]statusline reset to default[/]")
+                    continue
+                STATUSLINE_FILE.write_text(sub)
+                console.print(f"[green]statusline:[/] {sub}")
+                continue
             if cmd == "plugins":
                 sub = args.strip()
                 if sub == "reload":
