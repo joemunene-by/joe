@@ -2597,7 +2597,7 @@ class ToolCall:
 #   self-closing:  <tool_name attr="val" />
 #   block:         <tool_name attr="val">body</tool_name>
 TAG_PAT = re.compile(
-    r"<(?P<name>read|write|edit|bash|grep|glob|delegate|"
+    r"<(?P<name>read|write|edit|bash|cd|grep|glob|delegate|"
     r"test|lint|build|web_search|web_fetch|plan|image|mcp)"
     # attrs: greedy any-char-but-> with a tail-trim of optional `/` so we still
     # detect self-closing tags. Previous version excluded `/` which broke
@@ -2616,7 +2616,7 @@ RUN_LEGACY_PAT = re.compile(r"^RUN:\s*(.+?)\s*$", re.MULTILINE)
 # IF the tag carries attributes, so we don't false-positive on prose that
 # happens to mention the tag name.
 OPENER_FALLBACK_PAT = re.compile(
-    r"<(?P<name>read|write|edit|bash|grep|glob|delegate|"
+    r"<(?P<name>read|write|edit|bash|cd|grep|glob|delegate|"
     r"test|lint|build|web_search|web_fetch|plan|image|mcp)"
     r"(?P<attrs>\s+[^>]+?)\s*/?>"
     r"(?!.*</(?P=name)>)",  # only if there's no matching close downstream

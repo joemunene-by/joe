@@ -141,3 +141,30 @@ def test_cd_in_tool_dispatcher_table(joe_module):
     text = pathlib.Path(joe_module.__file__).read_text()
     assert 'call.name == "cd"' in text
     assert "tool_cd(call.attrs, call.body)" in text
+
+
+def test_cd_tag_is_parseable_by_extract(joe_module):
+    """Regression: the TAG_PAT regex must include 'cd' in its tag whitelist.
+    First field test on the Mac showed the model emitting <cd path="CRM" />
+    correctly but the parser returning None because 'cd' was missing from
+    the disjunction -- so the tag was silently treated as prose."""
+    call = joe_module.extract_first_tool_call('<cd path="CRM" />')
+    assert call is not None, "the parser must recognise <cd>"
+    assert call.name == "cd"
+    assert call.attrs == {"path": "CRM"}
+
+
+def test_cd_tag_block_form_parses(joe_module):
+    """Block form: `<cd>path</cd>` should also parse, body becomes the path."""
+    call = joe_module.extract_first_tool_call("<cd>~/Desktop/CRM</cd>")
+    assert call is not None
+    assert call.name == "cd"
+    assert call.body == "~/Desktop/CRM"
+
+
+def test_cd_tag_with_absolute_path_parses(joe_module):
+    """Path attrs that contain `/` must not break the regex (regression)."""
+    call = joe_module.extract_first_tool_call('<cd path="/Users/ghost/Desktop/CRM" />')
+    assert call is not None
+    assert call.name == "cd"
+    assert call.attrs["path"] == "/Users/ghost/Desktop/CRM"
