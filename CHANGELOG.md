@@ -2,6 +2,18 @@
 
 The headline feature per release. Full git log between tags has more.
 
+## v0.11.9 — comprehensive docs sync
+
+- README.md grew a `## v0.11.x — user-research polish + safety
+  hardening` section covering v0.11.1 through v0.11.8 (8 releases).
+- JOE.md appended a structured `v0.9.x / v0.10.x / v0.11.x` retrospective
+  to replace the v0.8.0-era "what's coming next" stub. Three of the
+  four open paths there shipped; the doc now reflects that.
+- "what's not in here yet" sections in both files refreshed: shipped
+  items removed, replaced with the actual remaining backlog (HTTP/SSE
+  MCP transport, `/undo last-N`, speculative parallel, voice on
+  Windows, `joe stats --export csv`).
+
 ## v0.11.8 — OS-level <bash> sandbox
 
 - When joe's tool-layer sandbox is `read-only` or `workspace-write`,

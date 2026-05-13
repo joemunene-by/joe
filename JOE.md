@@ -791,16 +791,109 @@ has. Read it on a slow weekend.
 
 ## what's coming next
 
-Open paths if you want to push further:
+Three of the four 2026-vintage open paths shipped (bidirectional MCP
+in v0.7.0, /debate in v0.5.0, web dashboard at `joe-http /dashboard`
+with full inbox / eval / blame / graph). Frontmost-window Accessibility
+is still the one outstanding item.
 
-- Multi-agent debate (`/debate <topic>` spawns 2-3 personas with
-  conflicting system prompts, surfaces disagreements)
-- Watch the frontmost window via macOS Accessibility instead of zsh
-  history (more precise proactive triggers)
-- Bidirectional MCP: joe and Claude Code drive each other through the
-  same set of tools
-- A web dashboard (FastAPI) on `joe-http` rendering inbox / eval / blame
-  / graph in a single pane
+What landed after the original v0.8.0 doc snapshot:
 
-`joe --help` and `/help` are the live source of truth; this doc captures
-the model as of the latest deploy.
+### v0.9.x — quality + correctness
+
+- `_import_required_or_die` so VSCode-terminal launches no longer die
+  with "ModuleNotFoundError: rich"; instead they print the exact
+  interpreter path and the right pip line.
+- Per-tool session trust: `[y/N/a]` permission prompt; `a` = always for
+  this tool, this session. `/trust` for explicit grants + reset.
+- Reproducibility passports: sha256 of (model + prompt + cwd + lessons
+  + lora endpoint) for every turn. `/passport list`. `/passport replay
+  <hash>` re-runs bit-for-bit.
+- `/council <prompt>` fires same prompt at 3 local models concurrently
+  (joe-gemma + qwen2.5:14b + deepseek-r1:14b) and auto-judges.
+- `/blame <file>:<line>` shows AI-provenance (which session / prompt /
+  model wrote that line).
+- Python AST validation before write + tool-emission repair hints on
+  parser failure.
+- PC-control suite: `<screen>`, `<click>`, `<type>`, `<key>`, `<open>`,
+  `<clipboard>` (Anthropic Computer-Use surface, locally).
+- Custom slash commands as TOML at `~/.joe-agent/commands/*.toml`.
+- Hooks: shell scripts in `~/.joe-agent/hooks/<event>.sh` for
+  pre_tool / post_tool / user_prompt / stop.
+- Eval harness: `joe eval add`, `joe eval run`, `joe eval diff <a> <b>`,
+  auto-eval daemon on model swap, warn on regression.
+- `<parallel>` runs N side-effect-free tools concurrently.
+- Per-session cache for read / grep / glob / web_fetch.
+- `<browser>` with 9 Playwright actions (open / click / type / wait /
+  screenshot / extract / title / url / back / close).
+- GitHub Actions test + auto-release pipeline (idempotent release job).
+- joe-voice press-to-talk loop (joe-listen + joe -p + joe-speak).
+
+### v0.10.x — everything-agent pack
+
+- Plugin tools: `~/.joe-agent/tools/*.py` with `register()` get a new
+  tag in the parser at load time.
+- `AGENTS.md` / `CLAUDE.md` / `.joe/instructions.md` auto-loaded as
+  `<project_context>` in every system prompt.
+- `/diff-model <a> <b> <prompt>` (cheap two-model A/B, no judge).
+- `capture_reasoning_trace()` strips and persists `<think>` blocks.
+- Inline turn meter: `└ 1247 tok in · 412 tok out · 3.2s · 129 tok/s`.
+- `/output-style` with 7 presets + custom `.md` overlays.
+- `/statusline <fmt>` customises the bottom-of-REPL bar.
+- `<multi_edit>` — atomic N-edits-in-one-tag.
+- `<notebook_edit>` — Jupyter .ipynb cell mutations.
+- `@path/to/file` in user input auto-injects as `<file>` block.
+- Sandbox modes (`read-only` / `workspace-write` / `full`) gate the
+  tool dispatcher and refuse writes outside cwd.
+- Aider-style `<repo_map>` block per system prompt.
+- `/mode act | plan | architect | debug | ask | review | security`
+  atomically swaps output-style + sandbox.
+- Skills (Claude Code SKILL.md packages). `/skills install <git-url>`
+  clones a public skill directly into `~/.joe-agent/skills/`.
+- `/loop N <prompt>` and `/loop until <cond> <prompt>` (max 12).
+- `/ai-markers` + `/ai-markers fix` for Aider-style `# AI!` comments.
+
+### v0.11.x — user-research polish + safety hardening
+
+- `joe doctor --fix` pip-installs missing deps through the *same*
+  interpreter running joe, killing the "rich not found" UX hole.
+- `/swarm prompts.txt` fans out N independent agents concurrently.
+- Cumulative session $-cost in `/cost` (Claude 4.x / GPT-5 / o3 /
+  DeepSeek-V4 priced; local models render `$0 (local)`).
+- Auto-compact at 85% context budget; one summarisation per
+  ceiling-cross, keeps recent half verbatim.
+- `bin/joe-mcp` now exposes 13 tools so MCP clients (Claude Desktop,
+  Cursor, Zed) can drive ALL of joe — read_file, write_file,
+  blame_line, council, recall, list_passports, replay_passport,
+  list_skills, ai_markers_in.
+- `bin/joe-watch-ai` daemon: polls cwd for saves, auto-fires `joe -p`
+  on detected AI! markers, auto-commits. Aider's headline parity.
+- Windows compat shims for `<screen>` (PowerShell + .NET),
+  `<open>` (`cmd /c start ""`), and `<clipboard>` (Get-Clipboard +
+  `clip`). Core tool surface works on Windows 10+ without modification.
+- Knowledge-graph viz in `/dashboard`: newest triples rendered as a
+  Mermaid `flowchart LR` (dark theme, lazy-loaded from CDN). Table
+  preserved behind a `<details>` toggle.
+- Tree-sitter edit guard for 25+ non-Python extensions
+  (.js .ts .tsx .rs .go .rb .java .kt .swift .c .cpp .cs .php
+  .lua .scala .sh .html .css .json .yaml .toml .sql). Optional dep:
+  `pip install tree-sitter-languages` to activate. Same contract as
+  the Python AST guard — broken parse refuses the write.
+- OS-level `<bash>` jail: macOS `sandbox-exec` with Seatbelt SBPL
+  profile; Linux `bwrap` (preferred) / `firejail` fallback. Wraps
+  every `<bash>` when `/sandbox read-only` or `/sandbox
+  workspace-write` is active so escape-via-subshell is denied at the
+  kernel layer. `JOE_OS_SANDBOX=0` opts out; `/sandbox os on|off`
+  toggles in REPL.
+
+The remaining bucket is small. Future polish:
+
+- HTTP / SSE transport for `joe-mcp` (FastMCP supports it; a small
+  wiring job).
+- `joe stats --export csv`.
+- `/undo last-N` — atomic rollback of joe's recent writes via the
+  provenance log + git reflog.
+- Speculative parallel inference for cloud models.
+- Voice on Windows (pyttsx3 + Sapi5).
+
+`joe --help` and `/help` are the live source of truth; this doc
+captures the model as of v0.11.8.

@@ -682,6 +682,155 @@ from a public repo into `~/.joe-agent/skills/`. Validates the dir
 name as `[a-zA-Z0-9_-]+`; refuses if target exists; reloads the
 skill registry after install so it's active in the same REPL.
 
+## v0.11.x — user-research polish + safety hardening
+
+Eight more rounds after the v0.10.x parity pack. v0.11.0 was a docs
+release; v0.11.1 onward each shipped a piece of either competitive
+parity or hardening surfaced by the "what do developers want from
+terminal AI agents in 2026" survey + competitor mining.
+
+### v0.11.1 — doctor --fix + /swarm + cumulative cost
+
+`joe doctor --fix` iterates over runtime deps (rich, prompt_toolkit,
+fastapi, uvicorn, mcp, pyautogui, playwright) and pip-installs any
+missing one through the *same* interpreter that's running joe, so
+the "ModuleNotFoundError: rich" UX disappears for good.
+
+`/swarm prompts.txt` reads N lines (one prompt per line) and fires
+each as an independent agent in a fresh session, concurrently, up to
+8 threads. A result table renders per-agent success / failure +
+preview. Latency drops from `sum(individual)` to `max(individual)`.
+
+`/cost` now shows cumulative $-spend per session based on the new
+`MODEL_PRICES_PER_MTOK` table (Claude 4.x family, GPT-5, o3,
+DeepSeek-V4-Pro:cloud). Local models render as `$0 (local)` so the
+"free" signal is loud.
+
+### v0.11.2 — auto-compact at 85%
+
+Every REPL iteration estimates current session tokens. When the
+ratio crosses 85% of `CONTEXT_BUDGET_TOKENS`, `_auto_compact()`
+summarises the oldest half via the current model with a
+preserve-decisions-files-open-questions prompt, replaces it with one
+system turn, keeps the recent half verbatim. Context drops from
+~87% to ~30-40% with the conversation's useful state intact. Fires
+once per ceiling-cross (a `_warned_compact` flag prevents thrash).
+
+### v0.11.3 — native MCP server: every joe tool exposed
+
+`bin/joe-mcp` was a four-tool MCP server (ask, search_repos,
+pr_draft, standup). It now exposes thirteen so any FastMCP-aware
+client (Claude Desktop, Cursor, Zed, Cline) can drive joe fully:
+
+```
+ask         search_repos    pr_draft     standup
+read_file   write_file      blame_line   council
+recall      list_passports  replay_passport
+list_skills ai_markers_in
+```
+
+`write_file` goes through joe-agent so the write is stamped to the
+provenance log and AST-validated. A Claude Desktop user can now say
+"use joe's `council` to compare joe-gemma vs deepseek-r1 on this
+question" and joe IS the server doing it.
+
+### v0.11.4 — joe-watch-ai daemon (Aider parity)
+
+A long-running daemon that polls the cwd for file saves and, on
+detection of a `# AI!` / `// AI!` / `<!-- AI! -->` marker, shells
+out to `joe -p` to fix and remove the marker, then optionally
+`git commit`s the result.
+
+```
+joe-watch-ai                 # daemon mode, polls every 2s
+joe-watch-ai --once          # one pass + exit
+joe-watch-ai --path src      # subtree
+joe-watch-ai --dry-run       # show what would fire
+joe-watch-ai --no-commit
+```
+
+Leave it running in a side terminal while you work; flag spots with
+marker comments; joe attends to them in the background. This is the
+always-on companion to the manual `/ai-markers fix`.
+
+### v0.11.5 — Windows compat shims
+
+joe was Linux + macOS only. v0.11.5 boots on Windows with native
+fallbacks for the platform-dependent tools:
+
+```
+<screen>     macOS screencapture -> Linux gnome-screenshot/scrot
+             -> Windows PowerShell + .NET (System.Windows.Forms +
+             Drawing) -> pyautogui last resort
+<open>       macOS open -> xdg-open -> Windows `cmd /c start ""`
+<clipboard>  pbpaste/pbcopy -> xclip/wl-* -> Windows PowerShell
+             Get-Clipboard (read) and `clip` (write, ships with
+             every Windows since XP)
+```
+
+No service-mode install yet, but the core tool surface works without
+modification on Windows 10+.
+
+### v0.11.6 — knowledge-graph viz in /dashboard
+
+The web dashboard's KG block used to render the newest triples as
+plain text. v0.11.6 also renders them as a Mermaid `flowchart LR`
+graph, loaded lazily from the CDN with a dark theme that matches
+the rest of the dashboard. The original triple table is preserved
+behind a `<details>` toggle.
+
+### v0.11.7 — tree-sitter-aware edit guard
+
+v0.9.6's Python `ast.parse` validation refuses `.py` writes that
+don't parse. v0.11.7 extends the same contract to every non-Python
+language joe can recognise:
+
+```
+.js .cjs .mjs .jsx   -> javascript
+.ts                  -> typescript           .tsx -> tsx
+.rs                  -> rust
+.go                  -> go                   .rb  -> ruby
+.java                -> java                 .kt  -> kotlin
+.swift               -> swift
+.c .h                -> c                    .cpp -> cpp
+.cs .php .lua .scala .sh .bash
+.html .css .json .yaml .toml .sql
+```
+
+When `tree-sitter-languages` is installed, broken non-Python writes
+get refused with a line:col error string the model can use to retry.
+The dep stays optional: absent => silent skip, same as before.
+
+### v0.11.8 — OS-level <bash> sandbox
+
+The Python-layer sandbox modes in v0.10.4 gated which tools the
+dispatcher would invoke. But `<bash>` was a hole: a clever model
+could shell out via `echo foo > /etc/whatever` and Python never
+saw the redirect. v0.11.8 closes that hole with an OS-native jail
+around every `<bash>` when the mode is restricted:
+
+```
+macOS   -> sandbox-exec -p <SBPL profile> sh -c <cmd>
+Linux   -> bwrap --ro-bind / --tmpfs /tmp --chdir <cwd> ...
+            (firejail --read-only=/ ... fallback)
+other   -> silent passthrough; Python-layer checks still apply
+```
+
+In `read-only` mode the jail denies file-write* everywhere except
+`/tmp` and `/dev/null`. In `workspace-write` it additionally
+re-allows writes under the cwd subpath. In `full` mode the
+wrapper is a no-op — the user picked unrestricted on purpose.
+
+```
+JOE_OS_SANDBOX=0      # disable globally
+/sandbox os on|off    # REPL toggle
+/sandbox              # status panel shows which jail is active
+```
+
+The Bash panel title prepends the wrapper label so the user can
+see at a glance: `Bash (macOS Seatbelt)`, `Bash (linux bwrap)`,
+`Bash (linux firejail)`, or just `Bash` (no wrapping).
+
 ## tool registry (26 tags)
 
 | tag | what it does | side effects |
@@ -715,16 +864,18 @@ skill registry after install so it's active in the same REPL.
 
 ## what's not in here yet
 
-The headline open items are shipped. Future polish:
+The headline open items shipped through v0.11.8. Future polish:
 
-- HTTP transport for MCP clients (currently stdio-only).
+- HTTP / SSE transport for `joe-mcp` (currently stdio-only; FastMCP
+  supports SSE so this is a small wiring job).
 - A `joe stats --export csv` flag.
 - More piper-tts voices via a per-language `--setup-piper <locale>` flow.
-- Treesitter-aware `<edit>` (Python writes are AST-validated; other
-  languages get text-only).
-- Plugin-driven tool registration (the 22 tools are hard-coded; a
-  drop-in `~/.joe-agent/tools/*.py` loader would mirror MCP's role for
-  external services but for pure-Python local tools).
+- `/undo last-N` — atomic rollback of joe's recent writes via the
+  provenance log + git reflog cross-walk.
+- Speculative parallel inference: for high-latency cloud models, fire
+  2-3 variants in parallel and pick the first valid one.
+- Voice on Windows (joe-voice currently macOS-first; pyttsx3 + Sapi5
+  is the obvious port).
 
 PRs welcome.
 
