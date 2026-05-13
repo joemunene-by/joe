@@ -33,13 +33,15 @@ import datetime as dt
 import html
 import json
 import os
+import re
 import secrets
 import sqlite3
 import subprocess
 import threading
+import time
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 try:
     from fastapi import FastAPI, Header, HTTPException, Request
@@ -405,6 +407,19 @@ def _render_dashboard_html() -> str:
         '</form></section>'
     )
 
+    # Live transcript pane: follows the newest `joe --transcript` log so
+    # operators can watch a running REPL session without SSHing.
+    parts.append(
+        '<section><h2>Live REPL '
+        '<span class="dim" style="font-size:11px;text-transform:none;'
+        'letter-spacing:0">(tail of newest <code>joe --transcript</code> '
+        'log) <span id="tx-file"></span></span></h2>'
+        '<pre id="transcript-output" class="chat-output" '
+        'style="max-height:280px;color:#b8bcc0;">'
+        '(no transcript yet -- run <code>joe --transcript</code> on a host)'
+        '</pre></section>'
+    )
+
     # Eval sparklines.
     eval_body = ""
     for model in sorted(by_model.keys()):
@@ -488,11 +503,15 @@ def _render_dashboard_html() -> str:
     parts.append(
         '<footer><p class="dim">'
         'Refresh the page for live data. '
-        'Other pages: <a href="/keys?token=' + html.escape(TOKEN) + '" '
+        'Other pages: '
+        '<a href="/m?token=' + html.escape(TOKEN) + '" '
+        'style="color:#81a1c1">/m</a> (mobile / PWA) · '
+        '<a href="/keys?token=' + html.escape(TOKEN) + '" '
         'style="color:#81a1c1">/keys</a> '
         '(joe sync --encrypt key management). '
         'Endpoints under same auth: <code>/health</code> · '
-        '<code>/chat</code> · <code>/ios</code> · <code>/standup/latest</code>.'
+        '<code>/chat</code> · <code>/ios</code> · '
+        '<code>/transcript-stream</code> · <code>/standup/latest</code>.'
         '</p></footer>'
     )
 
@@ -573,11 +592,37 @@ def _render_dashboard_html() -> str:
         document.getElementById('chat-form').dispatchEvent(new Event('submit', {cancelable: true}));
       }
     });
+
+    // Live REPL transcript: open SSE to /transcript-stream and append.
+    // Auto-reconnect on error so the pane survives a brief network blip.
+    function openTranscript() {
+      const out = document.getElementById('transcript-output');
+      const lbl = document.getElementById('tx-file');
+      const params = new URLSearchParams({token: __TOKEN__});
+      const es = new EventSource('/transcript-stream?' + params.toString());
+      es.addEventListener('file', (e) => {
+        out.textContent = '';
+        lbl.textContent = JSON.parse(e.data);
+      });
+      es.addEventListener('rotate', (e) => {
+        out.textContent += '\\n--- new session: ' + JSON.parse(e.data) + ' ---\\n';
+        lbl.textContent = JSON.parse(e.data);
+      });
+      es.onmessage = (e) => {
+        try { out.textContent += JSON.parse(e.data) + '\\n'; } catch (_) {}
+        out.scrollTop = out.scrollHeight;
+      };
+      es.addEventListener('error', () => { es.close(); setTimeout(openTranscript, 5000); });
+    }
+    openTranscript();
     """.replace("__TOKEN__", f"'{js_token}'")
     return f"""<!doctype html>
 <html lang="en"><head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0e0e10">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/icon.svg">
   <title>joe dashboard</title>
   <style>{css}</style>
 </head><body>
@@ -872,6 +917,333 @@ def chat_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# --------------------------------------------------------------------------
+# Live transcript stream. Tails the newest ~/.joe-agent/transcripts/repl-*.log
+# (written by `joe --transcript`) and yields incremental lines as SSE events.
+# ANSI escape sequences are stripped so the client can render plain text.
+# --------------------------------------------------------------------------
+
+# ANSI CSI escape codes (colour, cursor moves) emitted by Rich.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
+# Rich's spinner frames -- noisy in a tail, strip them.
+_SPINNER_CHARS = set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+# Pure "thinking" status lines (Rich rewrites these dozens of times per
+# token). Without the regex, the tail fills with hundreds of dupes.
+_THINKING_RE = re.compile(r"^\s*[\w-]+ is thinking\.\.\.\s*$")
+
+
+def _strip_ansi(text: str) -> str:
+    text = _ANSI_RE.sub("", text)
+    text = "".join(ch for ch in text if ch not in _SPINNER_CHARS)
+    # \r without \n is a Rich redraw -- collapse to nothing.
+    text = text.replace("\r", "")
+    return text
+
+
+def _interesting(line: str) -> bool:
+    """Return True if the line is worth showing to a remote tailer."""
+    if not line.strip():
+        return False
+    if _THINKING_RE.match(line):
+        return False
+    return True
+
+
+def _latest_transcript() -> Optional[Path]:
+    tdir = STATE_DIR / "transcripts"
+    if not tdir.is_dir():
+        return None
+    files = sorted(tdir.glob("repl-*.log"), key=lambda p: p.stat().st_mtime)
+    return files[-1] if files else None
+
+
+def _stream_transcript(initial_tail: int = 200) -> Iterator[str]:
+    """Yield SSE events for new lines as they're appended to the newest
+    transcript. Sends `initial_tail` historical lines on connect so the
+    client doesn't see a blank pane while waiting for the next print."""
+    path = _latest_transcript()
+    if path is None:
+        yield f"event: error\ndata: {json.dumps('no transcript files yet')}\n\n"
+        return
+
+    yield f"event: file\ndata: {json.dumps(path.name)}\n\n"
+
+    # Replay the tail.
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        last_emitted = ""
+        for ln in lines[-initial_tail:]:
+            clean = _strip_ansi(ln.rstrip("\n"))
+            if not _interesting(clean) or clean == last_emitted:
+                continue
+            yield f"data: {json.dumps(clean)}\n\n"
+            last_emitted = clean
+    except OSError:
+        pass
+
+    # Follow new appends. Re-resolve the path on each cycle so a rotation
+    # (next `joe --transcript` session writes to a new file) is picked up.
+    last_path = path
+    last_size = last_path.stat().st_size if last_path.exists() else 0
+    idle_ticks = 0
+    while True:
+        time.sleep(0.5)
+        latest = _latest_transcript()
+        if latest is None:
+            idle_ticks += 1
+            if idle_ticks > 120:  # 60s of no transcript at all -> hang up
+                yield f"event: error\ndata: {json.dumps('transcript disappeared')}\n\n"
+                return
+            continue
+        if latest != last_path:
+            yield f"event: rotate\ndata: {json.dumps(latest.name)}\n\n"
+            last_path = latest
+            last_size = 0
+        try:
+            cur_size = last_path.stat().st_size
+        except OSError:
+            continue
+        if cur_size > last_size:
+            try:
+                with last_path.open("r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(last_size)
+                    chunk = fh.read()
+                last_size = cur_size
+                for ln in chunk.splitlines():
+                    clean = _strip_ansi(ln)
+                    if not _interesting(clean) or clean == last_emitted:
+                        continue
+                    yield f"data: {json.dumps(clean)}\n\n"
+                    last_emitted = clean
+            except OSError:
+                continue
+            idle_ticks = 0
+        else:
+            # Heartbeat every 20s so proxies don't kill an idle SSE.
+            idle_ticks += 1
+            if idle_ticks % 40 == 0:
+                yield ": heartbeat\n\n"
+
+
+@app.get("/transcript-stream")
+def transcript_stream(token: Optional[str] = None):
+    _check_auth_qs(token)
+    return StreamingResponse(
+        _stream_transcript(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# --------------------------------------------------------------------------
+# PWA assets. /manifest.json + /sw.js make the mobile dashboard installable
+# via Safari's Add-to-Home-Screen on iOS and "Install app" on Android.
+# Neither is auth-gated -- they don't expose data, only declare the app.
+# --------------------------------------------------------------------------
+
+
+@app.get("/manifest.json")
+def pwa_manifest() -> dict:
+    return {
+        "name": "joe",
+        "short_name": "joe",
+        "description": "Local-first agent shell, mobile remote.",
+        "start_url": "/m",
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "portrait",
+        "background_color": "#0e0e10",
+        "theme_color": "#0e0e10",
+        "icons": [
+            {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml",
+             "purpose": "any maskable"},
+        ],
+    }
+
+
+@app.get("/sw.js")
+def pwa_service_worker():
+    """Minimal service worker. PWA installability only needs the worker to
+    register successfully; we don't cache anything (the data is live)."""
+    body = (
+        "self.addEventListener('install', e => self.skipWaiting());\n"
+        "self.addEventListener('activate', e => self.clients.claim());\n"
+        "self.addEventListener('fetch', e => {});\n"
+    )
+    return StreamingResponse(
+        iter([body.encode()]),
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/icon.svg")
+def pwa_icon():
+    """A simple SVG icon for the home-screen tile."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">'
+        '<rect width="192" height="192" rx="36" fill="#0e0e10"/>'
+        '<text x="96" y="124" text-anchor="middle" '
+        'font-family="ui-monospace,SFMono-Regular,monospace" '
+        'font-weight="700" font-size="92" fill="#7fd17f">j</text>'
+        '</svg>'
+    )
+    return StreamingResponse(
+        iter([svg.encode()]),
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+# --------------------------------------------------------------------------
+# Mobile PWA dashboard at /m. Single-column, big-text chat with the live
+# transcript inline. Designed for one-thumb operation on a phone.
+# --------------------------------------------------------------------------
+
+
+def _render_mobile_html() -> str:
+    js_token = _esc_js(TOKEN)
+    css = """
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body { margin: 0; font: 16px/1.4 -apple-system, BlinkMacSystemFont,
+           sans-serif; background: #0e0e10; color: #e8e8e8;
+           min-height: 100dvh; display: flex; flex-direction: column;
+           padding-bottom: env(safe-area-inset-bottom);
+           padding-top: env(safe-area-inset-top); }
+    header { padding: 12px 16px 8px; display: flex; align-items: baseline;
+             justify-content: space-between; }
+    header h1 { font-size: 20px; margin: 0; }
+    header .dim { font-size: 12px; color: #888; }
+    main { flex: 1; padding: 8px 12px; overflow-y: auto;
+           -webkit-overflow-scrolling: touch; }
+    .pane { background: #161618; border: 1px solid #2a2a30;
+            border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+    .pane h2 { font-size: 11px; text-transform: uppercase;
+               letter-spacing: 0.5px; margin: 0 0 8px; color: #888;
+               font-weight: 600; }
+    .out, .transcript {
+      white-space: pre-wrap; word-break: break-word;
+      font: 13px/1.45 ui-monospace, SFMono-Regular, monospace;
+      max-height: 50dvh; overflow-y: auto; margin: 0; min-height: 60px;
+    }
+    .transcript { color: #b8bcc0; }
+    footer { padding: 8px 12px 16px; border-top: 1px solid #1f1f24;
+             background: #0e0e10; }
+    textarea { width: 100%; background: #1a1a1f; color: #e8e8e8;
+               border: 1px solid #2a2a30; border-radius: 8px;
+               padding: 12px; font: 15px/1.4 -apple-system, sans-serif;
+               resize: none; min-height: 60px; }
+    textarea:focus { outline: 1px solid #7fd17f; }
+    .row { display: flex; gap: 8px; margin-top: 8px; }
+    button { flex: 1; background: #2d4a2d; color: #e8e8e8; border: 0;
+             border-radius: 8px; padding: 12px; font: 600 15px/1
+             -apple-system, sans-serif; cursor: pointer; }
+    button.alt { flex: 0 0 auto; background: #2a2a30; padding: 12px 18px; }
+    button:active { opacity: 0.7; }
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 4px;
+             background: #1a1a1f; color: #7fd17f; font-size: 11px;
+             font-family: ui-monospace, monospace; }
+    """
+    return f"""<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="joe">
+  <meta name="theme-color" content="#0e0e10">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/icon.svg">
+  <title>joe</title>
+  <style>{css}</style>
+</head><body>
+  <header>
+    <h1>joe</h1>
+    <span class="dim"><span class="badge" id="status">connecting</span></span>
+  </header>
+  <main>
+    <div class="pane">
+      <h2>response</h2>
+      <pre class="out" id="out">(type something below)</pre>
+    </div>
+    <div class="pane">
+      <h2>live REPL <span class="dim" id="tname"></span></h2>
+      <pre class="transcript" id="tx">(no transcript yet -- run `joe --transcript` on the Mac)</pre>
+    </div>
+  </main>
+  <footer>
+    <form id="f" onsubmit="return ask(event)">
+      <textarea id="i" placeholder="ask joe..." autocapitalize="off" autocomplete="off"></textarea>
+      <div class="row">
+        <button type="submit">Ask</button>
+        <button type="button" class="alt" onclick="document.getElementById('out').textContent=''">Clear</button>
+      </div>
+    </form>
+  </footer>
+<script>
+  const TOKEN = '__TOKEN__';
+  const out = document.getElementById('out');
+  const tx = document.getElementById('tx');
+  const tname = document.getElementById('tname');
+  const status = document.getElementById('status');
+
+  function ask(ev) {{
+    ev.preventDefault();
+    const i = document.getElementById('i');
+    const prompt = i.value.trim();
+    if (!prompt) return false;
+    out.textContent = '';
+    status.textContent = 'thinking';
+    const es = new EventSource('/chat-stream?' + new URLSearchParams({{token: TOKEN, prompt}}));
+    es.onmessage = (e) => {{
+      try {{ out.textContent += JSON.parse(e.data); }} catch (_) {{ out.textContent += e.data; }}
+      out.scrollTop = out.scrollHeight;
+    }};
+    es.addEventListener('done', () => {{ es.close(); status.textContent = 'ready'; }});
+    es.addEventListener('error', () => {{ es.close(); status.textContent = 'error'; }});
+    return false;
+  }}
+
+  // Live transcript stream.
+  function openTranscript() {{
+    const es = new EventSource('/transcript-stream?' + new URLSearchParams({{token: TOKEN}}));
+    es.addEventListener('file', (e) => {{
+      tx.textContent = '';
+      tname.textContent = JSON.parse(e.data);
+    }});
+    es.addEventListener('rotate', (e) => {{
+      tx.textContent += '\\n--- new session: ' + JSON.parse(e.data) + ' ---\\n';
+      tname.textContent = JSON.parse(e.data);
+    }});
+    es.onmessage = (e) => {{
+      try {{ tx.textContent += JSON.parse(e.data) + '\\n'; }} catch (_) {{}}
+      tx.scrollTop = tx.scrollHeight;
+    }};
+    es.addEventListener('error', () => {{
+      status.textContent = 'tx offline';
+      es.close();
+      setTimeout(openTranscript, 5000);  // auto-reconnect
+    }});
+  }}
+  openTranscript();
+  status.textContent = 'ready';
+
+  // Register PWA service worker (silent on failure).
+  if ('serviceWorker' in navigator) {{
+    navigator.serviceWorker.register('/sw.js').catch(() => {{}});
+  }}
+</script>
+</body></html>""".replace("__TOKEN__", js_token)
+
+
+@app.get("/m", response_class=HTMLResponse)
+def mobile_dashboard(token: Optional[str] = None) -> HTMLResponse:
+    _check_auth_qs(token)
+    return HTMLResponse(_render_mobile_html())
 
 
 # --------------------------------------------------------------------------

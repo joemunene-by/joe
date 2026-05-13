@@ -1,0 +1,112 @@
+{
+  "name": "joe-vscode",
+  "displayName": "joe",
+  "description": "Talk to your local joe agent shell from inside VS Code. Quick ask, streaming chat sidebar, and OpenAI-style completion API via joe-http.",
+  "version": "0.1.0",
+  "publisher": "joemunene-by",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/joemunene-by/joe"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["AI", "Chat", "Other"],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "joe.ask",
+        "title": "joe: Ask",
+        "category": "joe"
+      },
+      {
+        "command": "joe.askSelection",
+        "title": "joe: Ask about selection",
+        "category": "joe"
+      },
+      {
+        "command": "joe.openChat",
+        "title": "joe: Open chat sidebar",
+        "category": "joe"
+      },
+      {
+        "command": "joe.openDashboard",
+        "title": "joe: Open dashboard in browser",
+        "category": "joe"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "joe-sidebar",
+          "title": "joe",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "joe-sidebar": [
+        {
+          "id": "joe.chatView",
+          "name": "chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "joe.askSelection",
+          "when": "editorHasSelection",
+          "group": "1_modification@99"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "joe",
+      "properties": {
+        "joe.httpUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8765",
+          "description": "Base URL of the joe-http server. Default assumes joe-http is running on this machine on port 8765."
+        },
+        "joe.httpToken": {
+          "type": "string",
+          "default": "",
+          "description": "Bearer token for joe-http. Leave empty and set the JOE_HTTP_TOKEN env var instead, or paste from ~/.joe-agent/http-token."
+        },
+        "joe.model": {
+          "type": "string",
+          "default": "joe-gemma",
+          "description": "Default model to ask. Pass any name joe-http accepts (joe-gemma, qwen2.5-coder:14b, etc.)."
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "joe.ask",
+        "key": "ctrl+alt+j",
+        "mac": "cmd+alt+j"
+      },
+      {
+        "command": "joe.askSelection",
+        "key": "ctrl+alt+shift+j",
+        "mac": "cmd+alt+shift+j",
+        "when": "editorHasSelection"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.4.0"
+  }
+}
