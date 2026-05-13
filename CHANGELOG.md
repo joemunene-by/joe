@@ -1,0 +1,126 @@
+# Changelog
+
+The headline feature per release. Full git log between tags has more.
+
+## v0.11.0 — 2026-05-13
+
+- Comprehensive README + JOE.md update covering everything shipped
+  v0.10.1 through v0.10.7 in one place.
+- New CHANGELOG.md as the per-release reference.
+
+## v0.10.7 — AI! markers + /skills install
+
+- `/ai-markers` scans cwd for `# AI!` / `// AI!` / `<!-- AI! -->`
+  comments. `/ai-markers fix` runs one turn per marker. Aider's
+  signature feature, ported.
+- `/skills install <git-url>` clones a SKILL.md package directly into
+  `~/.joe-agent/skills/`. Validated, idempotent, reloads after install.
+
+## v0.10.6 — Skills + /loop
+
+- Skills system: Claude Code's SKILL.md packages. Drop a directory
+  with frontmatter (name, description, when_to_use, allowed_tools).
+  Auto-injected when user message matches triggers.
+- `/loop N <prompt>` runs the same prompt N times.
+- `/loop until <condition> <prompt>` iterates up to 12 times.
+
+## v0.10.5 — repo map + mode switching
+
+- Aider-style `<repo_map>` block in system prompt. Per-file symbol
+  table for Python, TypeScript, Rust, Go.
+- `/mode act | plan | architect | debug | ask | review | security`
+  atomically swaps output-style + sandbox. Cline / Roo Code pattern.
+
+## v0.10.4 — @-mentions + sandbox modes
+
+- `@path/to/file` in user input auto-injects the file as a
+  `<file>` block. Cursor / Continue.dev pattern.
+- Sandbox modes (`read-only` / `workspace-write` / `full`) gate the
+  tool dispatcher. `workspace-write` refuses writes outside cwd.
+
+## v0.10.3 — Claude-Code parity pack
+
+- `/output-style` with 7 presets (concise, explanatory, learning,
+  security, review, ship-it, default). Custom `.md` files extend.
+- `/statusline <fmt>` customises the bottom-of-REPL bar.
+- `<multi_edit>` — atomic N-edits-in-one-tag.
+- `<notebook_edit>` — Jupyter .ipynb cell mutations.
+
+## v0.10.2 — /diff-model + reasoning trace + turn meter
+
+- `/diff-model <a> <b> <prompt>` is the cheap 2-model A/B without a
+  judge spend.
+- `capture_reasoning_trace()` strips and persists `<think>` blocks
+  from DeepSeek-R1-style models.
+- `/think show <hash>` surfaces past traces.
+- Inline turn meter: `└ 1247 tok in · 412 tok out · 3.2s · 129 tok/s`.
+
+## v0.10.1 — plugins + AGENTS.md auto-load
+
+- Plugin tools: drop `.py` files in `~/.joe-agent/tools/` with a
+  `register()` function. Parser regenerates to recognise the new tag.
+- `AGENTS.md` / `CLAUDE.md` / `.joe/instructions.md` in cwd are
+  auto-loaded as `<project_context>` in every system prompt.
+
+## v0.10.0 — comprehensive docs
+
+- README rewritten with the full v0.9.x tour + 22-tool registry.
+- JOE.md (806 lines) created at `~/Desktop/JOE.md`.
+
+## v0.9.10 — Playwright browser tool
+
+- `<browser>` with 9 actions (open / click / type / wait / screenshot
+  / extract / title / url / back / close). Single Playwright session
+  per REPL.
+
+## v0.9.9 — `<parallel>` + tool result cache
+
+- `<parallel>` runs N side-effect-free tools concurrently.
+- Per-session cache for read / grep / glob / web_fetch.
+
+## v0.9.8 — eval diff + auto-eval on swap
+
+- `joe eval diff <a> <b>` for per-case A/B regression.
+- `joe eval cases` to preview the benchmark.
+- Auto-eval daemon thread fires on `/model` swap, warns on regression.
+
+## v0.9.7 — PC control + custom commands + hooks
+
+- Six new tools: `<screen>`, `<click>`, `<type>`, `<key>`, `<open>`,
+  `<clipboard>`. Anthropic Computer Use surface, locally.
+- Custom slash commands as TOML files in `~/.joe-agent/commands/`.
+- Hooks: shell scripts in `~/.joe-agent/hooks/<event>.sh` for
+  pre_tool / post_tool / user_prompt / stop.
+
+## v0.9.6 — reproducibility passport + /council + /blame
+
+- Passport: sha256 of (model + prompt + cwd + lessons + lora) for
+  every turn. `/passport replay <hash>` re-runs bit-for-bit.
+- `/council <prompt>` fires same prompt at 3 models + auto-judge.
+- `/blame <file>:<line>` surfaces AI provenance.
+- Tool-emission repair hints when the parser fails.
+- Python AST validation before write.
+
+## v0.9.5 — per-tool session trust
+
+- `[y/N/a]` permission prompt. `a` = always for this tool, this
+  session. `/trust` for explicit grants + reset.
+
+## v0.9.4 — friendly missing-dep error + project orient banner
+
+- `_import_required_or_die` prints the exact interpreter path + pip
+  command on missing rich/prompt_toolkit.
+- `_orient()` shows `project: X · framework, git: branch · last
+  commit, about: README first line, llm: mlx_lm.server` under banner.
+
+## v0.9.3 — CI fixes (py3.10 dropped, idempotent release)
+
+## v0.9.2 — CI runtime deps + fail-fast off
+
+## v0.9.1 — CI cache directive fix
+
+## v0.9.0 — LoRA REPL routing + GitHub Actions CI + joe-voice
+
+- `/lora on/off/status` + auto-detect mlx_lm.server on :8081.
+- GitHub Actions test.yml + release.yml.
+- joe-voice press-to-talk loop (joe-listen + joe -p + joe-speak).

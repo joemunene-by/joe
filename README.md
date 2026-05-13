@@ -554,7 +554,135 @@ headless browser (websites + scraping + automation) AND the user's actual
 desktop (window automation). That's the full Anthropic-Computer-Use
 surface, on local hardware, with /trust-gated consent.
 
-## tool registry (22 tags)
+## v0.10.x — everything-agent pack
+
+Eight more rounds after v0.10.0 brought joe to feature parity with
+Claude Code, Codex, Cursor, Aider, and Cline / Roo Code, while keeping
+the local-first, byte-of-state-in-`~/.joe-agent/` model.
+
+### v0.10.1 — plugin tools + AGENTS.md / CLAUDE.md auto-load
+
+Drop a `.py` file in `~/.joe-agent/tools/` exporting a `register()` that
+returns `{name: handler}`. The parser regenerates after load so the
+new tag is recognised. Plugins cannot override built-in tools.
+
+```python
+# ~/.joe-agent/tools/jira.py
+def jira_handler(attrs, body):
+    return f"JIRA-{attrs['key']}: ..."
+def register():
+    return {"jira": jira_handler}
+```
+
+Plus: when joe enters a cwd with `AGENTS.md` (OpenAI Codex convention),
+`CLAUDE.md` (Claude Code convention), or `.joe/instructions.md`, the
+content gets injected as `<project_context>` into every system prompt.
+
+### v0.10.2 — /diff-model + reasoning trace + turn meter
+
+`/diff-model <a> <b> <prompt>` is the cheap two-model A/B without the
+judge spend of `/council`. `capture_reasoning_trace()` strips
+`<think>...</think>` blocks from streaming output, persists each to
+`think.sqlite`, returns the clean response. `/think show <hash>`
+surfaces past reasoning. Every model turn ends with an inline meter:
+
+```
+└ 1247 tok in ·   412 tok out ·  3.2s ·  129 tok/s
+```
+
+### v0.10.3 — output styles + statusline + multi_edit + notebook_edit
+
+Seven built-in output-style presets (`/output-style concise`, `learning`,
+`security`, `review`, `ship-it`, …) overlay the system prompt. Custom
+`.md` files at `~/.joe-agent/output-styles/<name>.md` extend the set.
+`/statusline <fmt>` lets you write a Rich-markup format string that
+replaces the default bottom-of-REPL bar.
+
+New tools: `<multi_edit>` (Claude Code MultiEdit equivalent — atomic
+N-edit-in-one-tag with single diff preview); `<notebook_edit>` for
+.ipynb cells with replace / append / insert / delete ops.
+
+### v0.10.4 — @-mentions + sandbox modes
+
+```
+> @src/auth.py what's wrong here?
+```
+
+joe auto-prepends `<file path="src/auth.py">...</file>` to the prompt
+before the model sees it. Cursor / Continue.dev pattern. Multiple
+`@path` tokens, dedup, trailing-punctuation strip, 30 KB cap per file.
+
+Sandbox modes (Codex-inspired): `read-only`, `workspace-write`, `full`.
+`/sandbox <mode>` at the prompt; `--sandbox <mode>` at CLI; or
+`$JOE_SANDBOX`. The dispatcher blocks tools not allowed at the current
+level, and `workspace-write` additionally refuses writes outside cwd.
+
+### v0.10.5 — repo map + mode switching
+
+Aider-style repo map: every system prompt now contains a
+`<repo_map>` block with a per-file symbol table (def / class / fn /
+struct / trait / type) for Python, TypeScript, Rust, Go. Capped at
+~5 KB so it doesn't blow the context budget on monorepos. Refreshed
+every 60s per cwd.
+
+Mode switching (Cline / Roo Code): `/mode act | plan | architect |
+debug | ask | review | security` atomically swaps both
+`/output-style` and `/sandbox`. So "plan the change" → `/mode plan`
+(explanatory + read-only); "now make it real" → `/mode act` (ship-it
++ full).
+
+### v0.10.6 — skills + /loop
+
+**Skills** (Claude Code SKILL.md packages). Drop a directory at
+`~/.joe-agent/skills/<name>/` with `SKILL.md`:
+
+```markdown
+---
+name: pr-review
+description: Senior code review with security focus
+when_to_use: review, audit, check for bugs, vulnerabilities
+allowed_tools: read, grep, glob, parallel
+---
+<body of skill instructions...>
+```
+
+joe loads all skills at REPL start. Every turn, it matches the user
+message against each skill's `when_to_use` triggers and injects matched
+skills as `<skill_available>` blocks. Joe-autonomous: the model picks
+them up when relevant, no explicit invocation. Different from `/<name>`
+custom commands (user-typed) and `@@<persona>` subagents (explicit
+dispatch).
+
+`/loop 5 fix the next lint warning` repeats a turn 5 times.
+`/loop until DONE finish the refactor` iterates up to 12 times until
+the response contains "DONE" (case-insensitive). Useful for "keep
+going until tests pass" or "apply this to every model file."
+
+### v0.10.7 — AI! markers + /skills install
+
+Aider's signature feature: leave a comment marker in your code:
+
+```python
+def parse_csv(text):
+    # AI! refactor this to use the csv module
+    return [line.split(",") for line in text.split("\n")]
+```
+
+```
+/ai-markers       scan cwd, list every marker with file:line
+/ai-markers fix   run a turn per marker; addresses + removes the
+                  marker line
+```
+
+Marker styles recognised: `# AI!`, `// AI!`, `<!-- AI! ... -->`,
+`; AI!`, `-- AI!`. Skips node_modules, target, .venv, .git etc.
+
+Plus `/skills install <git-url>` clones a SKILL.md package directly
+from a public repo into `~/.joe-agent/skills/`. Validates the dir
+name as `[a-zA-Z0-9_-]+`; refuses if target exists; reloads the
+skill registry after install so it's active in the same REPL.
+
+## tool registry (26 tags)
 
 | tag | what it does | side effects |
 |---|---|---|
@@ -582,6 +710,8 @@ surface, on local hardware, with /trust-gated consent.
 | `<clipboard>` | get/set system clipboard | clipboard |
 | `<parallel>` | fan-out N side-effect-free tools | concurrency |
 | `<browser>` | Playwright Chromium driver | browser session |
+| `<multi_edit>` | atomic N-edits-in-one-tag (CC MultiEdit equiv) | disk write |
+| `<notebook_edit>` | Jupyter .ipynb cell mutations | disk write |
 
 ## what's not in here yet
 
