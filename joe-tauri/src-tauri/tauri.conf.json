@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/schema.json",
   "productName": "joe",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "identifier": "com.joe-agent.menubar",
   "build": {
     "frontendDist": "../dist"
@@ -47,7 +47,7 @@
       "icons/icon.ico"
     ],
     "category": "DeveloperTool",
-    "shortDescription": "Menu-bar dashboard for the joe agent",
-    "longDescription": "A tiny Tauri menu-bar shell around joe-http's dashboard. Inbox, blame, eval trend, and streaming chat without leaving the menu bar."
+    "shortDescription": "Native desktop surface for the joe agent",
+    "longDescription": "Menu-bar tray + full desktop app for joe. Permission-gated file tree, git pane, agent chat, and a permissions inspector. Everything runs locally — no embedded model, no telemetry."
   }
 }
