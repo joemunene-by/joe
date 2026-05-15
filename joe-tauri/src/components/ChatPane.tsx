@@ -90,7 +90,7 @@ export default function ChatPane() {
         const updated: Message = { ...last, text: last.text + line + '\n' };
         return [...m.slice(0, -1), updated];
       }
-      // No active agent message; create one (defensive — should not
+      // No active agent message; create one (defensive: should not
       // normally happen because we add the placeholder on send).
       return [
         ...m,

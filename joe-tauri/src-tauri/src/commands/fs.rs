@@ -123,7 +123,7 @@ pub fn read_file(path: String, perms: State<'_, Permissions>) -> Result<FileCont
 }
 
 /// Write a file. Parent dir is created if missing. Permission check
-/// uses the path being written — granting a directory grants writes
+/// uses the path being written; granting a directory grants writes
 /// to any new file inside it.
 #[tauri::command]
 pub fn write_file(

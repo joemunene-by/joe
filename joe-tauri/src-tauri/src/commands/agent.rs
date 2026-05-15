@@ -2,10 +2,10 @@
 //! the renderer as Tauri events. The renderer subscribes to two
 //! channels:
 //!
-//!   joe://stdout    — each event carries a chunk of the agent's output
-//!   joe://done      — fires once when the sidecar exits, with exit_code
+//!   joe://stdout    each event carries a chunk of the agent's output
+//!   joe://done      fires once when the sidecar exits, with exit_code
 //!
-//! Spawning joe itself is *not* permission-gated — the user already
+//! Spawning joe itself is *not* permission-gated. The user already
 //! granted that by installing the desktop app and running joe locally.
 //! What joe does *inside* its run (touching files, running bash, calling
 //! git) is gated by joe's own sandbox modes, not ours.

@@ -8,9 +8,9 @@ sidecar directly with permission-gated file, git, and shell access.
 
 Two surfaces in one Tauri binary:
 
-1. **Menu-bar mode** (default) — click the tray icon to open the
+1. **Menu-bar mode** (default): click the tray icon to open the
    `joe-http` dashboard in a floating webview. Same v0.2 behavior.
-2. **Desktop mode** — full window with a file tree, git pane, agent
+2. **Desktop mode**: full window with a file tree, git pane, agent
    chat, and a permissions inspector. Every native operation goes
    through a default-deny grant flow you control.
 
@@ -67,9 +67,14 @@ can branch on scope and offer the right grant button.
 
 ## prerequisites
 
-- Rust + cargo (`brew install rust`)
-- Tauri CLI (`cargo install tauri-cli --version "^2.0"`)
-- Node 18+ and npm (frontend is now a Vite+React build)
+- Rust + cargo. Install via rustup (preferred); `brew install rust`
+  ships an older toolchain and doesn't manage targets cleanly:
+  ```sh
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  source ~/.cargo/env
+  ```
+- Tauri CLI: `cargo install tauri-cli --version "^2.0"`
+- Node 18+ and npm (frontend is a Vite+React build)
 
 ## dev
 
@@ -111,8 +116,8 @@ The artifact lands in `src-tauri/target/release/bundle/`. Drag the
 
 ## changelog
 
-- **v0.3.0** — desktop window with file tree, git, chat, and
+- **v0.3.0**: desktop window with file tree, git, chat, and
   permissions. Default-deny permission model with session +
   persistent grants. Multi-page Vite build alongside the menu-bar
   fallback.
-- **v0.2.x** — menu-bar shell around `joe-http`.
+- **v0.2.x**: menu-bar shell around `joe-http`.

@@ -1,7 +1,7 @@
 //! Shell-exec command. The most dangerous surface; gated hardest.
 //!
 //! Each call requires `Permissions::command_allowed(<bare program name>)`.
-//! Grants are *per command*, not per full command line — granting `ls`
+//! Grants are *per command*, not per full command line. Granting `ls`
 //! authorises every `ls` invocation regardless of args, but a granted
 //! `ls` does not let the renderer call `rm` or `curl`.
 //!

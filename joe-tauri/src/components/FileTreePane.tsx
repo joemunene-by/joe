@@ -142,7 +142,7 @@ export default function FileTreePane({ cwd, onChangeCwd }: Props) {
             <pre className="file-preview-text">{preview.text}</pre>
           )}
           {preview.truncated && (
-            <div className="file-preview-truncated">[truncated — file is {prettyBytes(preview.bytes)}]</div>
+            <div className="file-preview-truncated">[truncated, file is {prettyBytes(preview.bytes)}]</div>
           )}
         </div>
       )}

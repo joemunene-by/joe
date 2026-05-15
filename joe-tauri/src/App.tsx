@@ -1,5 +1,5 @@
 /**
- * joe desktop — top-level layout.
+ * joe desktop: top-level layout.
  *
  *   ┌──────────────────┬──────────────────────────────────────┐
  *   │ File tree        │  Chat (streaming agent output)        │
@@ -26,7 +26,7 @@ export default function App() {
   const [tab, setTab] = useState<SidebarTab>('files');
   // Current working directory the desktop app is "rooted" at. The
   // FileTree pane reflects it; the GitPane runs commands against it.
-  // Defaulting to $HOME is the safest first-launch choice — the user
+  // Defaulting to $HOME is the safest first-launch choice; the user
   // explicitly grants read access from there.
   const [cwd, setCwd] = useState<string>(homeDir());
 

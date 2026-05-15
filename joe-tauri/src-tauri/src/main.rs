@@ -7,7 +7,7 @@
 //   2. The full desktop window (v0.3, the new mode). React frontend
 //      with chat + file tree + git pane + permissions pane, talks to
 //      native Rust commands for fs / git / shell / agent. Default-deny
-//      permissions — every path, repo, and shell command needs an
+//      permissions: every path, repo, and shell command needs an
 //      explicit grant before joe-tauri will touch it.
 //
 // The menu-bar shell is still hidden-on-launch + tray-toggled. The

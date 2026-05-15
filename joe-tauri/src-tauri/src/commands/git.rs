@@ -1,5 +1,5 @@
 //! Git commands. Implemented by shelling out to the `git` binary
-//! rather than linking libgit2 — keeps the binary smaller, matches
+//! rather than linking libgit2. Keeps the binary smaller, matches
 //! exactly what the user gets at the shell, and lets us inherit
 //! their configured credential helper / SSH agent without ceremony.
 //!

@@ -8,12 +8,12 @@
 //!   - **repo** grants: "this app may run git commands in this repo"
 //!   - **command** grants: "this app may exec this command name"
 //!
-//! Each grant has a scope — `Session` (forgotten on app quit) or
+//! Each grant has a scope: `Session` (forgotten on app quit) or
 //! `Persistent` (saved to disk). The UI surfaces a Permissions pane
 //! where the user can revoke any persistent grant at any time.
 //!
 //! Storage: ~/.joe-agent/desktop-permissions.json on macOS / Linux.
-//! Default policy is **deny** — every new path / repo / command
+//! Default policy is **deny**: every new path / repo / command
 //! requires an explicit grant. There is no "trust everything" toggle;
 //! the explicit-grant flow is the entire point.
 
