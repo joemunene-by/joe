@@ -2351,6 +2351,11 @@ def cmd_train(args: list[str], default_model: str) -> int:
         ts_str = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).strftime("%Y%m%d-%H%M%S")
         out_path = TRAINING_DATA_DIR / f"jsonl-{ts_str}.jsonl"
         n = 0
+        # Bake proven skills (used + net-positive) into the same training set
+        # so the LoRA learns the procedures that actually earned their place,
+        # not just raw accepted turns. This closes synthesis -> measure ->
+        # prune -> train into one loop.
+        skill_recs = skill_training_records()
         with out_path.open("w") as f:
             for i in range(len(rows) - 1):
                 s1, t1, r1, c1 = rows[i]
@@ -2369,6 +2374,8 @@ def cmd_train(args: list[str], default_model: str) -> int:
                 }
                 f.write(json.dumps(record) + "\n")
                 n += 1
+            for rec in skill_recs:
+                f.write(json.dumps(rec) + "\n")
         # Also dump active lessons as few-shot "system rules" file.
         rules = lessons_active_rules()
         rules_path = TRAINING_DATA_DIR / f"rules-{ts_str}.txt"
@@ -2376,8 +2383,9 @@ def cmd_train(args: list[str], default_model: str) -> int:
         panel(
             "joe train collect",
             Text.from_markup(
-                f"[bold]JSONL pairs:[/]  {n}  ({out_path})\n"
-                f"[bold]rules:[/]        {len(rules)}  ({rules_path})\n\n"
+                f"[bold]JSONL pairs:[/]     {n}  ({out_path})\n"
+                f"[bold]skill records:[/]  {len(skill_recs)}  (proven skills baked in)\n"
+                f"[bold]rules:[/]          {len(rules)}  ({rules_path})\n\n"
                 f"[dim]next: `joe train modelfile` (fast, ollama-only)\n"
                 f"     or `joe train lora` (real fine-tune via mlx-lm)[/]"
             ),
@@ -4898,6 +4906,40 @@ def skill_prune(dry_run: bool = True) -> list[tuple[str, str, str]]:
             shutil.move(str(d), str(dest))
         out.append((name, reason, action))
     return out
+
+
+def proven_skills(min_uses: int = 1) -> list[dict]:
+    """Skills that have earned their place: injected at least ``min_uses``
+    times and net-positive (wins > losses). Returns their parsed meta dicts.
+    These are the skills worth baking into the model itself."""
+    eff = skill_effectiveness()
+    out: list[dict] = []
+    for name, d in _skill_dirs().items():
+        e = eff.get(name, {"uses": 0, "wins": 0, "losses": 0})
+        if e["uses"] >= min_uses and e["wins"] > e["losses"]:
+            meta = _parse_skill_md(d / "SKILL.md")
+            if meta:
+                out.append(meta)
+    return out
+
+
+def skill_training_records() -> list[dict]:
+    """Turn proven skills into chat-format training records, so `train
+    collect` can bake the procedures that actually worked into the on-device
+    LoRA. Matches the existing {"messages": [...]} record shape exactly."""
+    recs: list[dict] = []
+    for s in proven_skills():
+        body = (s.get("body") or "").strip()
+        if not body:
+            continue
+        desc = s.get("description") or s.get("name") or "this task"
+        recs.append({
+            "messages": [
+                {"role": "user", "content": f"How should I approach this: {desc}"},
+                {"role": "assistant", "content": body},
+            ],
+        })
+    return recs
 
 
 def _load_project_context(cwd: Path) -> str:

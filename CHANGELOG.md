@@ -2,6 +2,21 @@
 
 The headline feature per release. Full git log between tags has more.
 
+## v0.12.2 — bake proven skills into the model
+
+`joe train collect` now also emits chat-format training records for skills
+that earned their place: injected at least once and net-positive (wins >
+losses) per the v0.12.1 ledger. The on-device LoRA learns the procedures
+that actually worked, not just raw accepted turns. This closes the full
+loop: synthesise from wins -> measure against /undo -> prune the failures ->
+train on the survivors.
+
+- `proven_skills()` / `skill_training_records()` select and format the
+  survivors; records match the existing `{"messages": [...]}` shape so the
+  modelfile and LoRA pipelines consume them unchanged.
+- `joe train collect` reports a new "skill records" count.
+- 5 new tests in `tests/test_skill_training.py`, all offline.
+
 ## v0.12.1 — skill effectiveness ledger: close the loop
 
 Synthesis (v0.12.0) writes skills from wins. This release measures whether
