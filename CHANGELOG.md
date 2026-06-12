@@ -2,6 +2,24 @@
 
 The headline feature per release. Full git log between tags has more.
 
+## v0.12.0 — skill synthesis: joe learns from wins, not just corrections
+
+joe's lessons loop already learns from every `/undo` (corrections). Skill
+synthesis is the mirror image: it learns from successful sessions. After a
+multi-step task that worked, joe distils the session transcript into a
+reusable `SKILL.md` package under `~/.joe-agent/skills/<slug>/`, which the
+existing skill loader auto-injects into future matching turns. This is the
+Voyager "ever-growing skill library" loop, local-first, with no retraining.
+
+- `joe skill synth [session]` — synthesise a skill from a session (defaults
+  to the most recent one).
+- `/skills synth [session]` — same, from inside the REPL, then hot-reloads.
+- The orchestrator returns either `NONE` (nothing reusable) or a `SKILL.md`;
+  output is validated by the canonical parser before it is written, and an
+  existing slug is never clobbered (`<slug>-2`, `<slug>-3`, ...).
+- 14 new tests in `tests/test_skill_synth.py`, model call stubbed so the
+  suite stays offline.
+
 ## v0.11.12 — docs sync (v0.11.10 + v0.11.11)
 
 - README.md grows new sections for **v0.11.10** (secrets guardrail)

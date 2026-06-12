@@ -4628,6 +4628,141 @@ def _skills_block(user_msg: str) -> str:
     return "\n\n".join(blocks)
 
 
+# --------------------------------------------------------------------------
+# Skill synthesis: turn a SUCCESSFUL session into a reusable skill.
+#
+# joe's lessons loop learns from corrections (every /undo). Skill synthesis
+# is the mirror image: it learns from wins. After a multi-step task that
+# worked, the orchestrator distils the session transcript into a SKILL.md
+# package written to ~/.joe-agent/skills/<slug>/, which the existing
+# load_skills() / _relevant_skills() path then auto-injects into future
+# matching turns. This is the Voyager "ever-growing skill library" loop,
+# local-first: joe compounds capability over time with no retraining.
+# --------------------------------------------------------------------------
+
+SKILL_SYNTH_MIN_TURNS = 4  # a real multi-step task, not a one-liner
+
+
+def _build_skill_synth_prompt(transcript: str) -> str:
+    """Prompt the orchestrator to distil a transcript into a SKILL.md, or
+    decline. The model must reply with either the literal token NONE or a
+    SKILL.md document (--- frontmatter --- + body)."""
+    return (
+        "Below is a transcript of a completed task I ran with my agent. Decide "
+        "whether it contains a GENERALISABLE, REUSABLE procedure worth saving "
+        "as a skill for next time.\n\n"
+        "Save a skill ONLY if the task taught a repeatable method: a workflow, "
+        "a sequence of tools, or a non-obvious fix that will recur. Do NOT "
+        "save one-off chatter, a trivial single edit, or anything so specific "
+        "to one file that it will never apply again.\n\n"
+        "If it is NOT worth saving, reply with exactly: NONE\n\n"
+        "If it IS worth saving, reply with ONLY a SKILL.md document in this "
+        "exact format, nothing before or after it:\n\n"
+        "---\n"
+        "name: short-kebab-case-name\n"
+        "description: one sentence on what this skill does\n"
+        "when_to_use: comma-separated trigger keywords a future request would "
+        "contain\n"
+        "---\n"
+        "The reusable procedure as numbered steps: which tools to use and any "
+        "gotchas. Write it as instructions to a future agent, not as a "
+        "narration of what happened. Keep it under 250 words.\n\n"
+        f"<transcript>\n{transcript[:12000]}\n</transcript>"
+    )
+
+
+def _extract_skill_md(raw: str) -> Optional[str]:
+    """Pull a SKILL.md document out of a model response. Tolerates a wrapping
+    code fence and leading/trailing prose. Returns None if the model declined
+    (NONE) or produced no valid frontmatter block."""
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", text)
+        text = re.sub(r"\n```\s*$", "", text).strip()
+    if text.upper().startswith("NONE"):
+        return None
+    idx = text.find("---")
+    if idx == -1:
+        return None
+    text = text[idx:]
+    if text.find("\n---", 4) == -1:  # no closing fence
+        return None
+    if not re.search(r"^name:\s*\S", text, re.MULTILINE):
+        return None
+    return text.strip() + "\n"
+
+
+def _slugify_skill_name(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    return slug or "skill"
+
+
+def write_synthesized_skill(skill_md: str) -> tuple[bool, str]:
+    """Validate a SKILL.md string with the canonical parser and write it to
+    SKILLS_DIR/<slug>/SKILL.md. Never clobbers: an existing slug becomes
+    <slug>-2, <slug>-3, ... Returns (ok, path-or-error)."""
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as tf:
+        tf.write(skill_md)
+        tmp = Path(tf.name)
+    meta = _parse_skill_md(tmp)
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    if not meta or "name" not in meta:
+        return False, "synthesized text was not a valid SKILL.md"
+    slug = _slugify_skill_name(meta["name"])
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    target = SKILLS_DIR / slug
+    n = 2
+    while target.exists():
+        target = SKILLS_DIR / f"{slug}-{n}"
+        n += 1
+    target.mkdir(parents=True)
+    (target / "SKILL.md").write_text(skill_md, encoding="utf-8")
+    return True, str(target / "SKILL.md")
+
+
+def skill_synth_from_session(
+    session: str, model: str, model_fn=None
+) -> tuple[bool, str]:
+    """Read a session's full transcript and synthesise a reusable skill from
+    it. ``model_fn`` (prompt -> response) is injectable for testing and
+    defaults to a one-shot call against ``model``."""
+    if model_fn is None:
+        def model_fn(p: str) -> str:
+            return _ollama_once(model, p)
+    c = _db()
+    rows = c.execute(
+        "SELECT role, content FROM turns WHERE session = ? ORDER BY ts",
+        (session,),
+    ).fetchall()
+    c.close()
+    if len(rows) < SKILL_SYNTH_MIN_TURNS:
+        return False, (
+            f"session '{session}' has only {len(rows)} turn(s); need at least "
+            f"{SKILL_SYNTH_MIN_TURNS} for a meaningful skill"
+        )
+    transcript = "\n\n".join(f"{r.upper()}: {ct}" for r, ct in rows)
+    skill_md = _extract_skill_md(model_fn(_build_skill_synth_prompt(transcript)))
+    if skill_md is None:
+        return False, "no reusable skill found in this session"
+    return write_synthesized_skill(skill_md)
+
+
+def _latest_session() -> Optional[str]:
+    """The session with the most recent turn, or None if no sessions yet."""
+    c = _db()
+    row = c.execute(
+        "SELECT session FROM turns ORDER BY ts DESC LIMIT 1"
+    ).fetchone()
+    c.close()
+    return row[0] if row else None
+
+
 def _load_project_context(cwd: Path) -> str:
     """If the cwd has AGENTS.md, CLAUDE.md, or .joe/instructions.md, load
     its content and return a <project_context> XML block to inject into
@@ -9767,6 +9902,25 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                     _LOADED_SKILLS = load_skills()
                     console.print(f"[dim]reloaded {len(_LOADED_SKILLS)} skills[/]")
                     continue
+                if sub == "synth" or sub.startswith("synth "):
+                    parts = sub.split()
+                    sess = parts[1] if len(parts) > 1 else session
+                    if not sess:
+                        console.print(
+                            "[yellow]/skills synth needs a named session. "
+                            "Start joe with -s <name> so turns are saved.[/]"
+                        )
+                        continue
+                    console.print(
+                        f"[dim]synthesising a skill from session '{sess}'...[/]"
+                    )
+                    ok, msg = skill_synth_from_session(sess, model)
+                    if ok:
+                        console.print(f"[green]wrote skill -> {msg}[/]")
+                        _LOADED_SKILLS = load_skills()
+                    else:
+                        console.print(f"[yellow]{msg}[/]")
+                    continue
                 if sub.startswith("install "):
                     url = sub[len("install "):].strip()
                     ok, msg = install_skill_from_git(url)
@@ -11070,6 +11224,24 @@ def main() -> int:
             PROMPT_SUPPLEMENT.touch(exist_ok=True)
             subprocess.run([editor, str(PROMPT_SUPPLEMENT)])
             return 0
+    if argv and argv[0] == "skill":
+        if len(argv) >= 2 and argv[1] == "synth":
+            session = argv[2] if len(argv) > 2 else _latest_session()
+            if not session:
+                console.print(
+                    "[red]usage: joe skill synth <session>[/]  "
+                    "[dim](no sessions found to synthesise from)[/]"
+                )
+                return 1
+            console.print(f"[dim]synthesising a skill from session '{session}'...[/]")
+            ok, msg = skill_synth_from_session(session, DEFAULT_MODEL)
+            if ok:
+                console.print(f"[green]wrote skill -> {msg}[/]")
+                return 0
+            console.print(f"[yellow]{msg}[/]")
+            return 1
+        console.print("[red]usage: joe skill synth [session][/]")
+        return 1
     if argv and argv[0] == "tasks":
         cmd_tasks(); return 0
     if argv and argv[0] == "task":
@@ -11099,6 +11271,7 @@ def main() -> int:
             "  eval          build | run [model] | report\n"
             "  train         collect | modelfile | lora | activate\n"
             "  lessons       list | distill | review\n"
+            "  skill         synth [session]  save a winning session as a skill\n"
             "  ios-setup     print the iOS Shortcut recipe"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
