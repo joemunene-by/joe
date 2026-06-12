@@ -169,6 +169,7 @@ PLUGIN_TOOLS_DIR = STATE_DIR / "tools"
 OUTPUT_STYLES_DIR = STATE_DIR / "output-styles"
 STATUSLINE_FILE = STATE_DIR / "statusline"
 SKILLS_DIR = STATE_DIR / "skills"
+SKILL_USAGE_DB = STATE_DIR / "skill-usage.sqlite"
 
 # Sandbox modes (Codex-inspired). Determines which tools the dispatcher
 # will actually invoke. "full" = everything, "workspace-write" = read +
@@ -4723,6 +4724,12 @@ def write_synthesized_skill(skill_md: str) -> tuple[bool, str]:
         n += 1
     target.mkdir(parents=True)
     (target / "SKILL.md").write_text(skill_md, encoding="utf-8")
+    # Provenance marker: lets `skill prune` distinguish synthesized skills
+    # (safe to auto-archive) from ones the user installed (never touched).
+    (target / ".synth").write_text(
+        dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat(),
+        encoding="utf-8",
+    )
     return True, str(target / "SKILL.md")
 
 
@@ -4761,6 +4768,136 @@ def _latest_session() -> Optional[str]:
     ).fetchone()
     c.close()
     return row[0] if row else None
+
+
+# --------------------------------------------------------------------------
+# Skill effectiveness ledger: close the loop on skill synthesis.
+#
+# Synthesis writes skills from wins; this measures whether they actually
+# help. Every time a skill is injected into a turn we log it. A usage is a
+# "loss" if an /undo correction landed in the same session within the same
+# hour (the same heuristic `train collect` uses to skip undone exchanges),
+# otherwise it's a "win". `joe skill review` shows the ledger; `joe skill
+# prune` archives synthesized skills that never trigger or go net-negative.
+# Pruning only ever touches synthesized skills, never ones you installed.
+# --------------------------------------------------------------------------
+
+
+def _skill_usage_db() -> sqlite3.Connection:
+    c = sqlite3.connect(str(SKILL_USAGE_DB))
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS skill_usage ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " ts TEXT NOT NULL, skill TEXT NOT NULL, session TEXT NOT NULL)"
+    )
+    return c
+
+
+def record_skill_usage(skill_names: list[str], session: str) -> None:
+    """Best-effort: log that these skills were injected into one turn."""
+    if not skill_names:
+        return
+    try:
+        c = _skill_usage_db()
+        ts = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None).isoformat()
+        c.executemany(
+            "INSERT INTO skill_usage (ts, skill, session) VALUES (?, ?, ?)",
+            [(ts, n, session or "") for n in skill_names],
+        )
+        c.commit(); c.close()
+    except Exception:
+        return
+
+
+def _undo_hour_keys() -> set:
+    """(session, hour) keys that saw an /undo, for win/loss attribution."""
+    keys = set()
+    try:
+        le = _lessdb()
+        for ts, sess in le.execute(
+            "SELECT ts, session FROM events WHERE source = 'undo'"
+        ).fetchall():
+            keys.add((sess, ts[:13]))
+        le.close()
+    except Exception:
+        pass
+    return keys
+
+
+def skill_effectiveness() -> dict[str, dict]:
+    """Per-skill ledger: {skill: {uses, wins, losses, last_used}}."""
+    try:
+        c = _skill_usage_db()
+        rows = c.execute("SELECT skill, session, ts FROM skill_usage").fetchall()
+        c.close()
+    except Exception:
+        return {}
+    undo_keys = _undo_hour_keys()
+    out: dict[str, dict] = {}
+    for skill, session, ts in rows:
+        d = out.setdefault(
+            skill, {"uses": 0, "wins": 0, "losses": 0, "last_used": ""}
+        )
+        d["uses"] += 1
+        if (session, ts[:13]) in undo_keys:
+            d["losses"] += 1
+        else:
+            d["wins"] += 1
+        if ts > d["last_used"]:
+            d["last_used"] = ts
+    return out
+
+
+def _skill_dirs() -> dict[str, Path]:
+    """Map each loaded skill's display name to its directory."""
+    out: dict[str, Path] = {}
+    if not SKILLS_DIR.is_dir():
+        return out
+    for d in sorted(SKILLS_DIR.iterdir()):
+        sf = d / "SKILL.md"
+        if not sf.is_file():
+            continue
+        meta = _parse_skill_md(sf)
+        if meta:
+            out[meta["name"]] = d
+    return out
+
+
+def _is_synthesized(skill_dir: Path) -> bool:
+    """True if the skill was written by skill synthesis (has a .synth marker)."""
+    return (skill_dir / ".synth").exists()
+
+
+def skill_prune(dry_run: bool = True) -> list[tuple[str, str, str]]:
+    """Archive synthesized skills that aren't earning their place: never
+    triggered, or net-negative (losses > wins). Moves them under
+    SKILLS_DIR/_archived/ so the loader stops injecting them. Returns a list
+    of (skill_name, reason, action). Never touches installed (non-synth)
+    skills."""
+    eff = skill_effectiveness()
+    archive_root = SKILLS_DIR / "_archived"
+    out: list[tuple[str, str, str]] = []
+    for name, d in _skill_dirs().items():
+        if not _is_synthesized(d):
+            continue
+        e = eff.get(name, {"uses": 0, "wins": 0, "losses": 0})
+        if e["uses"] == 0:
+            reason = "never triggered"
+        elif e["losses"] > e["wins"]:
+            reason = f"net-negative ({e['wins']}W/{e['losses']}L)"
+        else:
+            continue
+        action = "would archive" if dry_run else "archived"
+        if not dry_run:
+            archive_root.mkdir(parents=True, exist_ok=True)
+            dest = archive_root / d.name
+            n = 2
+            while dest.exists():
+                dest = archive_root / f"{d.name}-{n}"
+                n += 1
+            shutil.move(str(d), str(dest))
+        out.append((name, reason, action))
+    return out
 
 
 def _load_project_context(cwd: Path) -> str:
@@ -7570,6 +7707,9 @@ def _initial_prompt(user_msg: str, cwd: Path, session: Optional[str]) -> str:
     sb = _skills_block(user_msg)
     if sb:
         parts.append(sb)
+        # Ledger: log which skills were injected so skill_effectiveness()
+        # can later score each as a win or a loss against /undo events.
+        record_skill_usage([s["name"] for s in _relevant_skills(user_msg)], session or "")
     # Output-style overlay: /output-style swaps personality presets.
     style_text = _load_output_style(_ACTIVE_OUTPUT_STYLE)
     if style_text:
@@ -9921,6 +10061,41 @@ def repl(model: str, coder_model: str, allow_all_bash: bool, session: Optional[s
                     else:
                         console.print(f"[yellow]{msg}[/]")
                     continue
+                if sub == "review":
+                    eff = skill_effectiveness()
+                    dirs = _skill_dirs()
+                    if not dirs:
+                        console.print("[dim]no skills loaded yet[/]")
+                        continue
+                    lines = []
+                    for n in sorted(dirs):
+                        e = eff.get(n, {"uses": 0, "wins": 0, "losses": 0})
+                        tag = "synth" if _is_synthesized(dirs[n]) else "installed"
+                        lines.append(
+                            f"  [bold]{n}[/] [dim]({tag})[/]  "
+                            f"{e['uses']} uses, {e['wins']}W / {e['losses']}L"
+                        )
+                    panel(
+                        "Skill effectiveness ledger",
+                        Text.from_markup("\n".join(lines)),
+                        style="cyan",
+                    )
+                    continue
+                if sub == "prune" or sub == "prune apply":
+                    apply = sub == "prune apply"
+                    results = skill_prune(dry_run=not apply)
+                    if not results:
+                        console.print("[green]no synthesized skills need pruning[/]")
+                        continue
+                    for n, reason, action in results:
+                        console.print(
+                            f"  [yellow]{action}[/] [bold]{n}[/] [dim]({reason})[/]"
+                        )
+                    if apply:
+                        _LOADED_SKILLS = load_skills()
+                    else:
+                        console.print("[dim]run `/skills prune apply` to archive[/]")
+                    continue
                 if sub.startswith("install "):
                     url = sub[len("install "):].strip()
                     ok, msg = install_skill_from_git(url)
@@ -11240,7 +11415,39 @@ def main() -> int:
                 return 0
             console.print(f"[yellow]{msg}[/]")
             return 1
-        console.print("[red]usage: joe skill synth [session][/]")
+        if len(argv) >= 2 and argv[1] == "review":
+            eff = skill_effectiveness()
+            dirs = _skill_dirs()
+            if not dirs:
+                console.print("[dim]no skills loaded yet[/]")
+                return 0
+            lines = []
+            for name in sorted(dirs):
+                e = eff.get(name, {"uses": 0, "wins": 0, "losses": 0})
+                tag = "synth" if _is_synthesized(dirs[name]) else "installed"
+                lines.append(
+                    f"  [bold]{name}[/] [dim]({tag})[/]  "
+                    f"{e['uses']} uses, {e['wins']}W / {e['losses']}L"
+                )
+            panel(
+                "Skill effectiveness ledger",
+                Text.from_markup("\n".join(lines)),
+                style="cyan",
+                subtitle="win = injected, no /undo that hour;  loss = /undo same session+hour",
+            )
+            return 0
+        if len(argv) >= 2 and argv[1] == "prune":
+            apply = len(argv) > 2 and argv[2] == "apply"
+            results = skill_prune(dry_run=not apply)
+            if not results:
+                console.print("[green]no synthesized skills need pruning[/]")
+                return 0
+            for name, reason, action in results:
+                console.print(f"  [yellow]{action}[/] [bold]{name}[/] [dim]({reason})[/]")
+            if not apply:
+                console.print("[dim]re-run `joe skill prune apply` to archive these[/]")
+            return 0
+        console.print("[red]usage: joe skill synth|review|prune [args][/]")
         return 1
     if argv and argv[0] == "tasks":
         cmd_tasks(); return 0
@@ -11271,7 +11478,7 @@ def main() -> int:
             "  eval          build | run [model] | report\n"
             "  train         collect | modelfile | lora | activate\n"
             "  lessons       list | distill | review\n"
-            "  skill         synth [session]  save a winning session as a skill\n"
+            "  skill         synth [session] | review | prune [apply]\n"
             "  ios-setup     print the iOS Shortcut recipe"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,

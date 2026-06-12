@@ -2,6 +2,22 @@
 
 The headline feature per release. Full git log between tags has more.
 
+## v0.12.1 — skill effectiveness ledger: close the loop
+
+Synthesis (v0.12.0) writes skills from wins. This release measures whether
+they help. Every time a skill is injected into a turn it is logged; a usage
+is a "win" unless an `/undo` landed in the same session within the same hour
+(the heuristic `train collect` already uses), in which case it is a "loss".
+
+- `joe skill review` / `/skills review` — per-skill ledger (uses, W/L,
+  synth-vs-installed).
+- `joe skill prune [apply]` / `/skills prune [apply]` — archive synthesized
+  skills that never trigger or go net-negative (losses > wins) under
+  `skills/_archived/` so the loader stops injecting them. Dry-run by default;
+  only ever touches synthesized skills, never ones you installed.
+- Synthesized skills now carry a `.synth` provenance marker.
+- 9 new tests in `tests/test_skill_ledger.py`, all offline.
+
 ## v0.12.0 — skill synthesis: joe learns from wins, not just corrections
 
 joe's lessons loop already learns from every `/undo` (corrections). Skill
