@@ -27,3 +27,6 @@ venv/
 *.key
 .env
 .env.*
+
+# build output
+dist/
