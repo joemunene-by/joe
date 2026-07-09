@@ -2,6 +2,26 @@
 
 The headline feature per release. Full git log between tags has more.
 
+## v0.13.0 — ACP bridge: joe inside Zed, Neovim, Emacs, JetBrains
+
+joe-mcp already lends joe's tools to other agents. `bin/joe-acp` takes
+the other seat: it speaks Agent Client Protocol v1 (agentclientprotocol.com)
+over stdio, so any ACP editor can run joe as its native chat agent. One
+connector, four editor families.
+
+- stdlib-only single file, matching the rest of `bin/`; no `mcp` or any
+  other dependency.
+- every editor thread becomes a persistent joe session (`-s acp-<id>`),
+  so lessons, skills, and cross-session memory apply, and repo tools run
+  in the project the editor has open.
+- streams stdout as `agent_message_chunk` updates; `session/cancel`
+  SIGTERMs the turn's process group (including a cancel that races the
+  spawn); per-prompt timeout via JOE_ACP_TIMEOUT_S.
+- env knobs: JOE_ACP_BIN, JOE_ACP_ARGS (e.g. `--model qwen2.5-coder:14b`),
+  JOE_ACP_TIMEOUT_S.
+- 7 new tests in `tests/test_acp.py`, all offline: they spawn the real
+  bridge against a stub joe binary and assert on the actual wire traffic.
+
 ## v0.12.2 — bake proven skills into the model
 
 `joe train collect` now also emits chat-format training records for skills

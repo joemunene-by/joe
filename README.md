@@ -388,6 +388,40 @@ additions worth the indirection:
 
 Sample ghostloop runner at `examples/ghostloop-uses-joe.py`.
 
+## ACP: joe as the agent inside Zed, Neovim, Emacs, JetBrains
+
+MCP makes joe a toolbox other agents can call. ACP (the Agent Client
+Protocol, agentclientprotocol.com) is the other seat: the editor's
+native chat panel drives *joe itself*. `bin/joe-acp` is a stdlib-only
+bridge that speaks ACP v1 over stdio and maps every editor thread onto
+a persistent joe session, so lessons, skills, and cross-session memory
+all apply, and joe's repo tools run against the project you have open.
+
+Zed (`~/.config/zed/settings.json`):
+
+```json
+{
+  "agent_servers": {
+    "joe": {
+      "command": "/Users/<you>/.local/bin/joe-acp",
+      "args": []
+    }
+  }
+}
+```
+
+Open the agent panel, pick "joe", and chat. Streaming, cancellation
+(the panel's stop button SIGTERMs the underlying turn), and attached
+file context all work. Neovim (CodeCompanion / acp.nvim), Emacs
+(agent-shell), and JetBrains' ACP client take the same command + args
+pair; see each client's docs for where it goes.
+
+Knobs, all env vars: `JOE_ACP_BIN` (which joe to run), `JOE_ACP_ARGS`
+(extra flags for every turn, e.g. `--model qwen2.5-coder:14b`),
+`JOE_ACP_TIMEOUT_S` (per-prompt kill switch, default 600). The editor's
+`mcpServers` list is ignored on purpose: joe already manages its own
+MCP clients via `~/.joe-agent/mcp-clients.json`.
+
 ## the v0.9.x engineer-grade pack
 
 Six rounds shipped that push joe past "chat REPL with tools" into "real

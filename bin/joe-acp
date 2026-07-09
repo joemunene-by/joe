@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""joe-acp: Agent Client Protocol bridge, making joe a first-class agent
+in ACP-capable editors (Zed's agent panel, Neovim, Emacs, JetBrains).
+
+Where joe-mcp exposes joe as a set of *tools* an external agent may call,
+joe-acp exposes joe as the *agent itself*: the editor renders a native
+chat panel, streams joe's replies, and every panel thread maps onto a
+persistent joe session (so memory, lessons, and skills all apply).
+
+Protocol: JSON-RPC 2.0, one JSON object per line, over stdio. The editor
+spawns this script and speaks ACP v1 (agentclientprotocol.com). No
+third-party dependency; stdlib only.
+
+Wire it into Zed (~/.config/zed/settings.json):
+
+    {
+      "agent_servers": {
+        "joe": {
+          "command": "/Users/<you>/.local/bin/joe-acp",
+          "args": []
+        }
+      }
+    }
+
+Then open the agent panel and pick "joe" from the model/agent switcher.
+Neovim (CodeCompanion / acp.nvim), Emacs (agent-shell), and JetBrains'
+ACP client take the same command + args pair; see each client's docs.
+
+Environment:
+    JOE_ACP_BIN         path to the joe binary (default: sibling of this
+                        script, else `joe` on PATH)
+    JOE_ACP_ARGS        extra args appended to every joe invocation,
+                        shell-split (e.g. "--model qwen2.5-coder:14b")
+    JOE_ACP_TIMEOUT_S   per-prompt timeout in seconds (default 600)
+
+Each ACP session becomes `joe -p <prompt> -s acp-<id>` with the editor's
+project root as cwd, so repo tools (grep, git state, file edits) act on
+the project you have open. mcpServers passed by the editor are ignored:
+joe manages its own MCP clients via ~/.joe-agent/mcp-clients.json.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+
+PROTOCOL_VERSION = 1
+DEFAULT_TIMEOUT_S = int(os.environ.get("JOE_ACP_TIMEOUT_S", "600"))
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
+
+
+def find_joe_bin() -> str:
+    """Resolve the joe binary: env override, sibling, then PATH."""
+    env = os.environ.get("JOE_ACP_BIN")
+    if env:
+        return env
+    sibling = os.path.join(os.path.dirname(os.path.realpath(__file__)), "joe")
+    if os.path.isfile(sibling) and os.access(sibling, os.X_OK):
+        return sibling
+    on_path = shutil.which("joe")
+    if on_path:
+        return on_path
+    raise SystemExit(
+        "joe-acp: cannot locate the `joe` binary. Set JOE_ACP_BIN or put "
+        "joe on PATH (run install.sh)."
+    )
+
+
+class Session:
+    def __init__(self, session_id: str, cwd: str):
+        self.id = session_id
+        self.cwd = cwd
+        self.proc: subprocess.Popen | None = None
+        self.cancelled = False
+        self.lock = threading.Lock()  # one prompt in flight per session
+
+
+class AcpServer:
+    def __init__(self):
+        self.joe_bin = find_joe_bin()
+        self.extra_args = shlex.split(os.environ.get("JOE_ACP_ARGS", ""))
+        self.sessions: dict[str, Session] = {}
+        self.write_lock = threading.Lock()
+
+    # ---- wire ----------------------------------------------------------
+
+    def send(self, obj: dict) -> None:
+        line = json.dumps(obj, separators=(",", ":"))
+        with self.write_lock:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+
+    def reply(self, req_id, result: dict) -> None:
+        self.send({"jsonrpc": "2.0", "id": req_id, "result": result})
+
+    def reply_error(self, req_id, code: int, message: str) -> None:
+        self.send({"jsonrpc": "2.0", "id": req_id,
+                   "error": {"code": code, "message": message}})
+
+    def notify(self, method: str, params: dict) -> None:
+        self.send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def update(self, session_id: str, upd: dict) -> None:
+        self.notify("session/update", {"sessionId": session_id, "update": upd})
+
+    def chunk(self, session_id: str, text: str) -> None:
+        self.update(session_id, {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+        })
+
+    # ---- handlers ------------------------------------------------------
+
+    def on_initialize(self, req_id, params: dict) -> None:
+        self.reply(req_id, {
+            "protocolVersion": PROTOCOL_VERSION,
+            "agentCapabilities": {
+                "loadSession": False,
+                "promptCapabilities": {
+                    "image": False,
+                    "audio": False,
+                    "embeddedContext": True,
+                },
+            },
+            "authMethods": [],
+        })
+
+    def on_session_new(self, req_id, params: dict) -> None:
+        cwd = params.get("cwd") or os.getcwd()
+        if not os.path.isdir(cwd):
+            self.reply_error(req_id, -32602, f"cwd is not a directory: {cwd}")
+            return
+        sid = "acp-{}-{}".format(
+            dt.datetime.now().strftime("%Y%m%d-%H%M%S"), secrets.token_hex(3))
+        self.sessions[sid] = Session(sid, cwd)
+        self.reply(req_id, {"sessionId": sid})
+
+    def on_session_prompt(self, req_id, params: dict) -> None:
+        sid = params.get("sessionId", "")
+        sess = self.sessions.get(sid)
+        if sess is None:
+            self.reply_error(req_id, -32602, f"unknown sessionId: {sid}")
+            return
+        prompt = prompt_text(params.get("prompt") or [])
+        if not prompt.strip():
+            self.reply(req_id, {"stopReason": "end_turn"})
+            return
+        if not sess.lock.acquire(blocking=False):
+            self.reply_error(req_id, -32000,
+                             "a prompt is already running in this session")
+            return
+        t = threading.Thread(target=self._run_prompt,
+                             args=(req_id, sess, prompt), daemon=True)
+        t.start()
+
+    def on_session_cancel(self, params: dict) -> None:
+        sess = self.sessions.get(params.get("sessionId", ""))
+        if sess is None:
+            return
+        sess.cancelled = True
+        proc = sess.proc
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    # ---- prompt execution ----------------------------------------------
+
+    def _run_prompt(self, req_id, sess: Session, prompt: str) -> None:
+        try:
+            stop = self._stream_joe(sess, prompt)
+            self.reply(req_id, {"stopReason": stop})
+        except Exception as e:  # never let a turn kill the server
+            self.chunk(sess.id, f"\njoe-acp error: {e}\n")
+            self.reply(req_id, {"stopReason": "end_turn"})
+        finally:
+            sess.proc = None
+            sess.cancelled = False
+            sess.lock.release()
+
+    def _stream_joe(self, sess: Session, prompt: str) -> str:
+        env = dict(os.environ,
+                   NO_COLOR="1", TERM="dumb", PYTHONUNBUFFERED="1")
+        argv = [self.joe_bin, "-p", prompt, "-s", sess.id, *self.extra_args]
+        proc = subprocess.Popen(
+            argv, cwd=sess.cwd, env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, start_new_session=True,
+        )
+        sess.proc = proc
+        # A cancel may land between the prompt request and Popen; if it
+        # did, the cancel handler had no proc to kill, so kill here.
+        if sess.cancelled:
+            self._kill(proc)
+
+        timer = threading.Timer(DEFAULT_TIMEOUT_S, self._kill, args=(proc,))
+        timer.daemon = True
+        timer.start()
+        timed_out = True  # flipped off if the timer gets cancelled in time
+        try:
+            sent_any = False
+            while True:
+                data = proc.stdout.read1(65536)
+                if not data:
+                    break
+                text = ANSI_RE.sub("", data.decode("utf-8", errors="replace"))
+                if text:
+                    self.chunk(sess.id, text)
+                    sent_any = True
+            proc.wait()
+            if timer.is_alive():
+                timer.cancel()
+                timed_out = False
+        finally:
+            if timer.is_alive():
+                timer.cancel()
+
+        if sess.cancelled:
+            return "cancelled"
+        if timed_out:
+            self.chunk(sess.id,
+                       f"\njoe-acp: killed after {DEFAULT_TIMEOUT_S}s timeout\n")
+            return "end_turn"
+        if proc.returncode != 0 and not sent_any:
+            err = proc.stderr.read().decode("utf-8", errors="replace")
+            self.chunk(sess.id,
+                       f"joe exited {proc.returncode}:\n{err.strip()[-2000:]}\n")
+        return "end_turn"
+
+    @staticmethod
+    def _kill(proc: subprocess.Popen) -> None:
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    # ---- dispatch --------------------------------------------------------
+
+    def handle(self, msg: dict) -> None:
+        method = msg.get("method")
+        params = msg.get("params") or {}
+        req_id = msg.get("id")
+        is_request = req_id is not None
+
+        if method == "initialize":
+            self.on_initialize(req_id, params)
+        elif method == "authenticate":
+            self.reply(req_id, {})
+        elif method == "session/new":
+            self.on_session_new(req_id, params)
+        elif method == "session/prompt":
+            self.on_session_prompt(req_id, params)
+        elif method == "session/cancel":
+            self.on_session_cancel(params)
+        elif is_request:
+            self.reply_error(req_id, -32601, f"method not found: {method}")
+        # unknown notifications are ignored per JSON-RPC
+
+    def serve(self) -> int:
+        for raw in sys.stdin.buffer:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                self.send({"jsonrpc": "2.0", "id": None,
+                           "error": {"code": -32700, "message": "parse error"}})
+                continue
+            try:
+                self.handle(msg)
+            except Exception as e:
+                if msg.get("id") is not None:
+                    self.reply_error(msg["id"], -32603, f"internal error: {e}")
+        return 0
+
+
+def prompt_text(blocks: list) -> str:
+    """Flatten ACP content blocks into a single prompt string for joe.
+
+    Text blocks pass through; embedded resources become fenced context
+    tagged with their uri; resource links become a bare mention so joe's
+    own repo tools can pull the file if the model wants it.
+    """
+    parts: list[str] = []
+    for b in blocks:
+        kind = b.get("type")
+        if kind == "text":
+            parts.append(b.get("text", ""))
+        elif kind == "resource":
+            res = b.get("resource") or {}
+            text = res.get("text")
+            uri = res.get("uri", "")
+            if text is not None:
+                parts.append(f"[context: {uri}]\n```\n{text}\n```")
+            else:
+                parts.append(f"[attachment (binary, skipped): {uri}]")
+        elif kind == "resource_link":
+            parts.append(f"[file: {b.get('uri', b.get('name', '?'))}]")
+        else:
+            parts.append(f"[unsupported {kind} block skipped]")
+    return "\n\n".join(p for p in parts if p)
+
+
+def main() -> int:
+    return AcpServer().serve()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

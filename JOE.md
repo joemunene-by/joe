@@ -23,6 +23,7 @@ joe-speak        macOS say wrapper, strips markdown/tool tags first
 joe-schedule     launchd wrapper for arbitrary scheduled shell commands
 joe-http         FastAPI server exposing joe over the LAN + /ios endpoint
 joe-mcp          MCP server exposing joe to Claude Code
+joe-acp          ACP bridge: joe as the agent in Zed / Neovim / JetBrains
 joe-index        builds the per-repo RAG vector index
 joe-watch-logs   tails log files, alerts on errors/milestones via LLM
 joe-proactive    watches zsh history for retry patterns and idle stretches
@@ -464,6 +465,19 @@ Exposes joe's tools (ask, search_repos, pr_draft, standup) to Claude
 Code via the Model Context Protocol. Wire it into Claude Code's MCP
 config and you can drive joe (and via joe, your Mac) from any Claude
 Code session.
+
+### ACP bridge
+
+```
+joe-acp
+```
+
+The inverse seat: instead of lending tools to another agent, joe *is*
+the agent. Speaks Agent Client Protocol v1 over stdio so Zed's agent
+panel, Neovim, Emacs, and JetBrains can spawn it, stream replies, and
+cancel turns. Each editor thread maps to a persistent joe session
+(`joe -p <prompt> -s acp-<id>` under the hood). Config knobs are env
+vars: JOE_ACP_BIN, JOE_ACP_ARGS, JOE_ACP_TIMEOUT_S.
 
 ---
 
