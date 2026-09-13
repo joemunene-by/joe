@@ -1,9 +1,15 @@
 # joe
 
-A local-first, self-personalising agent shell for your machine. Think
-Claude Code, but every model runs on your own GPU, every byte of state
-sits in `~/.joe-agent/`, and the agent gets better at understanding you
-the longer you use it.
+**A local-first, self-personalising coding agent for your terminal.**
+
+Think Claude Code, but every model runs on your own machine, every byte of
+state stays in `~/.joe-agent/`, and the agent gets better at understanding
+you the longer you use it.
+
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)
+![runs 100% local](https://img.shields.io/badge/runs-100%25%20local-blue.svg)
+![models via ollama](https://img.shields.io/badge/models-ollama-blue.svg)
 
 ```
 joe (your terminal)
@@ -34,26 +40,26 @@ improve over time without retraining.
 
 The seven features that make joe interesting:
 
-1. **AI-blame / provenance** — `joe blame src/foo.py:42` tells you which
+1. **AI-blame / provenance** - `joe blame src/foo.py:42` tells you which
    prompt, under which agent, in which session, on which date produced
    that line. Git blame for *intent*.
-2. **Lessons-learned loop** — every `/undo` is a signal. `/lessons distill`
+2. **Lessons-learned loop** - every `/undo` is a signal. `/lessons distill`
    turns recent corrections into 1-line preference rules that get injected
    into the system prompt of every future turn. Auto-evolving personality.
-3. **Knowledge graph** — every conversation is parsed into
+3. **Knowledge graph** - every conversation is parsed into
    `(subject, relation, object)` triples in the background. `/ask` queries
    the graph for grounded answers with session citations.
-4. **Smart inbox** — `joe inbox` aggregates PRs awaiting your review,
+4. **Smart inbox** - `joe inbox` aggregates PRs awaiting your review,
    issues mentioning you, failing CI runs across active repos, running
    background tasks. One panel.
-5. **Self-eval / drift detection** — snapshot your past accepted answers
+5. **Self-eval / drift detection** - snapshot your past accepted answers
    as a private benchmark. Rerun weekly against the current model and
    measure how much it has drifted.
-6. **Live pair-programming** — `joe-pair` watches your files via fswatch.
+6. **Live pair-programming** - `joe-pair` watches your files via fswatch.
    On each save it runs your tests; if they pass, it briefly asks the
    model whether anything in the change is worth flagging. Silent 90% of
    the time.
-7. **Self-training** — `joe train collect` builds a JSONL training set
+7. **Self-training** - `joe train collect` builds a JSONL training set
    from your accepted answers + lessons. `joe train modelfile` bakes
    them into a fresh ollama Modelfile (`joe-gemma:vYYYYMMDD`).
    `joe train lora` hands the same data to mlx-lm for a real LoRA on
@@ -185,7 +191,7 @@ Never touch RESULTS.md by hand; it's auto-generated.
 """
 ```
 
-Generate a starter with `joe init` — it also scans the repo and bakes a
+Generate a starter with `joe init` - it also scans the repo and bakes a
 style fingerprint (indent / quote / naming / line-length) into the
 `context_extra` so coder delegates match existing convention.
 
@@ -217,25 +223,25 @@ opens it in `$EDITOR` for cleanup.
 joe is local-first, but the surface area is broad. A few flags to
 understand before turning them on:
 
-- **`--unsafe-bash` / `JOE_AUTO_YES=1`** — disables the bash allow-list
+- **`--unsafe-bash` / `JOE_AUTO_YES=1`** - disables the bash allow-list
   and auto-approves every write/edit/bash. Suitable for a sandboxed VM
   you can throw away; risky on your daily-driver Mac. Off by default.
-- **`joe-proactive`** — watches your zsh history file and pops a banner
+- **`joe-proactive`** - watches your zsh history file and pops a banner
   when it detects retry patterns. It reads your shell history. Opt-in
   (`JOE_PROACTIVE=1` for the `--autostart` form).
-- **`joe sync push`** — syncs `~/.joe-agent/` to a git remote you
+- **`joe sync push`** - syncs `~/.joe-agent/` to a git remote you
   configure. The default `.gitignore` excludes credentials and large
   blobs, but conversation logs (`joe-sessions.sqlite`) DO sync. Use a
   private repo.
-- **`joe-http`** — exposes a FastAPI server on a port of your choice.
+- **`joe-http`** - exposes a FastAPI server on a port of your choice.
   Bearer-token auth, no TLS. Bind to `127.0.0.1` for local-only or front
   it with Tailscale for off-LAN access. Never open port 8765 to the
   public internet.
-- **iOS bridge** — `joe ios-setup` prints a Shortcut recipe. Pushes go
+- **iOS bridge** - `joe ios-setup` prints a Shortcut recipe. Pushes go
   through ntfy.sh which is third-party. Use a guessable-but-not-obvious
   topic name (no public listing exists, but topics aren't private by
   design).
-- **`/web` and `<web_fetch>`** — scrape DuckDuckGo HTML and arbitrary
+- **`/web` and `<web_fetch>`** - scrape DuckDuckGo HTML and arbitrary
   URLs. Your IP is visible to those endpoints.
 
 No network calls happen unless you explicitly invoke a web tool, sync,
@@ -339,7 +345,7 @@ Results come back through the standard `<tool_result>` loop.
 joe pairs naturally with [ghostloop](https://github.com/joemunene-by/ghostloop),
 the embodied-agent runtime. Both directions of the loop are now wired:
 
-**direction 1 — joe drives ghostloop** (joe as MCP client, ghostloop as MCP server).
+**direction 1 - joe drives ghostloop** (joe as MCP client, ghostloop as MCP server).
 ghostloop ships `examples/mcp_robot.py` as an MCP server. Drop one entry into
 `~/.joe-agent/mcp-clients.json`:
 
@@ -362,7 +368,7 @@ force-cap, human-in-the-loop) still gates every intent so joe can use the
 robot but can't bypass safety. Full sample at
 `examples/mcp-clients.ghostloop.json`.
 
-**direction 2 — ghostloop uses joe-gemma as its policy brain** via the
+**direction 2 - ghostloop uses joe-gemma as its policy brain** via the
 OpenAI-shaped shim on `joe-http`:
 
 ```sh
@@ -378,10 +384,10 @@ OPENAI_MODEL=joe-gemma \
 
 joe-http proxies ollama's already-OpenAI-compatible endpoint, with two
 additions worth the indirection:
-  1. **personalisation injection** — the active lessons supplement gets
+  1. **personalisation injection** - the active lessons supplement gets
      prepended as a system message when the caller doesn't supply one,
      so ghostloop's `LLMPolicy` inherits your distilled preferences.
-  2. **bearer auth + cross-machine access** — ollama only listens on
+  2. **bearer auth + cross-machine access** - ollama only listens on
      localhost; joe-http can be exposed over LAN or Tailscale, so
      ghostloop on another machine can reach joe-gemma without exposing
      ollama directly.
@@ -422,507 +428,10 @@ Knobs, all env vars: `JOE_ACP_BIN` (which joe to run), `JOE_ACP_ARGS`
 `mcpServers` list is ignored on purpose: joe already manages its own
 MCP clients via `~/.joe-agent/mcp-clients.json`.
 
-## the v0.9.x engineer-grade pack
+## changelog
 
-Six rounds shipped that push joe past "chat REPL with tools" into "real
-terminal coding agent that an Anthropic engineer would scroll up over."
-
-### v0.9.5 — per-tool session trust
-
-Claude-Code-style permission prompts. Every confirm now accepts a third
-answer:
-
-```
-Apply this write to ./README.md? [y/N/a]:
-  y -- yes, this call only
-  N -- no (default)
-  a -- always (this tool, this session)
-```
-
-Trust is scoped per-tool, so `a` to a write doesn't trust bash. `/trust`
-shows + resets state; `/trust all` grants session-wide consent (close to
-`/yolo` but revocable). Synonyms for `a`: `always`, `trust`, `all`.
-
-### v0.9.6 — reproducibility passport + /council + /blame
-
-**Passport** — every model call stamps a sha256 of `(model + prompt +
-cwd + sorted active lessons + LoRA endpoint)` into
-`~/.joe-agent/passports.sqlite`.
-
-```
-/passport list                   # newest 20 (hash, ts, model, preview)
-/passport show <hash-prefix>     # full input space + response
-/passport replay <hash>          # re-run the exact prompt bit-for-bit
-```
-
-The hash is the natural identity for "this exact input space." Anthropic
-engineers know determinism is hard; having a passport for every turn is
-the difference between toy and tool.
-
-**`/council`** — concurrent multi-model arbitration. Fires the same
-prompt at `joe-gemma + deepseek-r1:14b + qwen2.5:14b` in parallel threads
-(override via `$JOE_COUNCIL='m1,m2,m3'`), shows them side-by-side in
-Rich Columns with per-model latency, then asks a fourth judge model
-(`$JOE_COUNCIL_JUDGE`) which one is best. Winner logged to evals.sqlite.
-
-**`/blame <file>:<line>`** — git-blame for AI provenance. Surfaces the
-prompt, agent, model, session, line range, and ±deltas that wrote that
-line. The capture has always happened; v0.9.6 surfaced it one slash away.
-
-Plus tool-emission repair hints (parser failures get specific feedback
-fed back — "your `<write>` opened at char 42 but never closed"), AST
-validation on Python writes (broken syntax blocked before disk hit), and
-a "Scope discipline" system-prompt section that stops joe from polishing
-files it just `<cd>`'d into.
-
-### v0.9.7 — agentic PC control + custom commands + hooks
-
-joe sees and acts on the host machine. Seven new XML tools:
-
-```xml
-<screen />                          <!-- captures display, attaches as
-                                         image to next turn; joe-gemma
-                                         is gemma3 vision-capable -->
-<click x="500" y="300" button="left" clicks="1" />
-<type>literal text at focus</type>
-<key>cmd+s</key>                    <!-- hotkey or single key -->
-<open>app-or-url</open>             <!-- launches via open/xdg-open/start -->
-<clipboard op="get" />              <!-- read system clipboard -->
-<clipboard op="set">text</clipboard>
-```
-
-Each gated by `/trust click`, `/trust type`, etc. Screenshots via
-`screencapture` (macOS) / `gnome-screenshot` / `scrot`. Mouse + keyboard
-via pyautogui (optional dep). Clipboard via pbpaste/pbcopy / xclip /
-wl-paste.
-
-**Custom slash commands** — drop a TOML file at
-`~/.joe-agent/commands/<name>.toml`:
-
-```toml
-description = "Senior security review"
-template = """
-Review {{args}} in {{cwd}} as of {{date}}.
-Focus on: thread safety, SQL injection, auth bypass, secrets in git.
-Be specific.
-"""
-model = "joe-gemma"               # optional override
-allowed_tools = ["read", "grep"]  # optional restriction
-```
-
-Type `/review src/auth.py` and joe renders the template + runs a turn.
-Substitutions: `{{args}}`, `{{cwd}}`, `{{date}}`. `/commands` lists them;
-`/commands reload` re-reads from disk.
-
-**Lifecycle hooks** — shell scripts in `~/.joe-agent/hooks/<event>.sh`
-fire on:
-
-```
-user_prompt   non-zero EXIT cancels the turn
-pre_tool      non-zero EXIT BLOCKS the tool + feeds stderr back to model
-post_tool     non-blocking; receives result via env
-stop          after turn completes
-```
-
-Hooks receive `JOE_HOOK_EVENT`, `JOE_HOOK_TOOL`, `JOE_HOOK_TOOL_ARGS`,
-`JOE_HOOK_TOOL_BODY`, `JOE_HOOK_TOOL_RESULT`, `JOE_HOOK_USER_MSG`,
-`JOE_HOOK_RESPONSE`, `JOE_HOOK_CWD`, `JOE_HOOK_SESSION`, `JOE_HOOK_MODEL`
-via env. Mirrors Claude Code's hook surface so admin policies port
-straight over.
-
-### v0.9.8 — eval diff + auto-eval on swap
-
-```
-joe eval diff <model-a> <model-b>   # per-case head-to-head: wins /
-                                    # losses / ties + score deltas
-joe eval cases                      # list the current eval set
-```
-
-Auto-eval kicks in a daemon thread when the REPL's model changes (via
-`/model <name>`). Runs the eval set against the new model, compares to
-the previous model's most recent run, fires a desktop notification if
-avg-similarity drops by >0.02.
-
-### v0.9.9 — `<parallel>` + deterministic-tool cache
-
-```xml
-<parallel>
-  <read path="src/a.py" />
-  <read path="src/b.py" />
-  <grep pattern="def login" path="." />
-</parallel>
-```
-
-Fans the children out concurrently via ThreadPoolExecutor (max 8
-workers). Children restricted to side-effect-free tags: `<read>`,
-`<grep>`, `<glob>`, `<web_fetch>`. Single-child short-circuits to direct
-dispatch (no thread overhead).
-
-Plus a per-session result cache for those same four tools keyed by
-`(tool, attrs, body prefix, cwd)`. Repeated reads of the same file or
-greps for the same pattern return instantly with a `[cache hit]` marker.
-
-### v0.9.10 — Playwright `<browser>`
-
-Real headless Chromium driven by a persistent Playwright session per
-REPL:
-
-```xml
-<browser action="open" url="https://github.com/joemunene-by" />
-<browser action="click" selector="a[href='/joemunene-by/joe']" />
-<browser action="extract" selector=".repository-content" />
-<browser action="screenshot" path="/tmp/joe-repo.png" />
-<browser action="close" />
-```
-
-Other actions: `type`, `wait`, `title`, `url`, `back`. Cookies + login
-persist across actions in one REPL. Headed via `JOE_BROWSER_HEADED=1`.
-Optional dep — refuses with an install hint if Playwright isn't present:
-
-```sh
-pip install --user playwright && playwright install chromium
-```
-
-Combined with `<screen>` + `<click>` from v0.9.7, joe drives both a
-headless browser (websites + scraping + automation) AND the user's actual
-desktop (window automation). That's the full Anthropic-Computer-Use
-surface, on local hardware, with /trust-gated consent.
-
-## v0.10.x — everything-agent pack
-
-Eight more rounds after v0.10.0 brought joe to feature parity with
-Claude Code, Codex, Cursor, Aider, and Cline / Roo Code, while keeping
-the local-first, byte-of-state-in-`~/.joe-agent/` model.
-
-### v0.10.1 — plugin tools + AGENTS.md / CLAUDE.md auto-load
-
-Drop a `.py` file in `~/.joe-agent/tools/` exporting a `register()` that
-returns `{name: handler}`. The parser regenerates after load so the
-new tag is recognised. Plugins cannot override built-in tools.
-
-```python
-# ~/.joe-agent/tools/jira.py
-def jira_handler(attrs, body):
-    return f"JIRA-{attrs['key']}: ..."
-def register():
-    return {"jira": jira_handler}
-```
-
-Plus: when joe enters a cwd with `AGENTS.md` (OpenAI Codex convention),
-`CLAUDE.md` (Claude Code convention), or `.joe/instructions.md`, the
-content gets injected as `<project_context>` into every system prompt.
-
-### v0.10.2 — /diff-model + reasoning trace + turn meter
-
-`/diff-model <a> <b> <prompt>` is the cheap two-model A/B without the
-judge spend of `/council`. `capture_reasoning_trace()` strips
-`<think>...</think>` blocks from streaming output, persists each to
-`think.sqlite`, returns the clean response. `/think show <hash>`
-surfaces past reasoning. Every model turn ends with an inline meter:
-
-```
-└ 1247 tok in ·   412 tok out ·  3.2s ·  129 tok/s
-```
-
-### v0.10.3 — output styles + statusline + multi_edit + notebook_edit
-
-Seven built-in output-style presets (`/output-style concise`, `learning`,
-`security`, `review`, `ship-it`, …) overlay the system prompt. Custom
-`.md` files at `~/.joe-agent/output-styles/<name>.md` extend the set.
-`/statusline <fmt>` lets you write a Rich-markup format string that
-replaces the default bottom-of-REPL bar.
-
-New tools: `<multi_edit>` (Claude Code MultiEdit equivalent — atomic
-N-edit-in-one-tag with single diff preview); `<notebook_edit>` for
-.ipynb cells with replace / append / insert / delete ops.
-
-### v0.10.4 — @-mentions + sandbox modes
-
-```
-> @src/auth.py what's wrong here?
-```
-
-joe auto-prepends `<file path="src/auth.py">...</file>` to the prompt
-before the model sees it. Cursor / Continue.dev pattern. Multiple
-`@path` tokens, dedup, trailing-punctuation strip, 30 KB cap per file.
-
-Sandbox modes (Codex-inspired): `read-only`, `workspace-write`, `full`.
-`/sandbox <mode>` at the prompt; `--sandbox <mode>` at CLI; or
-`$JOE_SANDBOX`. The dispatcher blocks tools not allowed at the current
-level, and `workspace-write` additionally refuses writes outside cwd.
-
-### v0.10.5 — repo map + mode switching
-
-Aider-style repo map: every system prompt now contains a
-`<repo_map>` block with a per-file symbol table (def / class / fn /
-struct / trait / type) for Python, TypeScript, Rust, Go. Capped at
-~5 KB so it doesn't blow the context budget on monorepos. Refreshed
-every 60s per cwd.
-
-Mode switching (Cline / Roo Code): `/mode act | plan | architect |
-debug | ask | review | security` atomically swaps both
-`/output-style` and `/sandbox`. So "plan the change" → `/mode plan`
-(explanatory + read-only); "now make it real" → `/mode act` (ship-it
-+ full).
-
-### v0.10.6 — skills + /loop
-
-**Skills** (Claude Code SKILL.md packages). Drop a directory at
-`~/.joe-agent/skills/<name>/` with `SKILL.md`:
-
-```markdown
----
-name: pr-review
-description: Senior code review with security focus
-when_to_use: review, audit, check for bugs, vulnerabilities
-allowed_tools: read, grep, glob, parallel
----
-<body of skill instructions...>
-```
-
-joe loads all skills at REPL start. Every turn, it matches the user
-message against each skill's `when_to_use` triggers and injects matched
-skills as `<skill_available>` blocks. Joe-autonomous: the model picks
-them up when relevant, no explicit invocation. Different from `/<name>`
-custom commands (user-typed) and `@@<persona>` subagents (explicit
-dispatch).
-
-`/loop 5 fix the next lint warning` repeats a turn 5 times.
-`/loop until DONE finish the refactor` iterates up to 12 times until
-the response contains "DONE" (case-insensitive). Useful for "keep
-going until tests pass" or "apply this to every model file."
-
-### v0.10.7 — AI! markers + /skills install
-
-Aider's signature feature: leave a comment marker in your code:
-
-```python
-def parse_csv(text):
-    # AI! refactor this to use the csv module
-    return [line.split(",") for line in text.split("\n")]
-```
-
-```
-/ai-markers       scan cwd, list every marker with file:line
-/ai-markers fix   run a turn per marker; addresses + removes the
-                  marker line
-```
-
-Marker styles recognised: `# AI!`, `// AI!`, `<!-- AI! ... -->`,
-`; AI!`, `-- AI!`. Skips node_modules, target, .venv, .git etc.
-
-Plus `/skills install <git-url>` clones a SKILL.md package directly
-from a public repo into `~/.joe-agent/skills/`. Validates the dir
-name as `[a-zA-Z0-9_-]+`; refuses if target exists; reloads the
-skill registry after install so it's active in the same REPL.
-
-## v0.11.x — user-research polish + safety hardening
-
-Eight more rounds after the v0.10.x parity pack. v0.11.0 was a docs
-release; v0.11.1 onward each shipped a piece of either competitive
-parity or hardening surfaced by the "what do developers want from
-terminal AI agents in 2026" survey + competitor mining.
-
-### v0.11.1 — doctor --fix + /swarm + cumulative cost
-
-`joe doctor --fix` iterates over runtime deps (rich, prompt_toolkit,
-fastapi, uvicorn, mcp, pyautogui, playwright) and pip-installs any
-missing one through the *same* interpreter that's running joe, so
-the "ModuleNotFoundError: rich" UX disappears for good.
-
-`/swarm prompts.txt` reads N lines (one prompt per line) and fires
-each as an independent agent in a fresh session, concurrently, up to
-8 threads. A result table renders per-agent success / failure +
-preview. Latency drops from `sum(individual)` to `max(individual)`.
-
-`/cost` now shows cumulative $-spend per session based on the new
-`MODEL_PRICES_PER_MTOK` table (Claude 4.x family, GPT-5, o3,
-DeepSeek-V4-Pro:cloud). Local models render as `$0 (local)` so the
-"free" signal is loud.
-
-### v0.11.2 — auto-compact at 85%
-
-Every REPL iteration estimates current session tokens. When the
-ratio crosses 85% of `CONTEXT_BUDGET_TOKENS`, `_auto_compact()`
-summarises the oldest half via the current model with a
-preserve-decisions-files-open-questions prompt, replaces it with one
-system turn, keeps the recent half verbatim. Context drops from
-~87% to ~30-40% with the conversation's useful state intact. Fires
-once per ceiling-cross (a `_warned_compact` flag prevents thrash).
-
-### v0.11.3 — native MCP server: every joe tool exposed
-
-`bin/joe-mcp` was a four-tool MCP server (ask, search_repos,
-pr_draft, standup). It now exposes thirteen so any FastMCP-aware
-client (Claude Desktop, Cursor, Zed, Cline) can drive joe fully:
-
-```
-ask         search_repos    pr_draft     standup
-read_file   write_file      blame_line   council
-recall      list_passports  replay_passport
-list_skills ai_markers_in
-```
-
-`write_file` goes through joe-agent so the write is stamped to the
-provenance log and AST-validated. A Claude Desktop user can now say
-"use joe's `council` to compare joe-gemma vs deepseek-r1 on this
-question" and joe IS the server doing it.
-
-### v0.11.4 — joe-watch-ai daemon (Aider parity)
-
-A long-running daemon that polls the cwd for file saves and, on
-detection of a `# AI!` / `// AI!` / `<!-- AI! -->` marker, shells
-out to `joe -p` to fix and remove the marker, then optionally
-`git commit`s the result.
-
-```
-joe-watch-ai                 # daemon mode, polls every 2s
-joe-watch-ai --once          # one pass + exit
-joe-watch-ai --path src      # subtree
-joe-watch-ai --dry-run       # show what would fire
-joe-watch-ai --no-commit
-```
-
-Leave it running in a side terminal while you work; flag spots with
-marker comments; joe attends to them in the background. This is the
-always-on companion to the manual `/ai-markers fix`.
-
-### v0.11.5 — Windows compat shims
-
-joe was Linux + macOS only. v0.11.5 boots on Windows with native
-fallbacks for the platform-dependent tools:
-
-```
-<screen>     macOS screencapture -> Linux gnome-screenshot/scrot
-             -> Windows PowerShell + .NET (System.Windows.Forms +
-             Drawing) -> pyautogui last resort
-<open>       macOS open -> xdg-open -> Windows `cmd /c start ""`
-<clipboard>  pbpaste/pbcopy -> xclip/wl-* -> Windows PowerShell
-             Get-Clipboard (read) and `clip` (write, ships with
-             every Windows since XP)
-```
-
-No service-mode install yet, but the core tool surface works without
-modification on Windows 10+.
-
-### v0.11.6 — knowledge-graph viz in /dashboard
-
-The web dashboard's KG block used to render the newest triples as
-plain text. v0.11.6 also renders them as a Mermaid `flowchart LR`
-graph, loaded lazily from the CDN with a dark theme that matches
-the rest of the dashboard. The original triple table is preserved
-behind a `<details>` toggle.
-
-### v0.11.7 — tree-sitter-aware edit guard
-
-v0.9.6's Python `ast.parse` validation refuses `.py` writes that
-don't parse. v0.11.7 extends the same contract to every non-Python
-language joe can recognise:
-
-```
-.js .cjs .mjs .jsx   -> javascript
-.ts                  -> typescript           .tsx -> tsx
-.rs                  -> rust
-.go                  -> go                   .rb  -> ruby
-.java                -> java                 .kt  -> kotlin
-.swift               -> swift
-.c .h                -> c                    .cpp -> cpp
-.cs .php .lua .scala .sh .bash
-.html .css .json .yaml .toml .sql
-```
-
-When `tree-sitter-languages` is installed, broken non-Python writes
-get refused with a line:col error string the model can use to retry.
-The dep stays optional: absent => silent skip, same as before.
-
-### v0.11.8 — OS-level <bash> sandbox
-
-The Python-layer sandbox modes in v0.10.4 gated which tools the
-dispatcher would invoke. But `<bash>` was a hole: a clever model
-could shell out via `echo foo > /etc/whatever` and Python never
-saw the redirect. v0.11.8 closes that hole with an OS-native jail
-around every `<bash>` when the mode is restricted:
-
-```
-macOS   -> sandbox-exec -p <SBPL profile> sh -c <cmd>
-Linux   -> bwrap --ro-bind / --tmpfs /tmp --chdir <cwd> ...
-            (firejail --read-only=/ ... fallback)
-other   -> silent passthrough; Python-layer checks still apply
-```
-
-In `read-only` mode the jail denies file-write* everywhere except
-`/tmp` and `/dev/null`. In `workspace-write` it additionally
-re-allows writes under the cwd subpath. In `full` mode the
-wrapper is a no-op — the user picked unrestricted on purpose.
-
-```
-JOE_OS_SANDBOX=0      # disable globally
-/sandbox os on|off    # REPL toggle
-/sandbox              # status panel shows which jail is active
-```
-
-The Bash panel title prepends the wrapper label so the user can
-see at a glance: `Bash (macOS Seatbelt)`, `Bash (linux bwrap)`,
-`Bash (linux firejail)`, or just `Bash` (no wrapping).
-
-### v0.11.10 — secrets-pattern guardrail
-
-A model that helpfully writes your live OpenAI key into a file you
-then commit is the actual nightmare on a dev box. v0.11.10 catches
-that at the tool-write boundary by scanning every `<write>` / `<edit>` /
-`<multi_edit>` body for 11 known secret formats and refusing the
-write if any match:
-
-```
-AWS access key            AKIA / ASIA + 16 base32 chars
-AWS secret access key     aws_secret_access_key = 40 base64 chars
-Anthropic API key         sk-ant-<20+>
-OpenAI API key            sk-(proj-)?<20+>  (negative lookahead for sk-ant-)
-GitHub PAT                ghp_<36+>
-GitHub fine-grained       github_pat_<60+>
-Stripe live key           sk_live_<20+> / pk_live_<20+>
-Google API key            AIza<35>
-Slack webhook + token     hooks.slack.com/... and xox[abprs]-...
-JWT                       eyJ<10+>.<10+>.<10+>
-Private key (PEM)         -----BEGIN [RSA|OPENSSH|EC|DSA|PGP] PRIVATE KEY-----
-```
-
-Refusal messages show the label + line:col but redact the matched
-bytes to `<8>...<4>` so the panel doesn't echo the full key into
-terminal scrollback. Inspired by Future AGI's gateway-level guardrail
-action triad (block / warn / log) and adapted to the local-first
-threat model — the dangerous moment is the disk write, not the
-model emission. `JOE_GUARDRAILS=0` disables per session.
-
-### v0.11.11 — codebase RAG + linter ACI + microagent compat
-
-Three near-free wins from a deep mine of 2026's OSS coding-agent
-ecosystem (Goose, OpenHands, SWE-agent, Cody, Continue, gptme, Warp,
-Zed, OpenCode, Cline/Roo, JetBrains hybrid).
-
-**Codebase vector RAG.** `joe-index` has built a vector store over
-the user's active repos since v0.4, but the REPL never auto-injected
-the results. v0.11.11 closes the gap: every turn now queries the
-vector index, filters to chunks under cwd, and prepends a `<repo_rag>`
-block to the system prompt with top-K most-relevant snippets. Same
-contract every modern agent ships (Cursor `@codebase`, Cody agentic
-context, Continue `@codebase`). Silent no-op when the index doesn't
-exist; `JOE_AUTO_RAG=0` disables.
-
-**Linter-feedback ACI on edit.** SWE-agent's published insight:
-tool-ergonomics tweaks dwarf retrieval gains for end-to-end task
-completion. After every successful `<write>` / `<edit>` /
-`<multi_edit>`, joe now auto-runs the per-file linter (ruff /
-eslint / go vet / shellcheck) and appends a `<lint_after_write>`
-block to the tool result so the model self-corrects on the SAME
-turn. 30s per-file timeout, 2000-char output cap, missing linter =
-silent no-op. `JOE_AUTO_LINT=0` disables.
-
-**OpenHands microagent compatibility.** SKILL.md frontmatter now
-also accepts the OpenHands microagent `triggers: [a, b, c]`
-inline-list syntax and folds it into the same `when_to_use` keyword
-match path joe already uses. Any public OpenHands microagent drops
-into `~/.joe-agent/skills/` without translation.
+Full release history is in [CHANGELOG.md](CHANGELOG.md). Latest release: v0.13.0,
+the ACP bridge that runs joe as the agent inside Zed, Neovim, Emacs, and JetBrains.
 
 ## tool registry (26 tags)
 
@@ -961,35 +470,35 @@ Through v0.11.11. The remaining backlog, in rough priority order from
 a 2026-landscape sweep across Goose / OpenHands / SWE-agent / Cody /
 Continue / OpenCode / Cline / Roo / Aider / Warp / Zed / JetBrains:
 
-- **OTLP exporter** — wrap each reproducibility passport as an
+- **OTLP exporter** - wrap each reproducibility passport as an
   OpenTelemetry span and emit to OTLP/HTTP (Langfuse / Tempo /
   Honeycomb compatible). Trace-export is 2026 table-stakes.
-- **Full LSP-diagnostic feedback loop** — the v0.11.11 linter ACI
+- **Full LSP-diagnostic feedback loop** - the v0.11.11 linter ACI
   is the cheap version; per-language LSP gives type errors + symbol
   resolution back to the model on the same turn. OpenCode's killer
   feature.
-- **`response_schema` on `/plan`** — Goose recipe-style JSON-schema
+- **`response_schema` on `/plan`** - Goose recipe-style JSON-schema
   validation on plan output with auto-retry up to N on validation
   fail. Closes the structured-output gap for CI/CD integrations.
-- **Shadow-git per-tool-call checkpoints** — Cline / Roo Code's
+- **Shadow-git per-tool-call checkpoints** - Cline / Roo Code's
   signature feature. Restore Files / Restore Task / Restore Both,
   `git worktree`-backed.
-- **OpenHands-style condenser** — augment auto-compact with an LLM
+- **OpenHands-style condenser** - augment auto-compact with an LLM
   summary of the dropped middle (currently we drop, don't summarise).
-- **`.aiignore`** — repo-pinned glob list that gates `read` / `grep` /
+- **`.aiignore`** - repo-pinned glob list that gates `read` / `grep` /
   `glob` / `write` / `edit`. JetBrains / industry adopted.
-- **Architect-pair mode** — route the plan turn to a strong model
+- **Architect-pair mode** - route the plan turn to a strong model
   and the edit turn to a cheap one. `/mode architect` exists; the
   two-model split doesn't yet.
-- **SWE-bench trajectory.json export** — reformat passports to the
+- **SWE-bench trajectory.json export** - reformat passports to the
   (thought, action, observation) JSON format SWE-agent and OpenHands
   benchmarks expect.
 - **HTTP / SSE transport for `joe-mcp`** (currently stdio-only;
   FastMCP supports SSE).
 - **`joe stats --export csv`**.
-- **`/undo last-N`** — atomic rollback of joe's recent writes via
+- **`/undo last-N`** - atomic rollback of joe's recent writes via
   the provenance log + git reflog cross-walk.
-- **Speculative parallel inference** — fire 2-3 cloud variants
+- **Speculative parallel inference** - fire 2-3 cloud variants
   concurrently, take the first valid one.
 - **Voice on Windows** (pyttsx3 + Sapi5 port of joe-voice).
 - **More piper-tts voices** via `--setup-piper <locale>`.
